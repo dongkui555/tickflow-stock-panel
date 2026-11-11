@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from app import __version__
 from app.api import (
     abnormal,
+    aiagents,
     alerts,
     analysis,
     backtest,
@@ -24,6 +25,7 @@ from app.api import (
     ext_pages,
     factors,
     financials,
+    fund_monitor,
     guardian,
     import_center,
     indices,
@@ -44,10 +46,13 @@ from app.api import (
     screener,
     sector_rotation,
     signals,
+    short_term_ai,
     stock_analysis,
+    stockformer,
     strategy,
     strategy_pool,
     task_registry,
+    tushare_gateway,
     watchlist,
 )
 from app.api import auth as auth_api
@@ -243,6 +248,14 @@ async def _application_lifespan(app: FastAPI):
     strategy_monitor = StrategyMonitorService()
     app.state.strategy_monitor = strategy_monitor
     qs.set_app_state(app.state)
+
+    # AI Agents 兼容层需要复用 TickFlow 的本地仓库与实时行情服务。
+    try:
+        from app.services.aiagents_sources import configure_runtime as configure_aiagents_runtime
+
+        configure_aiagents_runtime(repo=repo, quote_service=qs)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("aiagents runtime configure failed: %s", e)
 
     # 五档盘口 sealed 服务(真假涨停/跌停, 独立旁路线)
     from app.services.depth_service import DepthService
@@ -518,7 +531,7 @@ async def _application_lifespan(app: FastAPI):
             fsc.stop()
         qs = getattr(app.state, "quote_service", None)
         if qs:
-            qs.stop()
+            qs.stop(persist=False)
         dsvc = getattr(app.state, "depth_service", None)
         if dsvc:
             dsvc.stop_polling()
@@ -714,8 +727,13 @@ app.include_router(ext_data.router)
 app.include_router(ext_pages.router)
 app.include_router(task_registry.router)
 app.include_router(financials.router)
+app.include_router(fund_monitor.router)
+app.include_router(short_term_ai.router)
 app.include_router(stock_analysis.router)
+app.include_router(stockformer.router)
+app.include_router(aiagents.router)
 app.include_router(market_recap.router)
+app.include_router(tushare_gateway.router)
 app.include_router(settings_api.router)
 app.include_router(upgrade_guard_api.router)
 app.include_router(strategy.router)
@@ -739,8 +757,6 @@ app.state.extension_load_errors = extension_load_errors
 # 能力门控异常 → 403(而非默认 500)
 # 业务代码用 capset.require(Cap.X) 断言能力,缺失时抛 CapabilityDenied;
 # 若不注册 handler 会冒泡成 500 Internal Server Error,对前端不友好且语义错误。
-from fastapi import Request
-from fastapi.responses import JSONResponse
 
 from app.tickflow.capabilities import CapabilityDenied
 

@@ -464,7 +464,7 @@ class JobStore:
             self.terminate(jid, f"超时自动取消: 总运行 {int(total_s)}s 超过硬上限,已请求终止")
 
     def terminate(self, job_id: str, message: str) -> None:
-        """标记失败 + 请求协作式终止 + 强制释放执行槽(带所有权)。
+        """标记失败并请求协作式终止,执行槽由实际退出的工作线程释放。
 
         reap_stale(判定卡死)与手动取消端点共用。
         """
@@ -472,10 +472,8 @@ class JobStore:
         # 依赖 flag(而非记录)感知取消。
         request_cancel(job_id)
         self.fail(job_id, message)
-        # 强制释放重任务槽(按所有权): 卡死线程可能永远回不来释放。
-        # job 已标记 failed 且已请求终止; 僵尸线程即使后续短暂写盘,
-        # 也会在下一个分块回调处自行退出, 下次拉取会覆盖, 安全。
-        release_run_slot(job_id)
+        # Cancellation is cooperative. The worker's finally block owns release;
+        # releasing here would let a queued task write while the old worker is alive.
 
     def clear(self) -> None:
         """清空所有任务（内存 + 磁盘文件 + 取消标志）。"""
@@ -577,7 +575,7 @@ def run_with_capacity(job_id: str, fn: Callable[[], _Result]) -> _Result:
 # 所有权 token 修复的竞态: 旧实现用裸 threading.Lock + 无参 release ——
 # 僵尸线程最终结束时会在 finally 里误释放**新任务**正持有的锁(Lock 允许
 # 任意线程 release), 第三次点击又能插入并发。现在 release 必须携带持有者
-# job_id, 非持有者的释放一律忽略; reap 的强制释放也走同一入口。
+# job_id, 非持有者的释放一律忽略; reap 仅请求终止,不会提前释放。
 # 代价: 真卡死且协作式终止不生效(如卡在单个无限阻塞的网络读里)时,
 # 需重启进程才能再次跑重任务(优先保证数据不损坏)。
 _run_slot_lock = threading.Lock()

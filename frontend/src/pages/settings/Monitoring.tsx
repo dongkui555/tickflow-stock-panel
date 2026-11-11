@@ -13,6 +13,7 @@ import {
   useQuoteStatus,
   useQuoteInterval,
   useCapabilities,
+  useCapabilityMatrix,
 } from '@/lib/useSharedQueries'
 import { useUpdateQuoteInterval, useToggleRealtimeQuotes } from '@/lib/useSharedMutations'
 import { api, type EmailSmtpConfig } from '@/lib/api'
@@ -20,6 +21,7 @@ import { QK } from '@/lib/queryKeys'
 import { useCardFlash, cardFlashCls } from '@/lib/useCardFlash'
 import { toast } from '@/components/Toast'
 import { DepthConfigContent } from '@/components/data/DepthConfigCard'
+import { routeCapUsable } from '@/lib/capability-labels'
 
 // 卡片定位锚点: highlight=<anchor> 时该卡片滚动到视口中央并闪烁高亮。
 // 其他页面用 /settings?tab=monitoring&highlight=<anchor> 精确引导用户到某张卡片。
@@ -48,6 +50,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
   const qc = useQueryClient()
   const { data: prefs } = usePreferences()
   const { data: caps } = useCapabilities()
+  const { data: matrix } = useCapabilityMatrix()
   const { data: quoteStatus } = useQuoteStatus()
   const { data: intervalData } = useQuoteInterval()
   const updateInterval = useUpdateQuoteInterval()
@@ -58,7 +61,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
   const intradayInterval = prefs?.minute_intraday_refresh_interval ?? 6
   // 滑块本地草稿: 拖动时即时反馈, 停顿 2s 后落库 (与行情轮询滑块一致)
   const [intradayIntervalDraft, setIntradayIntervalDraft] = useState(intradayInterval)
-  // 盘中分钟增量 (Expert 专有): 间隔 (秒), 与后端 [3,120] clamp 对齐; 默认 6
+  // 盘中分钟增量: TickFlow Expert 全市场; 自定义分钟源按配置池增量
   const minuteRefreshInterval = prefs?.minute_refresh_interval ?? 6
   const [minuteRefreshIntervalDraft, setMinuteRefreshIntervalDraft] = useState(minuteRefreshInterval)
   // 盘中增量服务状态 (15s 轮询; 无服务时 available=false)
@@ -69,10 +72,10 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
   })
   const refreshPages = prefs?.sse_refresh_pages ?? {}
   const limitLadderMonitor = prefs?.limit_ladder_monitor_enabled ?? false
-  const hasDepth = !!caps?.capabilities?.['depth5.batch']
-  // 全量分钟 = intraday.universe 能力 (TickFlow Expert 专有): 标的池单请求拉全市场当日分钟,
-  // 修复轮的 intraday.batch 与其同档, 见后端 minute_refresh 服务
+  const hasDepth = !!routeCapUsable(matrix, 'depth5')
+  // TickFlow 全市场分钟 = intraday.universe; 自定义分钟源由后端按配置池增量刷新
   const hasFullMinuteCap = !!caps?.capabilities?.['intraday.universe']
+  const minuteRefreshAvailable = hasFullMinuteCap || !!refreshStatus.data?.custom_provider_active
   const rs = refreshStatus.data
   // 新建监控规则时默认勾选的推送渠道 (全局默认值数组, 单条规则可独立修改)
   const webhookDefaultChannels = prefs?.webhook_default_channels ?? []
@@ -119,6 +122,17 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
   const [botSecretDraft, setBotSecretDraft] = useState(wecomBotSecret)
   const [botError, setBotError] = useState('')
   const [botStatus, setBotStatus] = useState<{connected: boolean; last_error: string} | null>(null)
+  const botStatusQuery = useQuery({
+    queryKey: QK.wecomBotStatus,
+    queryFn: api.getWecomBotStatus,
+    enabled: !!wecomBotId,
+    refetchInterval: wecomBotEnabled ? 5000 : false,
+  })
+  const liveBotStatus = botStatusQuery.data ?? prefs?.wecom_bot_status ?? botStatus
+  const botConnected = liveBotStatus?.connected ?? false
+  const botLastError = liveBotStatus?.last_error ?? ''
+  const botStatusClass = !wecomBotId ? 'text-muted' : (botConnected ? 'text-emerald-500' : (wecomBotEnabled ? 'text-warning' : 'text-muted'))
+  const botStatusLabel = !wecomBotId ? '未配置' : (botConnected ? '已连接' : (wecomBotEnabled ? '连接中' : '已配置'))
   // 飞书渠道配置区展开态 (推送通知卡片内)
   const [channelOpen, setChannelOpen] = useState(false)
   // 企业微信渠道配置区展开态
@@ -286,6 +300,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
         last_error: data.wecom_bot_status?.last_error ?? '',
       })
       qc.invalidateQueries({ queryKey: QK.preferences })
+      qc.invalidateQueries({ queryKey: QK.wecomBotStatus })
     },
     onError: (err: any) => setBotError(String(err?.message ?? '保存失败')),
   })
@@ -302,6 +317,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
         last_error: data.wecom_bot_status?.last_error ?? '',
       })
       qc.invalidateQueries({ queryKey: QK.preferences })
+      qc.invalidateQueries({ queryKey: QK.wecomBotStatus })
     },
   })
 
@@ -466,23 +482,24 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
         {/* 全量分钟: 盘中全市场分钟落盘, 按能力路由 (TickFlow Expert 或声明 full_minute 的插件/自定义源) */}
         <Card icon={Zap} title="全量分钟" anchor="minute-refresh">
           <ToggleRow
-            label="全量分钟落盘"
+            label="分钟K落盘"
             desc={
-              !hasFullMinuteCap ? '需要全量分钟能力 (TickFlow Expert 或声明该能力的自定义源)'
+              !minuteRefreshAvailable ? '需要 TickFlow 全量分钟能力，或配置 Tushare/TDX 等分钟源'
+              : rs?.custom_provider_active ? (rs?.running ? `自定义源运行中 · ${rs?.scope ?? '配置池'}` : `自定义源 · ${rs?.scope ?? '配置池'}`)
               : rs?.repair_only ? `服务运行中 · ${rs?.provider ?? '自定义源'} 无廉价增量端点, 按 ≥60s 全天批量节奏`
               : rs?.running ? (rs?.in_trading_hours ? '服务运行中' : '运行中 · 非连续竞价时段暂停')
               : '已关闭'
             }
             checked={prefs?.minute_refresh_enabled ?? false}
             onChange={(v) => save({ minute_refresh_enabled: v })}
-            disabled={!hasFullMinuteCap}
+            disabled={!minuteRefreshAvailable}
           />
           <div className="mt-3 pt-3 border-t border-border">
             <div className="flex items-center justify-between gap-4 py-1">
               <div className="min-w-0">
                 <div className="text-sm text-foreground">刷新间隔</div>
                 <div className="text-[11px] text-muted">
-                  交易时段内全市场分钟K增量落盘的间隔; 稳态单请求增量, 冷启动/断档自动全天回补
+                  交易时段内分钟K增量落盘间隔; TickFlow 可全市场, 自定义源按分钟同步范围补尾巴
                 </div>
               </div>
               <span className="text-[11px] font-mono text-foreground shrink-0 tabular-nums">
@@ -496,7 +513,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                 max={120}
                 step={3}
                 value={minuteRefreshIntervalDraft}
-                disabled={!hasFullMinuteCap}
+                disabled={!minuteRefreshAvailable}
                 onChange={(e) => setMinuteRefreshIntervalDraft(parseInt(e.target.value, 10))}
                 className="flex-1 h-1 accent-accent cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
               />
@@ -507,6 +524,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
             {rs?.available && rs.rounds != null && rs.rounds > 0 && (
               <div className="mt-2 text-[10px] text-muted">
                 已 {rs.rounds} 轮 · 最近 {rs.last_symbols} 标的 / {rs.last_rows} 行 / {rs.last_requests} 请求
+                {rs.scope ? ` · ${rs.scope}` : ''}
                 {rs.last_round_ms != null ? ` · ${(rs.last_round_ms / 1000).toFixed(1)}s` : ''}
                 {rs.last_error ? ` · ${rs.last_error}` : ''}
               </div>
@@ -893,8 +911,8 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                 />
                 <span className="text-[11px] font-medium text-foreground">企业微信</span>
                 <span className="text-[9px] text-muted">智能机器人</span>
-                <span className={`ml-auto text-[9px] ${wecomBotId ? (botStatus?.connected ? 'text-emerald-500' : 'text-warning') : 'text-muted'}`}>
-                  {wecomBotId ? (botStatus?.connected ? '已连接' : (wecomBotEnabled ? '连接中' : '已配置')) : '未配置'}
+                <span className={`ml-auto text-[9px] ${botStatusClass}`}>
+                  {botStatusLabel}
                 </span>
                 <ChevronDown className={`h-3 w-3 text-muted transition-transform ${botOpen ? 'rotate-180' : ''}`} />
               </div>
@@ -930,8 +948,8 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                     <div className="mt-2 text-[11px] text-danger">{botError}</div>
                   )}
 
-                  {botStatus?.last_error && !botError && (
-                    <div className="mt-2 text-[11px] text-warning">连接异常: {botStatus.last_error}</div>
+                  {botLastError && !botError && (
+                    <div className="mt-2 text-[11px] text-warning">连接异常: {botLastError}</div>
                   )}
 
                   <div className="mt-2 flex items-center gap-2">

@@ -1,0 +1,26 @@
+# Optional isolated StockDB sidecar. Supply verified Linux release files first.
+# docker-compose -f docker-compose.yml -f docker-compose.stockdb.yml up -d stockdb-api
+services:
+  stockdb-api:
+    image: ${STOCKDB_RUNTIME_IMAGE:-tick-stock-panel-v022-integrated-app}
+    container_name: TickFlow_StockDB_Trial
+    entrypoint: ["/opt/stockdb/stockdb"]
+    command: ["stockdb.conf"]
+    working_dir: /work
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1
+    mem_limit: 512m
+    pids_limit: 256
+    environment:
+      HOME: /tmp
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    ports:
+      - "127.0.0.1:7899:7899"
+    volumes:
+      - ${STOCKDB_DIST_HOST:?Set STOCKDB_DIST_HOST}:/opt/stockdb:ro
+      - ${STOCKDB_DATA_HOST:?Set STOCKDB_DATA_HOST}:/work
+    restart: "no"

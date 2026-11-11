@@ -22,15 +22,16 @@ def sync_history(repo, capset, symbol: str, asset_type: str, days: int, *, on_up
     from app.services.heavy_job_limiter import shared_heavy_job_limiter
 
     source = kline_sync.minute_source_stamp()
+    raw_basis = minute_adjust.minute_basis_is_raw(repo.store.data_dir)
     key = (str(repo.store.data_dir.resolve()), capset, asset_type, symbol, days, cn_today(),
-           source, minute_adjust.minute_basis_is_raw(repo.store.data_dir))
+           source, raw_basis)
 
     def run():
         with shared_heavy_job_limiter.slot("normal", timeout=30):
             try:
                 return kline_sync.sync_and_persist_minute(
                     [symbol], repo, capset, days=days, force_full_days=True, asset_type=asset_type,
-                    expected_source=source,
+                    expected_source=source, expected_raw_basis=raw_basis,
                 )
             finally:
                 # 部分批次失败也可能已落盘，其他窗口应读取仓库中的有效结果。
@@ -68,7 +69,7 @@ def pull(repo, symbols: list[str], *, asset_type: str, start: datetime, end: dat
                 raise WorkBusyError("分钟数据源或价格基准已变化，请重新加载")
             if not frame.is_empty():
                 try:
-                    kline_sync._write_minute_partition(frame, folder)
+                    kline_sync._write_minute_partition(frame, folder, asset_type=asset_type)
                     persisted = True
                 except Exception:  # noqa: BLE001 -- callers can still use the valid live rows
                     logger.warning("minute-batch 补拉落盘失败 (降级为仅返回)", exc_info=True)

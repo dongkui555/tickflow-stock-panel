@@ -165,6 +165,35 @@ class Settings(BaseSettings):
 
     # TickFlow
     tickflow_api_key: str = Field(default="", description="留空启用 free 模式")
+    tushare_token: str = Field(default="", description="Tushare Pro API Token")
+    tushare_mode: str = "official"
+    tushare_http_url: str = ""
+    tushare_promax_url: str = ""
+    tushare_promax_key: str = ""
+    tushare_promax_verify_tls: bool = True
+    tushare_datahub_enabled: bool = False
+    tushare_datahub_url: str = "https://datahubco.com/app-api/openapi/v1/tushare"
+    tushare_datahub_key: str = ""
+    tushare_datahub_verify_tls: bool = False
+    tushare_ext_mode: str = "current"
+    tushare_ext_source_chain: str = "promax,datahub"
+    tushare_ext_auto_apis: str = ""
+    tushare_ext_timeout_seconds: float = 12.0
+    # Opt-in minute failover; unrelated providers and datasets keep their routes.
+    minute_fallback_provider: str = ""
+    stockdb_enabled: bool = False
+    stockdb_base_url: str = "http://host.docker.internal:7899"
+    stockdb_minute_fallback_enabled: bool = False
+    stockdb_after_close_primary_enabled: bool = False
+    stockdb_timeout_seconds: float = Field(default=3.0, ge=1, le=10)
+    stockdb_max_stock_days: int = Field(default=50, ge=1, le=200)
+    stockdb_online_fallback_symbols: int = Field(default=5, ge=1, le=50)
+    stockdb_readiness_sample_size: int = Field(default=10, ge=3, le=50)
+    stockdb_readiness_min_coverage: float = Field(default=0.6, ge=0.1, le=1.0)
+    stockdb_publication_retry_seconds: int = Field(default=600, ge=60, le=3600)
+    public_market_fallback_enabled: bool = False
+    public_market_fallback_max_symbols: int = Field(default=100, ge=1, le=300)
+    public_market_fallback_max_age_s: int = Field(default=180, ge=30, le=600)
 
     # AI
     ai_provider: str = "openai_compat"
@@ -198,7 +227,9 @@ class Settings(BaseSettings):
     backtest_range_guard: bool = False
     backtest_matrix_disk_cache_enabled: bool = True
     backtest_matrix_cache_max_mb: int = 512
-    backtest_matrix_cache_prewarm: bool = True
+    # 大型回测矩阵只在实际回测需要时构建；启动预热会与行情/研究请求
+    # 同时占用大量内存，容易让桌面 Docker 环境中的 Web 服务被 OOM 杀掉。
+    backtest_matrix_cache_prewarm: bool = False
     backtest_matrix_cache_prewarm_years: int = 5
 
     # polars collect 并发闸 — polars 共享执行器在多线程并发 collect 下存在死锁

@@ -11,7 +11,8 @@ export function SectionTitle({ icon: Icon, children }: { icon: React.ComponentTy
 }
 
 export function HistoryRow({ job, onClick }: { job: any; onClick: () => void }) {
-  const statusIcon = {
+  const partialIndex = job.status === 'succeeded' && job.result?.index_sync?.complete === false
+  const statusIcon = partialIndex ? { icon: AlertCircle, color: 'text-warning' } : {
     succeeded: { icon: CheckCircle2, color: 'text-bear' },
     failed:    { icon: XCircle, color: 'text-danger' },
     running:   { icon: Loader2, color: 'text-accent', spinning: true },
@@ -36,6 +37,7 @@ export function HistoryRow({ job, onClick }: { job: any; onClick: () => void }) 
         </div>
       </div>
       <div className="text-right shrink-0">
+        {partialIndex && <div className="text-xs text-warning">部分完成：指数缺 {job.result.index_sync.remaining_count} 只</div>}
         {job.result && (() => {
           const r = job.result as Record<string, any>
           const parts: string[] = []

@@ -20,6 +20,10 @@ const Factors = lazy(() => import('./pages/Factors').then(m => ({ default: m.Fac
 const Data = lazy(() => import('./pages/Data').then(m => ({ default: m.Data })))
 const Dashboard = lazy(() => import('./pages/Dashboard').then(m => ({ default: m.Dashboard })))
 const AnalysisDetail = lazy(() => import('./pages/AnalysisDetail').then(m => ({ default: m.AnalysisDetail })))
+const ShortTermAI = lazy(() => import('./pages/ShortTermAI').then(m => ({ default: m.ShortTermAI })))
+const StockFormer = lazy(() => import('./pages/StockFormer').then(m => ({ default: m.StockFormer })))
+const AIAgents = lazy(() => import('./pages/AIAgents').then(m => ({ default: m.AIAgents })))
+const FundMonitor = lazy(() => import('./pages/FundMonitor').then(m => ({ default: m.FundMonitor })))
 const Indices = lazy(() => import('./pages/Indices').then(m => ({ default: m.Indices })))
 const Branding = lazy(() => import('./pages/Branding').then(m => ({ default: m.Branding })))
 const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.Settings })))
@@ -36,12 +40,16 @@ const CORE_ROUTE_PATHS = new Set([
   '/overview',
   '/analysis',
   '/analysis/:menuId',
+  '/short-term-ai',
+  '/stockformer',
+  '/aiagents',
   '/watchlist',
   '/screener',
   '/backtest',
   '/factors',
   '/mining',
   '/data',
+  '/fund-monitor',
   '/indices',
   '/regime',
   '/branding',
@@ -132,12 +140,16 @@ export const router = createBrowserRouter([
       { path: 'overview', element: <Navigate to="/" replace /> },
       { path: 'analysis', element: <Navigate to="/settings?tab=pages&section=ext-pages" replace /> },
       { path: 'analysis/:menuId', element: <AnalysisDetail /> },
+      { path: 'short-term-ai', element: <ShortTermAI /> },
+      { path: 'stockformer', element: <StockFormer /> },
+      { path: 'aiagents', element: <AIAgents /> },
       { path: 'watchlist', element: <Watchlist /> },
       { path: 'screener', element: <Screener /> },
       { path: 'backtest', element: <Backtest /> },
       { path: 'factors', element: <Factors /> },
       { path: 'mining', element: <MiningRedirect /> },
       { path: 'data', element: <Data /> },
+      { path: 'fund-monitor', element: <FundMonitor /> },
       { path: 'indices', element: <Indices /> },
     { path: 'regime', element: <Regime /> },
       { path: 'branding', element: <Branding /> },

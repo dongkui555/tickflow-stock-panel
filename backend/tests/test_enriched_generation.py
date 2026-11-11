@@ -23,6 +23,14 @@ from app.enriched_generation import (
 from app.tickflow.repository import DataStore, KlineRepository
 
 
+@pytest.fixture(autouse=True)
+def instrument_dimension(tmp_path):
+    directory = tmp_path / "instruments"
+    directory.mkdir(exist_ok=True)
+    pl.DataFrame({"symbol": ["000001.SZ"], "code": ["000001"],
+                  "name": ["平安银行"]}).write_parquet(directory / "part.parquet")
+
+
 def _frame(value: float = 10.0) -> pl.DataFrame:
     return pl.DataFrame({
         "symbol": ["000001.SZ"],

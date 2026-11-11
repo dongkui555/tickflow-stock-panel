@@ -1,0 +1,8 @@
+name: tdx
+display_name: "本地 TDX（实时/分钟K）"
+runtime: python
+entry: app.plugins.tdx.provider:TdxProvider
+check: app.plugins.tdx.bridge:availability
+datasets: [daily, minute, realtime]
+description: "对接旧 aiagents-stock 使用的本地 TDX HTTP API。适合自选股、监控标的的实时行情和分钟K；接口按标的请求，不用于全A全量历史同步。"
+install_hint: "Docker Compose 已内置 tdx-api 服务；设置 TDX_ENABLED=1、TDX_BASE_URL=http://tdx-api:8080。若单独部署到宿主机，可改用 http://host.docker.internal:8080。"

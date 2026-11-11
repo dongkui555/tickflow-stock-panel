@@ -311,8 +311,18 @@ def test_stream_failure_preserves_queryable_partitions_and_retry_is_idempotent(m
     source = StreamSource(size=1, fail=True)
     route(monkeypatch, source)
     monkeypatch.setattr(kline_sync.preferences, "get_minute_sync_segment_days", lambda: 20)
+    stock_symbols = ["600000.SH", "600001.SH"]
+    etf_symbols = ["510300.SH", "510500.SH"]
+    for table, pool in (("instruments", stock_symbols), ("instruments_etf", etf_symbols)):
+        directory = tmp_path / table
+        directory.mkdir(exist_ok=True)
+        pl.DataFrame({"symbol": pool, "code": [symbol.split(".")[0] for symbol in pool]}).write_parquet(
+            directory / f"{table}.parquet",
+        )
+    symbols, other_symbols = (etf_symbols, stock_symbols) if asset_type == "etf" else (stock_symbols, etf_symbols)
+    first, second = symbols
     other_table = "kline_minute" if asset_type == "etf" else "kline_etf_minute"
-    kline_sync._write_minute_partition(frame(["other"]), tmp_path / other_table)
+    kline_sync._write_minute_partition(frame(other_symbols[:1]), tmp_path / other_table)
     other_file = next((tmp_path / other_table).rglob("*.parquet"))
     untouched = other_file.read_bytes()
     day = datetime(2026, 11, 6).date()
@@ -320,14 +330,15 @@ def test_stream_failure_preserves_queryable_partitions_and_retry_is_idempotent(m
 
     with pytest.raises(ProviderRequestError):
         kline_sync.sync_and_persist_minute(
-            ["a", "b"], repo, capset, force_full_days=True, asset_type=asset_type,
+            symbols, repo, capset, force_full_days=True, asset_type=asset_type,
         )
-    assert_frame_equal(repo.get_minute("a", day, asset_type=asset_type), frame(["a"]))
-    assert repo.get_minute("b", day, asset_type=asset_type).is_empty()
+    assert_frame_equal(repo.get_minute(first, day, asset_type=asset_type).select(frame([first]).columns), frame([first]))
+    assert repo.get_minute(second, day, asset_type=asset_type).is_empty()
     source.fail = False
     kline_sync.sync_and_persist_minute(
-        ["a", "b"], repo, capset, force_full_days=True, asset_type=asset_type,
+        symbols, repo, capset, force_full_days=True, asset_type=asset_type,
     )
-    for symbol in ("a", "b"):
-        assert_frame_equal(repo.get_minute(symbol, day, asset_type=asset_type), frame([symbol]))
+    for symbol in symbols:
+        expected = frame([symbol])
+        assert_frame_equal(repo.get_minute(symbol, day, asset_type=asset_type).select(expected.columns), expected)
     assert other_file.read_bytes() == untouched

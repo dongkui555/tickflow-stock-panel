@@ -135,6 +135,7 @@ class DepthService:
                     "bid1_vol": row.get("bid1_vol"),
                     "status": row.get("status"),
                     "fetched_ts": row.get("fetched_at"),
+                    "source": row.get("source") or "tickflow",
                 }
             with self._lock:
                 self._sealed_cache = cache
@@ -194,8 +195,8 @@ class DepthService:
         try:
             self._fetch_and_seal(persist=True)  # 落盘, 刷新页面不丢
             with self._lock:
-                count = len(self._sealed_cache)
-            return {"ok": True, "count": count, "msg": f"已修正 {count} 只"}
+                count = len(self._sealed_cache) if self._sealed_ready and self._sealed_date == cn_today() else 0
+            return {"ok": count > 0, "count": count, "msg": f"已修正 {count} 只" if count else "暂无通过校验的当日盘口"}
         except Exception as e:  # noqa: BLE001
             logger.warning("depth run_once 失败: %s", e)
             return {"ok": False, "count": 0, "msg": f"修正失败: {e}"}
@@ -229,6 +230,10 @@ class DepthService:
         # 只读 enriched 内存缓存(线程安全, 避免和 quote_service 写盘竞态)
         enriched, enriched_date = self._repo.get_enriched_latest()
         if enriched.is_empty():
+            return None
+        from app.config import settings
+        if settings.public_market_fallback_enabled and enriched_date != cn_today():
+            logger.warning("depth: stale enriched date, skip current-day snapshot")
             return None
 
         # 筛涨跌停名单(用 fill_null 防止列缺失)
@@ -280,6 +285,7 @@ class DepthService:
                 "bid1_vol": bid1,
                 "status": "limit_down" if sym in down_set and sym not in up_set else "limit_up",
                 "fetched_ts": fetched,
+                "source": d.get("source", "tickflow"),
             }
             new_cache[sym] = entry
 
@@ -301,6 +307,51 @@ class DepthService:
             self._persist(enriched_date)
 
     def _call_depth_batch(self, symbols: list[str]) -> dict:
+        from app.config import settings
+        from app.data_providers.public_market import public_market_backup, qualified_symbol, valid_depth
+
+        enabled = settings.public_market_fallback_enabled
+        if not enabled:
+            return self._call_primary_depth_batch(symbols)
+        result = {}
+        from app.services import preferences
+        primary_name = preferences.get_depth5_data_provider()
+        key = f"primary_depth5:{primary_name}"
+        primary_usable = primary_name != "tickflow" or self._get_capset().has(Cap.DEPTH5_BATCH)
+        if primary_usable and self._has_capability() and public_market_backup.available(key):
+            try:
+                result = self._call_primary_depth_batch(symbols)
+            except Exception as exc:  # noqa: BLE001
+                public_market_backup.record(key, False, type(exc).__name__)
+            else:
+                result = {s: dict(r, source=primary_name) for s, r in result.items()
+                          if s in symbols and valid_depth(r)}
+                public_market_backup.record(key, bool(result), "" if result else "empty_or_invalid_depth")
+        aliases = {qualified_symbol(s): s for s in symbols if s not in result}
+        if aliases and primary_name != "qmt" and str(os.getenv("QMT_ENABLED", "")).strip().lower() in {
+            "1", "true", "yes", "on"
+        }:
+            try:
+                from app.plugins.qmt.provider import QmtProvider
+
+                provider = QmtProvider()
+                try:
+                    qmt_depth = provider.get_depth5(list(aliases))
+                finally:
+                    provider.close()
+                for qualified, row in qmt_depth.items():
+                    storage_symbol = aliases.get(qualified_symbol(qualified))
+                    if storage_symbol and valid_depth(row):
+                        result[storage_symbol] = dict(row, symbol=storage_symbol, source="qmt")
+            except Exception as exc:  # noqa: BLE001
+                logger.info("QMT depth backup unavailable: %s", type(exc).__name__)
+            aliases = {qualified_symbol(s): s for s in symbols if s not in result}
+        missing = {s: "stock" for s in aliases}
+        result.update({aliases[r["symbol"]]: dict(r, symbol=aliases[r["symbol"]])
+                       for r in public_market_backup.fetch(missing, capability="depth5")})
+        return result
+
+    def _call_primary_depth_batch(self, symbols: list[str]) -> dict:
         """按独立五档路由取数; 所有 provider 共用分片限速且失败不跨源回退。"""
         from app.services import preferences
 
@@ -381,6 +432,7 @@ class DepthService:
                 "bid1_vol": e.get("bid1_vol"),
                 "status": e.get("status"),
                 "fetched_at": e.get("fetched_ts"),
+                "source": e.get("source", "tickflow"),
             })
         # 显式 schema: sealed_up/sealed_down 是 bool 与 None 混合, 不指定 schema
         # polars 会按首行推断类型, 后续遇到不一致 (bool vs null) 报
@@ -393,6 +445,7 @@ class DepthService:
             "bid1_vol": pl.Int64,
             "status": pl.Utf8,
             "fetched_at": pl.Float64,
+            "source": pl.Utf8,
         })
         ds = today.isoformat()
         out = self._repo.store.data_dir / "depth5" / f"date={ds}" / "part.parquet"
@@ -431,6 +484,8 @@ class DepthService:
         return self._read_from_parquet(target_date, is_down)
 
     def _read_from_memory(self, is_down: bool) -> dict:
+        from app.config import settings
+        from app.data_providers.public_market import fresh_timestamp
         sealed_key = "sealed_down" if is_down else "sealed_up"
         # 封单量: 涨停=买一量(涨停价买单堆积), 跌停=卖一量(跌停价卖单堆积)
         vol_key = "ask1_vol" if is_down else "bid1_vol"
@@ -441,15 +496,20 @@ class DepthService:
         age = (now - fetched_ts) if fetched_ts else 0.0
         result = {}
         for sym, e in cache.items():
+            ready = (self._sealed_date != cn_today() or not settings.public_market_fallback_enabled
+                     or fresh_timestamp(e.get("fetched_ts")))
             result[sym] = {
-                "sealed": e.get(sealed_key),
-                "vol": e.get(vol_key),
-                "ready": True,
+                "sealed": e.get(sealed_key) if ready else None,
+                "vol": e.get(vol_key) if ready else None,
+                "ready": ready,
                 "age": age,
+                "source": e.get("source", "tickflow"),
             }
         return result
 
     def _read_from_parquet(self, target_date: date, is_down: bool) -> dict:
+        from app.config import settings
+        from app.data_providers.public_market import fresh_timestamp
         if not self._repo:
             return {}
         out = self._repo.store.data_dir / "depth5" / f"date={target_date.isoformat()}" / "part.parquet"
@@ -468,11 +528,14 @@ class DepthService:
             sym = row.get("symbol")
             if not sym:
                 continue
+            ready = (target_date != cn_today() or not settings.public_market_fallback_enabled
+                     or fresh_timestamp(row.get("fetched_at")))
             result[sym] = {
-                "sealed": row.get(sealed_key),
-                "vol": row.get(vol_key),
-                "ready": True,
+                "sealed": row.get(sealed_key) if ready else None,
+                "vol": row.get(vol_key) if ready else None,
+                "ready": ready,
                 "age": None,  # 盘后定版, 无 age
+                "source": row.get("source") or "tickflow",
             }
         return result
 
@@ -480,7 +543,7 @@ class DepthService:
         """sealed 数据是否就绪(供前端降级判定)。"""
         # 内存缓存对应的数据日 == 查询日 → 看内存就绪状态
         if self._sealed_date and target_date == self._sealed_date:
-            return self._sealed_ready
+            return self._sealed_ready and any(row["ready"] for row in self._read_from_memory(False).values())
         # 其他日期: 有 parquet 就 ready
         return self._persisted_for_date(target_date)
 
@@ -638,6 +701,9 @@ class DepthService:
         本轮修复前此处只查 capset, 导致「五档已切到插件但启动补跑被跳过」。
         """
         from app.data_providers.capabilities import capability_gate
+        from app.config import settings
+        if settings.public_market_fallback_enabled:
+            return True
         ok, _ = capability_gate("depth5")
         return ok
 

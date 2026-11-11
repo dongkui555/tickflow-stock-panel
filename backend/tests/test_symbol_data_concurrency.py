@@ -74,7 +74,7 @@ def test_same_live_minute_read_is_shared(monkeypatch):
 def test_list_and_detail_share_daily_preparation_and_notify_every_window(tmp_path, monkeypatch):
     repo = KlineRepository(DataStore(tmp_path))
     symbol = "159558.SZ"
-    repo.save_etf_instruments(pl.DataFrame({"symbol": [symbol]}))
+    repo.save_etf_instruments(pl.DataFrame({"symbol": [symbol], "code": ["159558"]}))
     capset = CapabilitySet()
     quotes = QuoteService()
     subscribers = [quotes.subscribe(), quotes.subscribe()]

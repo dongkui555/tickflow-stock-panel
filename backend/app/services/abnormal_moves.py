@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -122,6 +123,44 @@ def _status_of(closeness: float) -> str:
     return _STATUS_WATCH
 
 
+def _float_or_none(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _live_stock_rows(quote_service: Any) -> tuple[dict, str | None, str, int]:
+    if quote_service is None or not hasattr(quote_service, "get_enriched_today"):
+        return {}, None, "none", 0
+    try:
+        df, live_date = quote_service.get_enriched_today()
+        live_date_iso = live_date.isoformat() if hasattr(live_date, "isoformat") else str(live_date)
+        status = quote_service.status() if hasattr(quote_service, "status") else {}
+        status = status or {}
+    except Exception:
+        return {}, None, "none", 0
+    if df is None or df.is_empty() or "symbol" not in df.columns:
+        return {}, live_date_iso, "none", 0
+    if live_date_iso != cn_today().isoformat():
+        return {}, live_date_iso, "stale", 0
+    mode = str(status.get("mode") or "").lower()
+    count = int(status.get("symbol_count") or 0)
+    if mode == "none" or (mode == "watchlist" and count <= 0):
+        return {}, live_date_iso, "none", 0
+    # A scoped service may return a historical full-market fallback frame.
+    if mode == "watchlist" and df.height > max(count + 30, count * 4):
+        return {}, live_date_iso, "stale", 0
+    columns = [c for c in ("symbol", "name", "close", "change_pct") if c in df.columns]
+    rows = {str(r["symbol"]): {
+        "name": r.get("name"), "close": _float_or_none(r.get("close")),
+        "rt_pct": _float_or_none(r.get("change_pct")),
+    } for r in df.select(columns).iter_rows(named=True)}
+    scope = "full_market" if mode == "full_market" else "partial"
+    return rows, live_date_iso, scope, min(df.height, count) if mode == "watchlist" else df.height
+
+
 def _hist_snapshot(repo: Any) -> dict[str, Any]:
     """enriched 最新日的偏离列快照 (60s 进程内缓存)。"""
     now = time.monotonic()
@@ -190,6 +229,12 @@ def build_overview(
     hist = _hist_snapshot(repo)
     cache_date = hist.get("cache_date")
     hist_rows: dict[str, dict[str, Any]] = hist["rows"]
+    live_rows, live_date, realtime_scope, realtime_symbols = _live_stock_rows(quote_service)
+    try:
+        name_map = repo.get_name_map(list(hist_rows)) if hasattr(repo, "get_name_map") else {}
+    except Exception:
+        name_map = {}
+    name_map = name_map or {}
 
     bench_rt = _bench_rt_pct(quote_service) if quote_service is not None else 0.0
     # 实时叠加按板块基准: 科创板减科创50、创业板减创业板综指, 不再全市场混均值
@@ -211,10 +256,12 @@ def build_overview(
 
     out_rows: list[dict[str, Any]] = []
     for symbol, base in hist_rows.items():
-        rule = rule_for(symbol, base.get("name"))
-        rt_pct = base.get("rt_pct")
-        rt_delta = 0.0 if includes_today else (
-            (rt_pct or 0.0) - bench_by_key.get(_bench_key_of(symbol), 0.0)
+        live_row = live_rows.get(symbol, {})
+        name = base.get("name") or live_row.get("name") or name_map.get(symbol)
+        rule = rule_for(symbol, name)
+        rt_pct = base.get("rt_pct") if includes_today else live_row.get("rt_pct")
+        rt_delta = 0.0 if includes_today or rt_pct is None else (
+            rt_pct - bench_by_key.get(_bench_key_of(symbol), 0.0)
         )
 
         windows: dict[str, dict[str, Any]] = {}
@@ -237,10 +284,10 @@ def build_overview(
             continue
         out_rows.append({
             "symbol": symbol,
-            "name": base.get("name"),
+            "name": name,
             "board": rule.board,
             "st": rule.st,
-            "close": base.get("close"),
+            "close": live_row.get("close") if live_row.get("close") is not None else base.get("close"),
             "rt_pct": rt_pct,
             "windows": windows,
             "max_closeness": round(max_closeness, 4),
@@ -258,6 +305,9 @@ def build_overview(
         "cache_date": cache_date,
         "bench_rt_pct": round(bench_rt, 4),
         "includes_today": includes_today,
+        "live_date": live_date,
+        "realtime_scope": realtime_scope,
+        "realtime_symbols": realtime_symbols,
         "rules": RULES_META,
         "counts": counts,
         "rows": out_rows[:limit],

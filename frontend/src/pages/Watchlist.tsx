@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Trash2, RefreshCw, Star, X, Search, LayoutGrid, List, Rows3, BarChart3, Settings2, Plus, Check, Filter, Eye, EyeOff, Minus, ChevronsUp, Clock, RotateCcw, FileUp, FolderOpen, FolderMinus, FolderPlus } from 'lucide-react'
+import { Trash2, RefreshCw, Star, X, Search, LayoutGrid, List, Rows3, BarChart3, Settings2, Plus, Check, Filter, Eye, EyeOff, Minus, ChevronsUp, Clock, RotateCcw, FileUp, Sparkles, Loader2, FolderOpen, FolderMinus, FolderPlus } from 'lucide-react'
 import { api, type KlineRow, type MinuteKlineRow, type WatchlistGroup, type WatchlistGroupColor } from '@/lib/api'
 import { ExtSparkChart } from '@/components/screener/ExtSparkChart'
 import { MINUTE_SEED_MAX } from '@/lib/minuteBatchIncremental'
@@ -16,6 +16,8 @@ import { reuseUnchangedSeries, EMPTY_ROWS } from '@/lib/series-identity'
 import { QK } from '@/lib/queryKeys'
 import { storage } from '@/lib/storage'
 import { fmtPrice, fmtPct, fmtBigNum, priceColorClass, formatExtNumber, fmtAssetPrice } from '@/lib/format'
+import { toast } from '@/components/Toast'
+import { findTodayReport, openHistoryReport, startAnalysis } from '@/lib/stockAnalysisStore'
 import { cn } from '@/lib/cn'
 import { computeGroupPcts, loadGroupStatsConfig, type GroupStatsConfigPatch } from '@/lib/watchlistGroupStats'
 import { PageHeader } from '@/components/PageHeader'
@@ -52,6 +54,7 @@ import { boardTag, renderBuiltinDataCell } from '@/components/stock-table/primit
 import { getSignals, signalCls, getSortValue, getIntradaySortValue, UNSORTABLE_KEYS } from '@/lib/stock-table'
 import { resolveCandleConfig, resolveIntradayConfig, resolveChartLink } from '@/lib/list-columns'
 import { useAuctionConfig, useAuctionSeries } from '@/lib/intraday-auction'
+import { normalizeSymbol } from '@/lib/symbol'
 import { useQuoteStatus, useCapabilities, usePreferences } from '@/lib/useSharedQueries'
 import {
   type ColumnConfig,
@@ -320,8 +323,14 @@ function StockSearchBox({
     }
   }
 
-  function handleSelect(r: { symbol: string; name: string }) {
-    onPreview(r.symbol, r.name)
+  function canonicalSearchSymbol(r: { symbol: string; asset_type?: string }) {
+    // Stock instrument tables may expose a bare code while index tables use
+    // the same code with .SH/.SZ. Keep the selected asset type explicit.
+    return r.asset_type === 'stock' ? normalizeSymbol(r.symbol) : r.symbol
+  }
+
+  function handleSelect(r: { symbol: string; name: string; asset_type?: string }) {
+    onPreview(canonicalSearchSymbol(r), r.name)
     setQuery('')
     setOpen(false)
     setActiveIdx(-1)
@@ -353,11 +362,14 @@ function StockSearchBox({
             className="absolute right-0 top-full mt-1 z-50 w-72 max-h-[320px] overflow-y-auto rounded-card border border-border bg-base shadow-xl"
           >
             {results.map((r, i) => {
+              const selectedSymbol = canonicalSearchSymbol(r)
               const entryGids = existingBySymbol.get(r.symbol)
-              const inWatchlist = entryGids !== undefined
+              const canonical = normalizeSymbol(r.symbol)
+              const canonicalEntryGids = entryGids ?? existingBySymbol.get(canonical)
+              const inWatchlist = canonicalEntryGids !== undefined
               return (
                 <div
-                  key={r.symbol}
+                  key={`${r.asset_type ?? 'unknown'}:${r.symbol}`}
                   className={`flex items-center gap-2.5 px-3 py-2 text-xs transition-colors duration-100 ${
                     i === activeIdx ? 'bg-accent/10 text-accent' : 'hover:bg-elevated text-foreground'
                   }`}
@@ -398,8 +410,8 @@ function StockSearchBox({
                       </span>
                       <WatchlistGroupPicker
                         groups={groups}
-                        groupIds={entryGids}
-                        symbol={r.symbol}
+                        groupIds={canonicalEntryGids}
+                        symbol={selectedSymbol}
                         disabled={memberPending}
                         onToggleMember={onToggleMember}
                       />
@@ -410,7 +422,7 @@ function StockSearchBox({
                     <span className="flex shrink-0 items-center gap-0.5">
                       <button
                         type="button"
-                        onClick={event => { event.stopPropagation(); onAdd(r.symbol, preferredGroupId ?? null) }}
+                        onClick={event => { event.stopPropagation(); onAdd(selectedSymbol, preferredGroupId ?? null) }}
                         disabled={addPending}
                         className="shrink-0 rounded p-1 text-muted transition-colors hover:bg-accent/10 hover:text-accent disabled:opacity-50 cursor-pointer"
                         title={
@@ -418,12 +430,12 @@ function StockSearchBox({
                             ? `加入自选 · 当前分组「${groups.find(g => g.id === preferredGroupId)?.name ?? ''}」`
                             : '加入自选 (未分组)'
                         }
-                        aria-label={`快速加入自选 ${r.symbol}`}
+                        aria-label={`快速加入自选 ${selectedSymbol}`}
                       >
                         <Plus className="h-3.5 w-3.5" />
                       </button>
                       <WatchlistAddMenu
-                        onSelect={groupId => onAdd(r.symbol, groupId)}
+                        onSelect={groupId => onAdd(selectedSymbol, groupId)}
                         preferredGroupId={preferredGroupId}
                         disabled={addPending}
                         triggerClassName="shrink-0 rounded p-1 text-muted transition-colors hover:bg-accent/10 hover:text-accent disabled:opacity-50"
@@ -500,7 +512,9 @@ const StockCard = React.memo(function StockCard({
   onConfirmRemove,
   onCancelRemove,
   onRequestRemove,
+  onAnalyze,
   isConfirming,
+  analysisPending,
   extCols,
   expandedCells,
   onToggleExpand,
@@ -518,7 +532,9 @@ const StockCard = React.memo(function StockCard({
   onConfirmRemove: (symbol: string) => void
   onCancelRemove: () => void
   onRequestRemove: (symbol: string) => void
+  onAnalyze: (symbol: string, name: string) => void
   isConfirming: boolean
+  analysisPending: boolean
   extCols: ColumnConfig[]
   expandedCells: Set<string>
   onToggleExpand: (key: string) => void
@@ -573,6 +589,16 @@ const StockCard = React.memo(function StockCard({
           </div>
         ) : (
           <div className="flex items-center gap-0.5" onClick={e => e.stopPropagation()}>
+            <button
+              type="button"
+              onClick={() => onAnalyze(r.symbol, name ?? '')}
+              disabled={analysisPending}
+              className="text-muted hover:text-accent transition-colors duration-150 p-0.5 rounded hover:bg-accent/10 disabled:opacity-50"
+              aria-label="个股AI分析"
+              title="个股AI分析（今日已有报告则直接打开）"
+            >
+              {analysisPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+            </button>
             <WatchlistGroupPicker
               groups={groups}
               groupIds={r.group_ids ?? []}
@@ -594,7 +620,7 @@ const StockCard = React.memo(function StockCard({
       {/* 卡片内容 */}
       <div className="pl-4 pr-2.5 pt-2.5 pb-0">
         {/* 第一行: 代码 + 名称 + 板块标识 */}
-        <div className="flex items-center gap-1.5 min-w-0 mb-2 pr-8">
+        <div className="flex items-center gap-1.5 min-w-0 mb-2 pr-14">
           <span className="shrink-0 font-mono text-foreground text-xs tracking-wide">
             {r.symbol}
           </span>
@@ -972,6 +998,7 @@ export function Watchlist() {
       qc.invalidateQueries({ queryKey: QK.watchlist })
       qc.invalidateQueries({ queryKey: ['watchlist-enriched'] })
     },
+    onError: error => toast(`加入自选失败: ${String((error as Error)?.message || error)}`, 'error'),
   })
 
   const remove = useMutation({
@@ -994,6 +1021,7 @@ export function Watchlist() {
       qc.invalidateQueries({ queryKey: ['watchlist-enriched'] })
       qc.invalidateQueries({ queryKey: ['kline-batch'] })
     },
+    onError: error => toast(`删除自选失败: ${String((error as Error)?.message || error)}`, 'error'),
   })
 
   const moveToTop = useMutation({
@@ -1069,6 +1097,7 @@ export function Watchlist() {
   // 二次确认状态
   const [confirmClear, setConfirmClear] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null)
+  const [analysisPendingSymbol, setAnalysisPendingSymbol] = useState<string | null>(null)
 
   // 稳定的 per-symbol 回调 (供 memo 化的 StockCard 使用, 避免每次渲染都传新引用)
   const handleCardPreview = useCallback((sym: string, name: string) => {
@@ -1079,6 +1108,24 @@ export function Watchlist() {
   }, [remove])
   const handleCardCancelRemove = useCallback(() => setConfirmRemove(null), [])
   const handleCardRequestRemove = useCallback((sym: string) => setConfirmRemove(sym), [])
+  const handleStockAnalysis = useCallback(async (sym: string, stockName: string) => {
+    if (!sym || analysisPendingSymbol === sym) return
+    setAnalysisPendingSymbol(sym)
+    try {
+      const today = await findTodayReport(sym)
+      if (today) {
+        openHistoryReport(today.id)
+        return
+      }
+      const result = await startAnalysis(sym, stockName, '', 'multi_agent')
+      if (result.error) toast(result.error, 'error')
+    } catch {
+      const result = await startAnalysis(sym, stockName, '', 'multi_agent')
+      if (result.error) toast(result.error, 'error')
+    } finally {
+      setAnalysisPendingSymbol(null)
+    }
+  }, [analysisPendingSymbol])
   const handleToggleMember = useCallback((symbol: string, groupId: string, member: boolean) => {
     if (member) addGroupMember.mutate({ symbol, groupId })
     else removeGroupMember.mutate({ symbol, groupId })
@@ -1098,7 +1145,7 @@ export function Watchlist() {
     [enriched.data?.rows],
   )
   const groupBySymbol = useMemo(
-    () => new Map(listEntries.map(entry => [entry.symbol, entry.group_ids ?? []])),
+    () => new Map(listEntries.map(entry => [normalizeSymbol(entry.symbol), entry.group_ids ?? []])),
     [listEntries],
   )
   // 分组等权平均涨跌幅 (实时优先 rt_pct, 收盘兜底 change_pct; 与表格同源)
@@ -1155,11 +1202,11 @@ export function Watchlist() {
 
   // 实时监控圆点: 仅 Free/低档 "按自选实时监控" 模式 (mode === 'watchlist') 下显示;
   // 全市场模式 (mode === 'full_market') 全部标的都在监控, 标圆点无意义, 故不显示。
-  // 后端自选实时模式实际只监控自选页前 N 个 (N = watchlist_symbol_count), 顺序与 allSymbols 一致。
+  // 后端按标的实时模式会监控自选、持仓、监控规则和核心指数。
   const realtimeMode = quoteStatus.data?.mode
-  const watchlistMonitoredCount = quoteStatus.data?.watchlist_symbol_count ?? 0
+  const watchlistMonitoredCount = quoteStatus.data?.watchlist_symbol_count ?? quoteStatus.data?.symbol_count ?? 0
   const showRealtimeDot = realtimeRunning && realtimeMode === 'watchlist'
-  // 真正被监控的标的集合 (自选列表前 watchlistMonitoredCount 个)
+  // 兼容旧后端字段: 没有 watchlist_symbol_count 时用本轮股票报价数量。
   const monitoredSymbols = useMemo(
     () => showRealtimeDot ? new Set(allSymbols.slice(0, watchlistMonitoredCount)) : new Set<string>(),
     [showRealtimeDot, allSymbols, watchlistMonitoredCount],
@@ -1420,7 +1467,9 @@ export function Watchlist() {
       onConfirmRemove={handleCardConfirmRemove}
       onCancelRemove={handleCardCancelRemove}
       onRequestRemove={handleCardRequestRemove}
+      onAnalyze={handleStockAnalysis}
       isConfirming={confirmRemove === r.symbol}
+      analysisPending={analysisPendingSymbol === r.symbol}
       extCols={visibleExtCols}
       expandedCells={expandedCells}
       onToggleExpand={handleToggleExpand}
@@ -1887,6 +1936,16 @@ export function Watchlist() {
                             </div>
                           ) : (
                             <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => handleStockAnalysis(r.symbol, name ?? '')}
+                                disabled={analysisPendingSymbol === r.symbol}
+                                className="p-0.5 text-muted hover:text-accent hover:bg-accent/10 rounded transition-colors duration-150 ease-smooth disabled:opacity-50"
+                                aria-label="个股AI分析"
+                                title="个股AI分析（今日已有报告则直接打开）"
+                              >
+                                {analysisPendingSymbol === r.symbol ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                              </button>
                               <WatchlistGroupPicker
                                 groups={groups}
                                 groupIds={r.group_ids ?? []}

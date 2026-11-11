@@ -20,6 +20,9 @@ export const CARD_META: Record<string, {
   etf:         { capKey: 'kline.daily.batch',       missingCapName: '' },
   minute:      { capKey: 'kline.minute.batch',      missingCapName: '分钟 K(批量)' },
   financials:  { capKey: 'financial',               missingCapName: '财务数据' },
+  moneyflow:   { capKey: 'moneyflow',               missingCapName: '主力资金' },
+  auction_open:{ capKey: 'auction',                 missingCapName: '集合竞价' },
+  news:        { capKey: 'news',                    missingCapName: '新闻' },
   regime:      { capKey: '',                        missingCapName: '' },
 }
 

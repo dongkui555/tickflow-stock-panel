@@ -1,7 +1,7 @@
 """FuyaoProvider 契约与单位标准化测试。
 
 不依赖真实网络: 用假 FuyaoClient 返回样例快照页/历史K线/dump, 验证字段映射、
-单位口径 (CONTRIBUTING §3.1: 百分数→小数、volume 股→手)、日K取数分档
+单位口径 (百分数→小数、volume 按股保存)、日K取数分档
 (10d dump / 单标的接口)、除权因子推导 (交易所公式 + half-up 舍入 +
 同日合并 + 涨跌停自检)、能力声明 (未声明数据集回退 tickflow) 与设置页试拉。
 """
@@ -111,8 +111,8 @@ def test_snapshot_units_and_field_mapping(monkeypatch):
     assert r["open"] == 1460.0
     assert r["high"] == 1490.5
     assert r["low"] == 1455.0
-    # volume 单位股(1234500) → 内部契约手: floor(1234500/100) = 12345
-    assert r["volume"] == 12345
+    # volume 单位股, 与当前历史库口径一致, 不做 /100。
+    assert r["volume"] == 1234500
     assert r["amount"] == 1.83e9
     assert r["timestamp"] > 0
     # 快照不提供的字段必须为 None, 不启发式伪造
@@ -702,8 +702,8 @@ def _adj_provider(monkeypatch, events: list[tuple], bars_by_symbol: dict) -> Fuy
 # ---- daily: 单标的接口路径 ----
 
 
-def test_daily_api_units_volume_shares_to_lots(monkeypatch):
-    """核心口径: 原始价 + volume 股→手 floor(/100) + 上海零点时区。"""
+def test_daily_api_units_volume_keeps_shares(monkeypatch):
+    """核心口径: 原始价 + volume 按股保存 + 上海零点时区。"""
     bars = [
         _bar(date(2026, 8, 26), 11.10),
         _bar(date(2026, 8, 27), 11.05),
@@ -716,7 +716,7 @@ def test_daily_api_units_volume_shares_to_lots(monkeypatch):
     assert df.columns == ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
     assert df.schema["date"] == pl.Date
     assert df["date"].to_list() == [date(2026, 8, 26), date(2026, 8, 27), date(2026, 8, 28)]
-    assert df["volume"].to_list() == [16126.0] * 3  # 1,612,611 股 → 16126 手
+    assert df["volume"].to_list() == [1_612_611.0] * 3
     assert df["close"].to_list() == [11.10, 11.05, 11.65]
     assert df["amount"].to_list() == [b["turnover"] for b in bars]
 
@@ -810,7 +810,7 @@ def _recent_daily_dump() -> pl.DataFrame:
 
 
 def test_daily_recent_window_uses_dump_without_api_calls(monkeypatch):
-    """近端窗口: 一次 dump 覆盖全部标的, 不打单标的接口; volume 股→手; 停牌行过滤。"""
+    """近端窗口: 一次 dump 覆盖全部标的, 不打单标的接口; volume 按股保存; 停牌行过滤。"""
     provider = _hist_provider(monkeypatch, _FakeHistClient({}))
     provider._dump_memo[fp._DAILY10_DUMP_KIND] = _recent_daily_dump()
     progress = []
@@ -823,7 +823,7 @@ def test_daily_recent_window_uses_dump_without_api_calls(monkeypatch):
     assert provider._get_client().calls == []  # 未走单标的接口
     assert progress == [(1, 1)]
     assert set(df["symbol"].to_list()) == {"000001.SZ"}  # 未请求的标的不混入
-    assert df["volume"].max() == 975_701.0  # 97,570,170 股 → 975,701 手
+    assert df["volume"].max() == 97_570_170.0
     assert date(2026, 8, 26) in df["date"].to_list()
     # 停牌行(open=high=0)被 filter_halt_days 剔除, 08-27 仅保留正常行
     assert df.filter(pl.col("date") == date(2026, 8, 27)).height == 1
@@ -934,7 +934,7 @@ def _bigdump_provider(
 
 
 def test_daily_deep_window_uses_big_dump(monkeypatch, tmp_path):
-    """深窗口走 10 年 dump: 不打单标的接口, volume 股→手, 未请求标的不混入。"""
+    """深窗口走 10 年 dump: 不打单标的接口, volume 按股保存, 未请求标的不混入。"""
     rows = [
         {
             "thscode": "000001.SZ",
@@ -977,7 +977,7 @@ def test_daily_deep_window_uses_big_dump(monkeypatch, tmp_path):
     assert progress == [(1, 1)]
     assert set(df["symbol"].to_list()) == {"000001.SZ"}
     assert df["date"].to_list() == [date(2026, 1, 5), date(2026, 6, 12), date(2026, 8, 14)]
-    assert df["volume"].to_list() == [975_701.0, 12_345.0, 12_345.0]
+    assert df["volume"].to_list() == [97_570_170.0, 1_234_500.0, 1_234_500.0]
 
 
 def test_iter_daily_big_dump_reads_bounded_record_batches(monkeypatch, tmp_path):

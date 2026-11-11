@@ -69,15 +69,13 @@ def minute_panel_start(start: date, daily_bars: int) -> date:
 def _trigger_hhmm(value) -> str:
     """从 last_datetime 提取北京时间 "HH:MM" 触发分钟。
 
-    分区 datetime 为 UTC 存储 (tz-aware 或 naive-UTC), 统一折算到北京时区。
+    分区 datetime 为北京时间墙钟；只有带时区输入才转换。
     """
     from app.market_time import CN_TZ
 
     if hasattr(value, "astimezone"):
         if value.tzinfo is None:
-            from datetime import timezone
-
-            value = value.replace(tzinfo=timezone.utc)
+            return value.strftime("%H:%M")
         return value.astimezone(CN_TZ).strftime("%H:%M")
     text = str(value or "")
     if len(text) >= 16 and text[13] == ":":
@@ -111,6 +109,8 @@ class MinuteReplayResult:
     replayed_days: int = 0
     strategy_matches: int = 0
     buy_limit_up: int = 0
+    excluded_stock_days: int = 0
+    quality_issues: list[dict] = field(default_factory=list)
     elapsed_ms: float = 0.0
 
 
@@ -177,7 +177,15 @@ class MinuteSignalReplayer:
                     "date": str(day),
                 })
 
-            history = repo.get_minute_by_dates(universe, [day], "stock")
+            from app.services.minute_quality import filter_minute_sessions
+
+            quality_reader = getattr(repo, "get_minute_quality", None)
+            if callable(quality_reader):
+                history, issues = quality_reader(universe, [day], "stock")
+            else:
+                history, issues = filter_minute_sessions(repo.get_minute_by_dates(universe, [day], "stock"))
+            result.excluded_stock_days += len(issues)
+            result.quality_issues.extend(issues[:max(0, 100 - len(result.quality_issues))])
             if history.is_empty():
                 result.skipped_days.append(day)
                 continue

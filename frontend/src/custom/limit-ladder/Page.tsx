@@ -14,7 +14,8 @@ import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { ErrorState } from '@/components/ErrorState'
 import { useTheme } from '@/lib/theme'
-import { useCapabilities, usePreferences } from '@/lib/useSharedQueries'
+import { useCapabilityMatrix, usePreferences } from '@/lib/useSharedQueries'
+import { routeCapUsable } from '@/lib/capability-labels'
 import { SealedBadge } from '@/components/SealedBadge'
 import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
 import type { ExtColumnDisplayConfig } from '@/lib/watchlist-columns'
@@ -211,8 +212,8 @@ const STATUS_STYLE: Record<string, { bg: string; bar: string; nameCls: string; c
  *  (否则休市日/节假日会把最新交易日误判为历史)。
  */
 function useSealedDegrade(asOf: string, latestDate: string | undefined, sealedReady: boolean | undefined, sealedCounts?: { real: number; fake: number; pending: number }) {
-  const { data: caps } = useCapabilities()
-  const hasDepth = !!caps?.capabilities?.['depth5.batch']
+  const { data: matrix } = useCapabilityMatrix()
+  const hasDepth = !!routeCapUsable(matrix, 'depth5')
   // 历史判定: 用户主动选了早于最新交易日的日期
   const isHistorical = !!asOf && !!latestDate && asOf < latestDate
   // 降级: 无能力 / 历史日期 / 最新日但 sealed 未就绪

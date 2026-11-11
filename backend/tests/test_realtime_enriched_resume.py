@@ -272,7 +272,7 @@ def test_realtime_enriched_missing_quote_extra_fields_fall_back_to_recompute():
     assert result["amplitude"].is_not_null().all()
 
 
-def test_repository_restores_active_rows_missing_from_latest_enriched(tmp_path):
+def test_repository_restores_active_rows_missing_from_latest_enriched(tmp_path, monkeypatch):
     today = date(2026, 7, 30)
     repo = KlineRepository(DataStore(tmp_path))
     repo._live_agg_cache = _live_state()
@@ -305,6 +305,16 @@ def test_repository_restores_active_rows_missing_from_latest_enriched(tmp_path):
     history = _previous_enriched().with_columns(
         pl.lit(today - timedelta(days=1)).alias("date"),
     )
+
+    original_filter = pl.DataFrame.filter
+
+    def bounded_filter(frame, *args, **kwargs):
+        result = original_filter(frame, *args, **kwargs)
+        if frame is history:
+            assert set(result["symbol"]) <= {"000820.SZ"}, "repair copied unrelated historical rows"
+        return result
+
+    monkeypatch.setattr(pl.DataFrame, "filter", bounded_filter)
 
     restored = repo._restore_missing_latest_rows(today, existing_today, history)
 

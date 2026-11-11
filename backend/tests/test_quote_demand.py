@@ -120,7 +120,7 @@ def test_partial_quotes_merge_both_raw_and_enriched_instead_of_replacing(market,
     repo.merge_live_daily_asset = lambda asset, frame: writes.append(("raw", asset))
     repo.flush_live_daily = Mock(side_effect=AssertionError("partial stock must merge"))
     repo.flush_live_daily_asset = Mock(side_effect=AssertionError("partial ETF must merge"))
-    monkeypatch.setattr(service, "_flush_live_enriched", lambda frame, extra, *, asset_type, merge=False: writes.append(("enriched", asset_type, merge)))
+    monkeypatch.setattr(service, "_flush_live_enriched", lambda frame, extra, *, asset_type, merge=False, **_kwargs: writes.append(("enriched", asset_type, merge)))
     monkeypatch.setattr(service, "_broadcast_quote_updated", lambda: None)
     monkeypatch.setattr(service, "_update_volume_delta", lambda *a: None)
     monkeypatch.setattr(quote_service, "_persist_last_fetch", lambda *a: None)

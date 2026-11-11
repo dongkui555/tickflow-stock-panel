@@ -2368,6 +2368,8 @@ class StrategyBacktestService:
             "replayed_days": replay.replayed_days,
             "skipped_days": [str(day) for day in replay.skipped_days[:50]],
             "skipped_day_count": len(replay.skipped_days),
+            "excluded_stock_days": replay.excluded_stock_days,
+            "quality_issues": replay.quality_issues,
             "dropped_axis_hits": dropped_axis_hits,
         }
 

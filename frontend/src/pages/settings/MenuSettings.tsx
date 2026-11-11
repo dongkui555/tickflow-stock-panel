@@ -42,9 +42,13 @@ const BUILTIN_PAGES: NavEntry[] = [
   { id: '/', label: '看板', type: 'builtin', visible: true },
   { id: '/watchlist', label: '自选', type: 'builtin', visible: true },
   { id: '/screener', label: '策略', type: 'builtin', visible: true },
+  { id: '/short-term-ai', label: '短线AI荐股', type: 'builtin', visible: true },
   { id: '/factors', label: '因子', type: 'builtin', visible: true },
   { id: '/backtest', label: '回测', type: 'builtin', visible: true },
+  { id: '/stockformer', label: 'StockFormer', type: 'builtin', visible: true },
+  { id: '/aiagents', label: 'AI增强', type: 'builtin', visible: true },
   { id: '/regime', label: '市场环境', type: 'builtin', visible: true },
+  { id: '/fund-monitor', label: '资金监控', type: 'builtin', visible: true },
   { id: '/indices', label: '指数', type: 'builtin', visible: true },
   { id: '/data', label: '数据', type: 'builtin', visible: true },
 ]

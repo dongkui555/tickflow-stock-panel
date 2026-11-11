@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from app.api import task_registry as task_registry_api
 from app.services import task_registry
+from app.services.fs_utils import atomic_write_text
 
 
 @pytest.fixture
@@ -61,7 +62,7 @@ def test_orphan_running_pruned_on_read(tmp_path: Path) -> None:
     p = tmp_path / "user_data" / task_registry._FILENAME
     doc = json.loads(p.read_text(encoding="utf-8"))
     doc["items"][0]["updated_at"] = time.time() - (task_registry.ORPHAN_RUNNING_SECONDS + 3600)
-    p.write_text(json.dumps(doc), encoding="utf-8")
+    atomic_write_text(p, json.dumps(doc))
 
     items = task_registry.list_items(tmp_path)
     assert items == [], "孤儿 running 项应在读取时被回收"

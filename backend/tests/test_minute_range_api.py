@@ -85,8 +85,9 @@ def test_minute_range_does_not_read_stock_store_for_index():
     repo.get_minute_range.assert_not_called()
 
 
-def test_sync_minute_single_uses_requested_days(monkeypatch):
+def test_sync_minute_single_uses_requested_days(monkeypatch, tmp_path):
     repo = MagicMock()
+    repo.store.data_dir = tmp_path
     repo.resolve_asset_type.return_value = "stock"
     capset = MagicMock()
     sync = MagicMock(return_value=2400)
@@ -104,6 +105,7 @@ def test_sync_minute_single_uses_requested_days(monkeypatch):
     sync.assert_called_once_with(
         ["600000.SH"], repo, capset, days=10, force_full_days=True, asset_type="stock",
         expected_source=kline_api.kline_sync.minute_source_stamp(),
+        expected_raw_basis=False,
     )
     refresh.assert_called_once_with(repo, "kline_minute")
 

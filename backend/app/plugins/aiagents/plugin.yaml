@@ -1,0 +1,8 @@
+name: aiagents
+display_name: "AI Agents 多源降级（行情/资金/海外）"
+runtime: python
+entry: app.plugins.aiagents.provider:AIAgentsProvider
+check: app.plugins.aiagents.bridge:availability
+datasets: [daily, minute, realtime]
+description: "接入 TickFlow 本地的多源 A 股行情、分钟线、实时行情，以及 AI Agents 增强 API 中的资金流、海外行情和新闻上下文。"
+install_hint: "请安装 backend/app/plugins/aiagents/requirements.txt，并确保数据目录与网络访问可用。"

@@ -1,6 +1,8 @@
 # 两阶段构建:前端 dist 拷进后端镜像,单容器运行
 # 可选:构建网络无法直连官方源时,传入 --build-arg USE_CN_MIRROR=1 启用国内镜像
 ARG USE_CN_MIRROR=1
+ARG INCLUDE_AIAGENTS=1
+ARG INCLUDE_TUSHARE=1
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 ARG PYPI_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 # 备用 PyPI 源:主源同步延迟/故障时自动兜底(阿里云与清华互为补充)
@@ -46,6 +48,8 @@ ARG USE_CN_MIRROR=1
 ARG PYPI_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PYPI_FALLBACK=https://mirrors.aliyun.com/pypi/simple
 ARG BACKEND_EXTRAS=
+ARG INCLUDE_AIAGENTS=1
+ARG INCLUDE_TUSHARE=1
 WORKDIR /app
 
 # Codex CLI 从官方 npm 包提取原生二进制，不依赖运行时 Node.js。
@@ -54,7 +58,7 @@ WORKDIR /app
 # 单阶段可达 8 分钟以上); USE_CN_MIRROR 与 npm/pypi 的换源开关注一脉相承。
 # tesseract-ocr: 自选截图导入（始终安装）
 RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
-        sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
+        sed -i 's|http://deb.debian.org|https://mirrors.aliyun.com|g; s|https://deb.debian.org|https://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
     fi \
     && apt-get update \
     && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng \
@@ -74,8 +78,17 @@ RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
     fi
 
 # Backend deps
-COPY README.md /README.md
+COPY README.md ./README.md
 COPY backend/pyproject.toml backend/uv.lock* ./
+# 容器内 pyproject.toml 被放在 /app；原始 readme = "../README.md" 会越出项目目录，
+# hatchling 会拒绝构建 editable 包。这里只修容器内临时副本，不影响本地开发布局。
+RUN python - <<'PY'
+from pathlib import Path
+path = Path("pyproject.toml")
+text = path.read_text(encoding="utf-8")
+text = text.replace('readme = "../README.md"', 'readme = "README.md"')
+path.write_text(text, encoding="utf-8")
+PY
 # uv 原生支持同时挂多个 index(主源 + 备用源),会自动在两源中查找,
 # 比逐个重试更稳健 —— 任一源缺包时另一源补位。
 RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
@@ -87,11 +100,28 @@ RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
     done; \
     uv sync --frozen "$@" || uv sync "$@"
 
+# AI Agents 适配层的可选数据源依赖。数据根目录通过 compose 只读挂载，
+# 不把旧 Streamlit 页面和数据库复制进镜像。
+COPY backend/app/plugins/aiagents/requirements.txt /tmp/aiagents-requirements.txt
+RUN if [ "$INCLUDE_AIAGENTS" = "1" ]; then \
+      if [ "$USE_CN_MIRROR" = "1" ]; then export UV_DEFAULT_INDEX="$PYPI_INDEX" UV_EXTRA_INDEX_URL="$PYPI_FALLBACK"; fi; \
+      uv pip install --python /app/.venv/bin/python -r /tmp/aiagents-requirements.txt; \
+    fi
+
+# Tushare provider 依赖: 与 AI Agents 依赖独立，关闭 AI Agents 时仍可使用 Tushare。
+COPY backend/app/plugins/tushare/requirements.txt /tmp/tushare-requirements.txt
+RUN if [ "$INCLUDE_TUSHARE" = "1" ]; then \
+      if [ "$USE_CN_MIRROR" = "1" ]; then export UV_DEFAULT_INDEX="$PYPI_INDEX" UV_EXTRA_INDEX_URL="$PYPI_FALLBACK"; fi; \
+      uv pip install --python /app/.venv/bin/python -r /tmp/tushare-requirements.txt; \
+      /app/.venv/bin/python -c "import tushare; print('tushare', tushare.__version__)"; \
+    fi
+
 # Backend code
 # 注意:Docker 里 WORKDIR=/app, 而 config.py 的 _PROJECT_ROOT 是按开发布局
 # (<root>/backend/app/) 推导的, 容器内会错算到 /。这里用环境变量显式指定
 # 三个关键路径；TSP_DOCKER 也确保 env_file 中的相对 DATA_DIR 按 /app 解析。
 COPY backend/app ./app
+COPY scripts ./scripts
 COPY tiers.yaml /app/tiers.yaml
 # 版本号运行时兜底 (issue #513): 非冻结路径 _load_version() 读
 # /app/frontend/package.json, 缺文件会静默回退 _FALLBACK_VERSION 显示旧版本。
@@ -129,4 +159,6 @@ ENV UV_DEFAULT_INDEX=${PYPI_INDEX} \
 # 此处让日志时间戳等其余 naive 时间也对齐北京时间。
 ENV TZ=Asia/Shanghai
 EXPOSE 3018
-CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3018"]
+# Runtime should use the frozen virtualenv produced at build time. `uv run` can
+# reacquire the global uv cache lock on container start and leave the port closed.
+CMD ["/app/.venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3018"]

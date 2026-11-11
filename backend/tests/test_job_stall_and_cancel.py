@@ -58,7 +58,9 @@ def test_stalled_job_is_reaped(monkeypatch, tmp_path):
     assert "进度停滞" in j["error"]
     # 协作式取消: 僵尸线程通过 flag 感知(记录已被 fail 弹出, flag 仍在)
     assert pipeline_jobs.is_cancelled(jid)
-    # 执行槽已按所有权释放
+    # The worker retains ownership until it has actually stopped writing.
+    assert pipeline_jobs.try_acquire_run_slot("next") is False
+    pipeline_jobs.release_run_slot(jid)
     assert pipeline_jobs.try_acquire_run_slot("next") is True
 
 
@@ -205,6 +207,8 @@ def test_manual_cancel_endpoint_contract(monkeypatch, tmp_path):
     assert j["status"] == "failed"
     assert "手动取消" in j["error"]
     assert pipeline_jobs.is_cancelled(jid)
+    assert pipeline_jobs.try_acquire_run_slot("next") is False
+    pipeline_jobs.release_run_slot(jid)
     assert pipeline_jobs.try_acquire_run_slot("next") is True
 
     # 已终态 (failed) → 400 拒绝重复取消

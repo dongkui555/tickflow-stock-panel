@@ -43,6 +43,9 @@ from app.services.ext_pull import _request_json, fetch_and_ingest, pull_schedule
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/ext-data", tags=["ext-data"])
 
+_PARTITION_SUMMARY_CACHE_TTL = 300.0
+_partition_summary_cache: dict[str, tuple[float, tuple[int, int], dict[str, str | None]]] = {}
+
 
 # ---------------------------------------------------------------------------
 # Pydantic 模型
@@ -392,22 +395,68 @@ def _latest_sync_date(config: ExtConfig, data_dir: Path) -> str | None:
     return _latest_sync_from_partitions(base)
 
 
-def _latest_sync_from_partitions(base: Path) -> str | None:
-    """从 date=xxx 分区目录中找到最新分区的修改时间 (北京墙钟)。"""
+def _partition_summary_from_dirs(base: Path) -> dict[str, str | None]:
+    """快速返回 date=xxx 分区的日期摘要。
+
+    离线批量导入不保证按日期顺序写分区；如果按 mtime 取“最新”，
+    列表页会把最后写入的历史分区误显示成最新数据日期。这里先扫描
+    目录名确定最大日期，再只读取最新分区的 parquet mtime，避免 Docker
+    Desktop 挂载 Windows 数据目录时对每个分区反复 stat。
+    """
     from datetime import datetime
+
+    if not base.exists():
+        return {"start": None, "end": None, "latest_sync_date": None}
+
+    try:
+        stat = base.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        signature = (0, 0)
+
+    cache_key = str(base.resolve())
+    now = time.monotonic()
+    cached = _partition_summary_cache.get(cache_key)
+    if cached and cached[1] == signature and now - cached[0] <= _PARTITION_SUMMARY_CACHE_TTL:
+        return dict(cached[2])
+
+    start_date: str | None = None
+    end_date: str | None = None
+    try:
+        iterator = base.iterdir()
+    except OSError:
+        return {"start": None, "end": None, "latest_sync_date": None}
+
+    for d in iterator:
+        if not d.is_dir() or not d.name.startswith("date="):
+            continue
+        date_part = d.name[5:]
+        if start_date is None or date_part < start_date:
+            start_date = date_part
+        if end_date is None or date_part > end_date:
+            end_date = date_part
+
     latest_ts: float = 0
-    latest_date: str | None = None
-    for d in base.iterdir():
-        if d.is_dir() and d.name.startswith("date="):
-            for f in d.glob("*.parquet"):
-                mtime = f.stat().st_mtime
-                if mtime > latest_ts:
-                    latest_ts = mtime
-                    latest_date = d.name[5:]
-    if latest_date and latest_ts > 0:
+    if end_date:
+        latest_dir = base / f"date={end_date}"
+        try:
+            for f in latest_dir.glob("*.parquet"):
+                latest_ts = max(latest_ts, f.stat().st_mtime)
+        except OSError:
+            latest_ts = 0
+
+    latest_sync_date = end_date
+    if end_date and latest_ts > 0:
         ts = datetime.fromtimestamp(latest_ts, tz=CN_TZ).strftime("%H:%M:%S")
-        return f"{latest_date} {ts}"
-    return latest_date
+        latest_sync_date = f"{end_date} {ts}"
+
+    summary = {"start": start_date, "end": end_date, "latest_sync_date": latest_sync_date}
+    _partition_summary_cache[cache_key] = (now, signature, dict(summary))
+    return summary
+
+
+def _latest_sync_from_partitions(base: Path) -> str | None:
+    return _partition_summary_from_dirs(base).get("latest_sync_date")
 
 
 def _date_range(config: ExtConfig, data_dir: Path) -> list[str] | None:
@@ -420,14 +469,12 @@ def _date_range(config: ExtConfig, data_dir: Path) -> list[str] | None:
         base = data_dir / "kline_ext"
     if not base.exists():
         return None
-    dates: list[str] = []
-    for d in base.iterdir():
-        if d.is_dir() and d.name.startswith("date="):
-            dates.append(d.name[5:])
-    if len(dates) < 1:
+    summary = _partition_summary_from_dirs(base)
+    start_date = summary.get("start")
+    end_date = summary.get("end")
+    if not start_date or not end_date:
         return None
-    dates.sort()
-    return [dates[0], dates[-1]]
+    return [start_date, end_date]
 
 
 def _plate_stats(config: ExtConfig, data_dir: Path) -> dict | None:
@@ -509,6 +556,7 @@ def _granularity_effective(config: ExtConfig, data_dir: Path) -> str | None:
 
 
 @router.get("")
+@router.get("/configs")
 def list_configs(request: Request):
     """列出所有扩展数据配置。"""
     configs = _store(request).load_all()

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,12 +46,29 @@ def _get_symbols(data_dir: Path) -> list[str]:
 
 def _financial_is_custom() -> bool:
     """当前财务数据源是否走 custom (用于绕过 TickFlow Expert 套餐门槛)。"""
+    return _financial_provider_name() != "tickflow"
+
+
+def _financial_provider_name() -> str:
+    """解析实际财务源。
+
+    日线已切到支持财务数据的自定义源（例如 Tushare）时，用户未单独切换财务源仍可
+    复用该源。这样首次两年建库不会出现行情完整、财务空缺的割裂状态。
+    """
     from app.services import preferences
+
     provider = preferences.get_financial_provider()
-    if provider == "tickflow":
-        return False
     from app.data_providers import custom as custom_sources
-    return custom_sources.provider_has_dataset(provider, "financial")
+    if provider != "tickflow" and custom_sources.provider_has_dataset(provider, "financial"):
+        return provider
+
+    daily_provider = preferences.get_daily_data_provider()
+    if (
+        daily_provider != "tickflow"
+        and custom_sources.provider_has_dataset(daily_provider, "financial")
+    ):
+        return daily_provider
+    return "tickflow"
 
 
 def _financial_capability_label() -> str:
@@ -65,6 +83,9 @@ def _fetch_table(
     symbols: list[str],
     capset: CapabilitySet,
     latest_only: bool = True,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    on_chunk_done: Callable[[int, int], None] | None = None,
 ) -> pl.DataFrame:
     """通过当前财务数据源拉取一张标准化财务表。"""
     is_custom = _financial_is_custom()
@@ -77,11 +98,21 @@ def _fetch_table(
 
     # 自定义数据源分流
     if is_custom:
-        from app.services import preferences
         from app.data_providers import custom as custom_sources
         try:
-            provider = custom_sources.get_provider(preferences.get_financial_provider())
-            df = provider.get_financials(table, symbols, latest_only=latest_only)
+            provider = custom_sources.get_provider(_financial_provider_name())
+            try:
+                df = provider.get_financials(
+                    table,
+                    symbols,
+                    latest_only=latest_only,
+                    start_time=start_time,
+                    end_time=end_time,
+                    on_chunk_done=on_chunk_done,
+                )
+            except TypeError:
+                # 兼容第三方旧插件：它们只实现了旧版 get_financials 契约。
+                df = provider.get_financials(table, symbols, latest_only=latest_only)
         except Exception as e:  # noqa: BLE001
             logger.warning("sync_%s custom provider failed: %s", table, e)
             return pl.DataFrame()
@@ -133,18 +164,47 @@ def _fetch_table(
     return df
 
 
-def _write_table(table: str, df: pl.DataFrame, data_dir: Path) -> int:
+def _write_table(
+    table: str,
+    df: pl.DataFrame,
+    data_dir: Path,
+    *,
+    merge_existing: bool = False,
+    retention_start: datetime | None = None,
+    retention_end: datetime | None = None,
+) -> int:
     if df.is_empty() or "symbol" not in df.columns:
-        return 0
+        if not merge_existing:
+            return 0
+        existing = get_financial_df(data_dir, table)
+        if existing.is_empty() or "symbol" not in existing.columns:
+            return 0
+        df = existing
+
+    out_df = df
+    if merge_existing:
+        existing = get_financial_df(data_dir, table)
+        frames = [frame for frame in (existing, df) if not frame.is_empty()]
+        if frames:
+            out_df = pl.concat(frames, how="diagonal_relaxed")
+        if "period_end" in out_df.columns:
+            out_df = out_df.with_columns(pl.col("period_end").cast(pl.Date, strict=False))
+            if retention_start is not None:
+                out_df = out_df.filter(pl.col("period_end") >= retention_start.date())
+            if retention_end is not None:
+                out_df = out_df.filter(pl.col("period_end") <= retention_end.date())
+        unique_cols = [column for column in ("symbol", "period_end") if column in out_df.columns]
+        if unique_cols:
+            out_df = out_df.unique(subset=unique_cols, keep="last").sort(unique_cols)
 
     # 写入 Parquet (全量覆盖)
     out_dir = data_dir / "financials" / table
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "part.parquet"
-    atomic_write_parquet(df, out_file)
+    atomic_write_parquet(out_df, out_file)
 
-    logger.info("sync_%s done: %d records written", table, len(df))
-    return len(df)
+    logger.info("sync_%s done: %d records written", table, len(out_df))
+    return len(out_df)
 
 
 def _sync_table(
@@ -271,6 +331,73 @@ def sync_all(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
     # 同步完成后注册 DuckDB 视图
     _refresh_financials_views(data_dir)
 
+    return results
+
+
+def _filter_history_range(
+    df: pl.DataFrame,
+    start_time: datetime,
+    end_time: datetime,
+) -> pl.DataFrame:
+    """只保留目标区间内的报告期，避免兼容网关忽略日期参数时污染历史库。"""
+    if df.is_empty() or "period_end" not in df.columns:
+        return pl.DataFrame()
+    try:
+        normalized = df.with_columns(pl.col("period_end").cast(pl.Date, strict=False))
+        return normalized.filter(
+            pl.col("period_end").is_between(start_time.date(), end_time.date(), closed="both")
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("filter financial history range failed: %s", exc)
+        return pl.DataFrame()
+
+
+def sync_recent_history(
+    data_dir: Path,
+    capset: CapabilitySet,
+    start_time: datetime,
+    end_time: datetime,
+    on_progress: Callable[[str, int, int], None] | None = None,
+    retention_start_time: datetime | None = None,
+    retention_end_time: datetime | None = None,
+) -> dict[str, int]:
+    """同步近两年财务报告和股本历史。
+
+    财务接口按标的返回，首次全市场建库会持续较久；重复执行会拉取增量窗口，
+    与本地旧表合并并按 retention_* 保留目标区间。
+    """
+    if not capset.has(Cap.FINANCIAL) and not _financial_is_custom():
+        return {}
+
+    symbols = _get_symbols(data_dir)
+    if not symbols:
+        return {}
+
+    results: dict[str, int] = {}
+    for table in FINANCIAL_TABLES:
+        def _progress(current: int, total: int, *, _table: str = table) -> None:
+            if on_progress:
+                on_progress(_table, current, total)
+
+        df = _fetch_table(
+            table,
+            symbols,
+            capset,
+            latest_only=False,
+            start_time=start_time,
+            end_time=end_time,
+            on_chunk_done=_progress,
+        )
+        results[table] = _write_table(
+            table,
+            _filter_history_range(df, start_time, end_time),
+            data_dir,
+            merge_existing=True,
+            retention_start=retention_start_time or start_time,
+            retention_end=retention_end_time or end_time,
+        )
+
+    _refresh_financials_views(data_dir)
     return results
 
 
@@ -421,7 +548,8 @@ class FinancialScheduler:
                 # 每周: 只同步 metrics
                 try:
                     rows = sync_metrics(self._data_dir, self._capset)
-                    self._record_sync("metrics")
+                    if rows > 0:
+                        self._record_sync("metrics")
                     logger.info("FinancialScheduler: metrics synced, %d rows", rows)
                 except Exception as e:
                     logger.warning("FinancialScheduler: metrics sync failed: %s", e)
@@ -452,16 +580,19 @@ class FinancialScheduler:
             if not fn:
                 return {}
             rows = fn(self._data_dir, self._capset)
-            self._record_sync(table)
+            if rows > 0:
+                self._record_sync(table)
             return {table: rows}
         # 全部同步
         symbols = _get_symbols(self._data_dir)
         result: dict[str, int] = {}
         for t in FINANCIAL_TABLES:
-            result[t] = _sync_history_table_for_symbols(
+            rows = _sync_history_table_for_symbols(
                 t, symbols, self._data_dir, self._capset
             )
-            self._record_sync(t)
+            result[t] = rows
+            if rows > 0:
+                self._record_sync(t)
         _refresh_financials_views(self._data_dir)
         return result
 

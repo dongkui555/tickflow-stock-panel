@@ -7,11 +7,12 @@ import logging
 import math
 from datetime import date, timedelta
 from functools import lru_cache, partial
+from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import anyio
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Response, UploadFile
 
 from app.db_safe import is_valid_ext_ident
 from app.indicators.pipeline import compute_enriched_single
@@ -23,6 +24,12 @@ from app.price_limits import (
     price_limit_pct,
 )
 from app.services import kline_sync, minute_adjust, minute_gaps, trading_day
+from app.services.history_import import (
+    HistoryCsvError,
+    import_history_csv,
+    import_history_csv_batch,
+    import_history_minute_batch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -328,7 +335,16 @@ def _get_stock_info(repo, symbol: str) -> dict:
         needed = ("symbol", "name", "total_shares", "float_shares")
         if df.is_empty() or not all(c in df.columns for c in needed):
             return {}
-        hit = df.filter(pl.col("symbol") == symbol).head(1)
+        clean_symbol = str(symbol or "").strip().upper()
+        compact_symbol = clean_symbol.split(".", 1)[0]
+        for prefix in ("SH", "SZ", "BJ"):
+            if compact_symbol.startswith(prefix):
+                compact_symbol = compact_symbol[len(prefix):]
+                break
+        digits = "".join(ch for ch in compact_symbol if ch.isdigit())
+        compact_symbol = digits[-6:].zfill(6) if digits else compact_symbol
+        code_expr = pl.col("code").cast(pl.Utf8, strict=False) == compact_symbol if "code" in df.columns else pl.lit(False)
+        hit = df.filter((pl.col("symbol") == clean_symbol) | (pl.col("symbol") == compact_symbol) | code_expr).head(1)
         if hit.is_empty():
             return {}
         return {
@@ -1071,6 +1087,19 @@ def get_minute_batch(request: Request, body: dict):
     )
 
 
+@router.get("/minute-bars")
+def get_minute_bars(request: Request, symbol: str = Query(...),
+                    period: int = Query(15), days: int = Query(20, ge=1, le=60)):
+    from app.services.minute_timeframes import PERIODS, chart_minutes
+    if period not in PERIODS:
+        raise HTTPException(status_code=422, detail="周期只能为5、15、30、60分钟")
+    repo = request.app.state.repo
+    asset_type = repo.resolve_asset_type(symbol)
+    result = chart_minutes(repo, symbol, asset_type, period, days, cn_now())
+    return {"symbol": symbol, "asset_type": asset_type, "period": period,
+            "source": "local", "price_basis": "stored_minute", **result}
+
+
 @router.get("/minute-range")
 def get_minute_range(
     request: Request,
@@ -1106,6 +1135,27 @@ def get_minute_range(
     start = end - timedelta(days=days * 3 + 20)
     minute = repo.get_minute_range([symbol], start, end, asset_type=asset_type)
     if minute.is_empty() or "datetime" not in minute.columns:
+        live_df = kline_sync.fetch_minute_single(
+            symbol, end, asset_type=asset_type, capset=request.app.state.capabilities,
+            raw_basis=minute_adjust.minute_basis_is_raw(repo.store.data_dir),
+        )
+        if not live_df.is_empty() and "datetime" in live_df.columns:
+            row_columns = [
+                column
+                for column in (
+                    "datetime", "open", "high", "low", "close", "volume", "amount"
+                )
+                if column in live_df.columns
+            ]
+            return _gzip_payload(request, {
+                **base_response,
+                "sessions": [{
+                    "date": end.isoformat(),
+                    "prev_close": _get_previous_closes(repo, symbol, [end], asset_type).get(end),
+                    "rows": live_df.sort("datetime").select(row_columns).to_dicts(),
+                }],
+                "source": "live",
+            }, pref_key="minute_batch_compress")
         return _gzip_payload(
             request,
             {**base_response, "sessions": [], "source": "none"},
@@ -1374,9 +1424,23 @@ def refresh_views(request: Request):
 
 @router.post("/sync_minute")
 async def sync_minute(request: Request):
-    """手动触发分钟 K 同步(全市场)。返回 pipeline job_id 可轮询进度。
+    """手动触发分钟 K 同步。返回 pipeline job_id 可轮询进度。
 
-    body 可选: { "days": int } — 指定拉取天数 (不传则用偏好设置)。
+    body 可选:
+      {
+        "days": int,
+        "extend": bool,
+        "mode": "history_increment|history_backfill|history_gaps",
+        "scope": "combined|watchlist|realtime_watchlist|holdings|stockformer_top|manual|all",
+        "top_n": int,
+        "symbols": ["000001", "600519"],
+        "lookback_days": 730,
+        "max_missing_days": 1,
+        "min_rows": 0,
+        "include_today": false,
+        "start_date": "2024-09-03",
+        "end_date": "2026-09-03"
+      }
     """
     # 可选 body: { "days": int, "extend": bool }
     # days: 拉取天数; extend: 向前扩展模式 (从最早数据往前补)
@@ -1390,6 +1454,7 @@ async def sync_minute(request: Request):
         request.app.state.capabilities,
         override_days=body.get("days"),
         extend_flag=body.get("extend"),
+        body=body,
     )
 
 
@@ -1426,19 +1491,18 @@ async def repair_minute_gaps(request: Request, body: dict):
     repo = request.app.state.repo
     if any(repo.resolve_asset_type(symbol) != "stock" for symbol in symbols):
         raise HTTPException(status_code=400, detail="分钟缺口补拉仅支持股票, ETF 和指数请使用各自的数据入口")
-    return await trigger_minute_sync(
-        repo, request.app.state.capabilities, override_days=10, repair_symbols=symbols, repair_targets=repair_targets or None,
+    return await _trigger_minute_repair(
+        repo, request.app.state.capabilities, symbols, repair_targets,
     )
 
 
-async def trigger_minute_sync(
-    repo, capset, *, override_days=None, extend_flag=None, repair_symbols: list[str] | None = None,
-    repair_targets: dict[date, list[str]] | None = None,
+async def _trigger_minute_repair(
+    repo, capset, symbols: list[str], repair_targets: dict[date, list[str]],
 ) -> dict:
-    """复用分钟同步的分块落盘、容量限制和取消机制; 缺口补拉限定标的且强制回溯。"""
     import asyncio
 
     from app.api.data import invalidate_storage_cache
+    from app.jobs.daily_pipeline import _refresh_single_view
     from app.services.pipeline_jobs import (
         JobCancelledError,
         job_store,
@@ -1446,18 +1510,105 @@ async def trigger_minute_sync(
         run_with_capacity,
         try_acquire_run_slot,
     )
-    from app.services.preferences import get_minute_sync_days
-    from app.tickflow.pools import get_pool
 
     if not _minute_allowed(capset):
-        if repair_symbols is not None:
-            raise HTTPException(status_code=403, detail="当前分钟数据源不可用, 请先在设置中配置可用数据源")
+        raise HTTPException(status_code=403, detail="当前分钟数据源不可用, 请先在设置中配置可用数据源")
+    job_id, is_new = job_store.create(long_running=True)
+    if not is_new:
+        raise HTTPException(status_code=409, detail="已有数据任务正在运行, 请等待完成后再批量补拉")
+
+    group_count = max(1, len(repair_targets))
+
+    def on_chunk(done: int, total: int, label: str, *, group_index: int = 0) -> None:
+        pct = 10 + int((group_index + done / max(total, 1)) / group_count * 85)
+        job_store.progress(job_id, "sync_minute", pct, f"补拉缺口分钟K… {done}/{total} 批 [{label}]")
+
+    def run() -> dict:
+        job_store.progress(job_id, "sync_minute", 5, f"准备补拉 {len(symbols)} 只缺口标的…")
+        try:
+            if not repair_targets:
+                written = kline_sync.sync_and_persist_minute(
+                    symbols, repo, capset, days=10, extend_backward=False,
+                    force_full_days=True, on_chunk_done=on_chunk,
+                )
+                return {"minute_rows": written}
+            added = remaining = 0
+            source = kline_sync.minute_source_stamp()
+            raw_basis = minute_adjust.minute_basis_is_raw(repo.store.data_dir)
+            for group_index, (day, group) in enumerate(repair_targets.items()):
+                progress = partial(on_chunk, group_index=group_index)
+                progress(0, 1, day.isoformat())
+                added += kline_sync.sync_and_persist_minute(
+                    group, repo, capset, repair_date=day, asset_type="stock", on_chunk_done=progress,
+                    expected_source=source, expected_raw_basis=raw_basis,
+                )
+                remaining += minute_gaps.count_remaining_gaps(
+                    repo.store.data_dir / "kline_minute", day, group, cn_now(),
+                )
+            return {"minute_rows": added, "remaining_gaps": remaining,
+                    "requested_gaps": sum(map(len, repair_targets.values()))}
+        finally:
+            # Refresh successful segments even after cancellation.
+            _refresh_single_view(repo, "kline_minute")
+
+    async def task() -> None:
+        if not try_acquire_run_slot(job_id):
+            job_store.fail(job_id, "已有数据任务在运行(或上一次任务卡死未结束),请稍后再试")
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(_long_task_executor, run_with_capacity, job_id, run)
+            written = result["minute_rows"]
+            if repair_targets:
+                message = f"新增 {written} 根分钟 K，复查 {result['requested_gaps']} 条，仍有 {result['remaining_gaps']} 条缺口"
+            else:
+                message = f"缺口分钟补拉完成, 写入 {written} 行; 是否补齐以体检结果为准"
+            job_store.progress(job_id, "done", 100, message)
+            job_store.succeed(job_id, {**result, "universe_size": len(symbols)})
+        except JobCancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            job_store.fail(job_id, str(exc))
+        finally:
+            release_run_slot(job_id)
+            invalidate_storage_cache()
+
+    asyncio.create_task(task())
+    return {"status": "started", "job_id": job_id}
+
+
+async def trigger_minute_sync(repo, capset, *, override_days=None, extend_flag=None, body=None) -> dict:
+    """触发分钟K同步/向前扩展后台任务(HTTP 端点与 AI 助手共用同一条触发路径)。"""
+    import asyncio
+
+    from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, run_with_capacity, try_acquire_run_slot
+    from app.api.data import invalidate_storage_cache
+    from app.services import preferences
+    from app.tickflow.capabilities import Cap
+
+    if not _minute_allowed(capset):
         raise HTTPException(status_code=403, detail="需要 Pro+ 权限")
+
+    # 可选 body: { "days": int, "extend": bool }
+    # days: 拉取天数; extend: 向前扩展模式 (从最早数据往前补)
+    body = dict(body or {})
+    if override_days is None:
+        override_days = body.get("days")
+    if extend_flag is None:
+        extend_flag = body.get("extend")
+    mode = str(body.get("mode") or "").strip().lower()
+    if mode in {"increment", "latest", "history_latest"}:
+        mode = "history_increment"
+    elif mode in {"backfill", "full", "full_history", "history_full"}:
+        mode = "history_backfill"
+    elif mode in {"gaps", "gap", "missing", "missing_dates", "history_gap"}:
+        mode = "history_gaps"
+    elif mode not in {"history_increment", "history_backfill", "history_gaps"}:
+        mode = ""
+
     # 分钟K全市场同步是长任务(数据量是日K的 ~240 倍),用更宽松的卡死阈值
     job_id, is_new = job_store.create(long_running=True)
     if not is_new:
-        if repair_symbols is not None:
-            raise HTTPException(status_code=409, detail="已有数据任务正在运行, 请等待完成后再批量补拉")
         return {"status": "reused", "job_id": job_id}
 
     async def task() -> None:
@@ -1469,87 +1620,149 @@ async def trigger_minute_sync(
         def progress(stage: str, pct: int, msg: str) -> None:
             job_store.progress(job_id, stage, pct, msg)
 
-        try:
-            progress("sync_minute", 5, "准备补拉缺口标的…" if repair_symbols is not None else "解析标的池…")
-            if repair_symbols is not None:
-                universe = repair_symbols
-            else:
-                # 标的池 = instruments 维表 + 自选 (单一来源, 不拉 CN_Equity_A/SW1 池)
-                all_symbols = set(get_pool("watchlist"))
-                inst_path = repo.store.data_dir / "instruments" / "instruments.parquet"
-                if inst_path.exists():
-                    try:
-                        import polars as pl
-                        inst = pl.read_parquet(inst_path, columns=["symbol"])
-                        all_symbols.update(inst["symbol"].to_list())
-                    except Exception:  # noqa: BLE001
-                        pass
-                # 剔除指数 symbol: 指数分钟K无本地存储, 落库会污染 kline_minute
-                index_set = repo.get_index_symbol_set()
-                universe = sorted(s for s in all_symbols if s not in index_set)
-            progress("sync_minute", 10, f"标的池 {len(universe)} 只")
+        def execute_sync():
+            progress("sync_minute", 5, "解析历史分钟K同步范围…")
+            scope = str(body.get("scope") or preferences.get_minute_sync_scope()).strip().lower()
+            top_n = body.get("top_n") or body.get("topN") or preferences.get_minute_sync_top_n()
+            universe, scope_label = kline_sync.resolve_minute_sync_universe(
+                repo,
+                capset,
+                scope=scope,
+                symbols=body.get("symbols"),
+                top_n=top_n,
+            )
+            progress("sync_minute", 10, f"{scope_label}: {len(universe)} 只")
+            if not universe:
+                raise RuntimeError(f"{scope_label}为空，请先添加自选/持仓/推荐股票或手动输入代码")
 
-            days = override_days if override_days else get_minute_sync_days()
-            # extend=1 → 向前扩展; days>=365 也自动向前扩展
-            extend_backward = bool(extend_flag) or days >= 365
+            days = override_days if override_days else preferences.get_minute_sync_days()
+            # mode=history_backfill / extend=1 / days>=365 → 向前扩展;
+            # history_increment 只按单股最后分钟线补最新尾巴。
+            extend_backward = (mode == "history_backfill") or bool(extend_flag) or days >= 365
+            effective_mode = "history_gaps" if mode == "history_gaps" else ("history_backfill" if extend_backward else "history_increment")
+            minute_provider = preferences.get_minute_data_provider().strip().lower()
+            if (
+                scope == "all"
+                and effective_mode == "history_backfill"
+                and minute_provider != "tickflow"
+                and not bool(body.get("allow_full_market_history"))
+            ):
+                raise RuntimeError(
+                    "全市场两年分钟K不能直接用 Tushare 在线逐股拉取，容易超时/限流。"
+                    "请先用离线包导入，或把范围改为自选/持仓/推荐池；如确认在线长跑，"
+                    "请求中传 allow_full_market_history=true。"
+                )
 
-            group_count = len(repair_targets) if repair_targets else 1
+            if effective_mode == "history_gaps":
+                daily_dates = kline_sync._partition_dates(repo.store.data_dir / "kline_daily")
+                default_end = daily_dates[-1] if daily_dates else date.today()
+                lookback_days = int(body.get("lookback_days") or body.get("window_days") or 730)
+                start_date = date.fromisoformat(str(body.get("start_date"))) if body.get("start_date") else default_end - timedelta(days=max(1, lookback_days))
+                end_date = date.fromisoformat(str(body.get("end_date"))) if body.get("end_date") else default_end
+                include_today_raw = body.get("include_today", False)
+                include_today = include_today_raw is True or str(include_today_raw).strip().lower() in {"1", "true", "yes", "y"}
+                if not include_today:
+                    latest_closed_day = cn_today() - timedelta(days=1)
+                    if end_date > latest_closed_day:
+                        end_date = latest_closed_day
+                max_missing_days = int(body.get("max_missing_days") or body.get("max_gap_days") or days or 1)
+                if max_missing_days < 1:
+                    max_missing_days = 1
+                min_rows_raw = body.get("min_rows")
+                min_rows = int(min_rows_raw) if min_rows_raw is not None else 0
+                progress(
+                    "sync_minute",
+                    12,
+                    f"缺口补齐: {start_date.isoformat()}~{end_date.isoformat()}, 最多 {max_missing_days} 个交易日",
+                )
 
-            def _on_chunk(done: int, total: int, seg_label: str, *, group_index: int = 0) -> None:
+                def _on_gap_done(done: int, total: int, seg_label: str) -> None:
+                    pct = 12 + int((done / max(total, 1)) * 83)
+                    progress("sync_minute", min(pct, 95), f"补齐缺失分钟K… {seg_label}")
+
+                def _run_gaps():
+                    if body.get("verified_gaps") is True:
+                        from app.services.minute_repair import repair_minute_gaps
+                        from app.services import minute_repair_authorization
+                        authorization_task = str(body.get("authorization_task_id") or
+                                                 minute_repair_authorization.scope_id(
+                                                     start_date, end_date, symbols=universe,
+                                                 ))
+                        return repair_minute_gaps(
+                            repo, start_date=start_date, end_date=end_date,
+                            provider_name=str(body.get("provider") or minute_provider),
+                            progress=_on_gap_done, workers=int(body.get("workers") or 2),
+                            symbols=universe,
+                            repair_conflicts=body.get("repair_conflicts") is True,
+                            # Keep authorization attached to the logical
+                            # range/universe, not a transient HTTP job id, so
+                            # a later retry of the same task reuses approval.
+                            task_id=authorization_task,
+                            max_missing_days=max_missing_days,
+                            newest_first=str(body.get("newest_first", True)).strip().lower() not in {"0", "false", "no", "n"},
+                        )
+                    return kline_sync.sync_missing_minute_days(
+                        universe,
+                        repo,
+                        capset,
+                        start_date=start_date,
+                        end_date=end_date,
+                        max_missing_days=max_missing_days,
+                        min_rows=min_rows,
+                        newest_first=str(body.get("newest_first", True)).strip().lower() not in {"0", "false", "no", "n"},
+                        on_range_done=_on_gap_done,
+                        provider_name=str(body.get("provider") or minute_provider).strip().lower(),
+                    )
+
+                gap_result = _run_gaps()
+                completion = "补齐任务结束，仍有未通过校验或源不支持的缺口" if gap_result.get("complete") is False else "缺失分钟 K 补齐完成"
+                counts = f"新增{gap_result.get('added_rows', gap_result.get('written_rows', 0))}行"
+                if gap_result.get("repair_conflicts"):
+                    counts += f"，替换{gap_result.get('replaced_rows', 0)}行，修复{gap_result.get('repaired_stock_days', 0)}个股票日"
+                progress("done", 100, f"{completion}，{counts}")
+                job_store.succeed(job_id, {
+                    "minute_rows": gap_result.get("written_rows", 0),
+                    "universe_size": len(universe),
+                    "scope": scope,
+                    "scope_label": scope_label,
+                    "mode": effective_mode,
+                    "days": days,
+                    **gap_result,
+                })
+                invalidate_storage_cache()
+                return
+
+            def _on_chunk(done: int, total: int, seg_label: str) -> None:
                 # 进度映射: 10% (标的池解析完) → 95%, 留 5% 给写入+刷新
-                pct = 10 + int((group_index + done / max(total, 1)) / group_count * 85)
-                action = "补拉缺口分钟K" if repair_symbols is not None else "拉取分钟K"
-                progress("sync_minute", pct, f"{action}… {done}/{total} 批 [{seg_label}]")
+                pct = 10 + int((done / max(total, 1)) * 85)
+                label = "补齐历史分钟K" if effective_mode == "history_backfill" else "增量补最新分钟K"
+                progress("sync_minute", pct, f"{label}… {done}/{total} [{seg_label}]")
 
             def _run():
-                from app.jobs.daily_pipeline import _refresh_single_view
+                return kline_sync.sync_and_persist_minute(
+                    universe, repo, capset, days=days,
+                    extend_backward=extend_backward,
+                    on_chunk_done=_on_chunk,
+                )
 
-                try:
-                    if repair_targets:
-                        added = remaining = 0
-                        source = kline_sync.minute_source_stamp()
-                        for group_index, (day, group) in enumerate(repair_targets.items()):
-                            on_chunk = partial(_on_chunk, group_index=group_index)
-                            on_chunk(0, 1, day.isoformat())
-                            added += kline_sync.sync_and_persist_minute(
-                                group, repo, capset, repair_date=day, asset_type="stock", on_chunk_done=on_chunk,
-                                expected_source=source,
-                            )
-                            remaining += minute_gaps.count_remaining_gaps(
-                                repo.store.data_dir / "kline_minute", day, group, cn_now(),
-                            )
-                        return {"minute_rows": added, "remaining_gaps": remaining,
-                                "requested_gaps": sum(map(len, repair_targets.values()))}
-                    if repair_symbols is not None:
-                        progress("sync_minute", 10, f"补拉 {len(universe)} 只缺口标的的分钟K…")
-                    written = kline_sync.sync_and_persist_minute(
-                        universe, repo, capset, days=days,
-                        extend_backward=extend_backward,
-                        force_full_days=repair_symbols is not None,
-                        on_chunk_done=_on_chunk,
-                    )
-                    return {"minute_rows": written}
-                finally:
-                    if repair_symbols is not None:
-                        # 补拉分块已写入的数据在失败/取消后也要可见, 刷新仍占用原执行槽。
-                        _refresh_single_view(repo, "kline_minute")
+            written = _run()
 
-            result = await loop.run_in_executor(_long_task_executor, run_with_capacity, job_id, _run)
-            if repair_symbols is None:
-                from app.jobs.daily_pipeline import _refresh_single_view
+            # 刷新视图
+            from app.jobs.daily_pipeline import _refresh_single_view
+            _refresh_single_view(repo, "kline_minute")
 
-                _refresh_single_view(repo, "kline_minute")
-
-            written = result["minute_rows"]
-            if repair_targets:
-                message = f"新增 {written} 根分钟 K，复查 {result['requested_gaps']} 条，仍有 {result['remaining_gaps']} 条缺口"
-            elif repair_symbols is not None:
-                message = f"缺口分钟补拉完成, 写入 {written} 行; 是否补齐以体检结果为准"
-            else:
-                message = f"分钟 K 同步完成,{written} 行"
-            progress("done", 100, message)
-            job_store.succeed(job_id, {**result, "universe_size": len(universe)})
+            progress("done", 100, f"历史分钟 K 同步完成,{written} 行")
+            job_store.succeed(job_id, {
+                "minute_rows": written,
+                "universe_size": len(universe),
+                "scope": scope,
+                "scope_label": scope_label,
+                "mode": effective_mode,
+                "days": days,
+            })
             invalidate_storage_cache()
+        try:
+            await loop.run_in_executor(_long_task_executor, run_with_capacity, job_id, execute_sync)
         except JobCancelledError:
             # 已由 terminate() 标记失败, 拉取线程在分块回调处自行退出
             invalidate_storage_cache()
@@ -1561,6 +1774,7 @@ async def trigger_minute_sync(
 
     asyncio.create_task(task())
     return {"status": "started", "job_id": job_id}
+
 
 
 @router.post("/sync_minute_single")
@@ -1967,6 +2181,229 @@ async def rebuild_enriched(request: Request):
         import traceback as _tb
         logger.error("rebuild_enriched error: %s\n%s", e, _tb.format_exc())
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/import_history")
+async def import_history(
+    request: Request,
+    file: UploadFile | None = File(None),
+    files: list[UploadFile] | None = File(None),
+    asset_type: str = Form("auto"),
+    data_kind: str = Form("daily"),
+    source_path: str = Form(""),
+    start_date: str = Form(""),
+    end_date: str = Form(""),
+):
+    """导入历史行情文件到主行情库；分钟K可按日期窗口导入。"""
+    import asyncio
+    import os
+    import shutil
+    import tempfile
+    import zipfile
+
+    from app.api.data import invalidate_storage_cache
+    from app.services.pipeline_jobs import (
+        JobCancelledError,
+        LONG_JOB_TIMEOUT_S,
+        job_store,
+        release_run_slot,
+        try_acquire_run_slot,
+    )
+
+    if asset_type not in ("auto", "stock", "index", "etf"):
+        raise HTTPException(status_code=400, detail="asset_type 只支持 auto/stock/index/etf")
+    data_kind = str(data_kind or "daily").strip().lower()
+    if data_kind in {"day", "daily_csv"}:
+        data_kind = "daily"
+    elif data_kind in {"minute_k", "minute1", "1m", "min"}:
+        data_kind = "minute"
+    if data_kind not in {"daily", "minute"}:
+        raise HTTPException(status_code=400, detail="data_kind 只支持 daily/minute")
+
+    repo = request.app.state.repo
+
+    uploads = [item for item in ([file] if file is not None else []) + list(files or []) if item is not None]
+    file_paths: list[Path] = []
+    tmp_dir: Path | None = None
+    supported_suffixes = {".csv"} if data_kind == "daily" else {".csv", ".parquet", ".zip"}
+    supported_text = "CSV" if data_kind == "daily" else "CSV / Parquet / ZIP"
+
+    def _abort(detail: str) -> None:
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=detail)
+
+    def _ensure_tmp_dir() -> Path:
+        nonlocal tmp_dir
+        if tmp_dir is None:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="history-import-"))
+        return tmp_dir
+
+    def _extract_zip(zip_path: Path) -> list[Path]:
+        if data_kind != "minute":
+            _abort("日线导入仅支持 CSV 文件")
+        root = _ensure_tmp_dir() / f"zip_{len(file_paths) + 1:03d}_{zip_path.stem[:32]}"
+        root.mkdir(parents=True, exist_ok=True)
+        extracted: list[Path] = []
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                for item in zf.infolist():
+                    if item.is_dir():
+                        continue
+                    suffix = Path(item.filename).suffix.lower()
+                    if suffix not in {".csv", ".parquet"}:
+                        continue
+                    name = Path(item.filename).name or f"part-{len(extracted) + 1}{suffix}"
+                    out = root / f"{len(extracted) + 1:05d}_{name}"
+                    with zf.open(item) as src, out.open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    if out.stat().st_size > 0:
+                        extracted.append(out)
+        except zipfile.BadZipFile:
+            _abort(f"无法读取 ZIP 文件: {zip_path.name}")
+        if not extracted:
+            _abort(f"ZIP 中没有可导入的 CSV/Parquet 文件: {zip_path.name}")
+        return extracted
+
+    def _append_import_path(path: Path) -> None:
+        suffix = path.suffix.lower()
+        if suffix not in supported_suffixes:
+            _abort(f"{data_kind} 导入仅支持 {supported_text} 文件")
+        if suffix == ".zip":
+            file_paths.extend(_extract_zip(path))
+        else:
+            file_paths.append(path)
+
+    def _resolve_source_path(raw: str) -> Path:
+        path = Path(os.path.expanduser(raw))
+        if path.exists():
+            return path
+        offline_root = Path(os.getenv("OFFLINE_DATA_DIR", "/app/offline-data"))
+        normalized = raw.replace("\\", "/")
+        marker = "offline-data/"
+        marker_index = normalized.lower().find(marker)
+        if marker_index >= 0:
+            suffix = normalized[marker_index + len(marker):].strip("/")
+            candidate = offline_root / suffix
+            if candidate.exists():
+                return candidate
+        return path
+
+    if uploads:
+        tmp_root = _ensure_tmp_dir()
+        for idx, upload in enumerate(uploads, start=1):
+            filename = Path(upload.filename or f"history-{idx}.csv").name
+            suffix = Path(filename).suffix.lower()
+            if suffix not in supported_suffixes:
+                _abort(f"{data_kind} 导入仅支持 {supported_text} 文件")
+            tmp_path = tmp_root / f"{idx:03d}_{filename}"
+            with tmp_path.open("wb") as fh:
+                shutil.copyfileobj(upload.file, fh)
+            try:
+                upload.file.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if tmp_path.stat().st_size <= 0:
+                _abort(f"空文件: {filename}")
+            _append_import_path(tmp_path)
+
+    if source_path.strip():
+        raw_paths = [p.strip() for p in source_path.replace(";", "\n").splitlines() if p.strip()]
+        for raw in raw_paths:
+            path = _resolve_source_path(raw)
+            if not path.exists():
+                _abort(f"路径不存在: {raw}")
+            if path.is_dir():
+                local_paths = sorted(p for p in path.rglob("*") if p.is_file() and p.suffix.lower() in supported_suffixes)
+                if not local_paths:
+                    _abort(f"目录中没有可导入的 {supported_text} 文件: {raw}")
+                for item in local_paths:
+                    _append_import_path(item)
+            else:
+                _append_import_path(path)
+
+    if not file_paths:
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"请至少选择一个 {supported_text} 文件，或填写本地路径")
+
+    deduped_paths: list[Path] = []
+    seen_paths: set[str] = set()
+    for path in file_paths:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        deduped_paths.append(path)
+    file_paths = deduped_paths
+
+    job_id, is_new = job_store.create(timeout_s=LONG_JOB_TIMEOUT_S)
+    if not is_new:
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return {"status": "reused", "job_id": job_id}
+
+    async def task() -> None:
+        if not try_acquire_run_slot(job_id):
+            job_store.fail(job_id, "已有数据任务在运行(或上一次任务卡死未结束),请稍后再试")
+            if tmp_dir is not None:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            return
+        loop = asyncio.get_event_loop()
+
+        def progress(stage: str, pct: int, msg: str) -> None:
+            job_store.progress(job_id, stage, pct, msg)
+
+        try:
+            job_store.start(job_id)
+            if data_kind == "minute":
+                result = await loop.run_in_executor(
+                    _long_task_executor,
+                    lambda: import_history_minute_batch(
+                        repo,
+                        file_paths,
+                        on_progress=progress,
+                        start_date=start_date,
+                        end_date=end_date,
+                    ),
+                )
+            elif len(file_paths) == 1:
+                result = await loop.run_in_executor(
+                    _long_task_executor,
+                    lambda: import_history_csv(
+                        repo,
+                        file_paths[0],
+                        asset_type_hint=asset_type,
+                        on_progress=progress,
+                    ),
+                )
+            else:
+                result = await loop.run_in_executor(
+                    _long_task_executor,
+                    lambda: import_history_csv_batch(
+                        repo,
+                        file_paths,
+                        asset_type_hint=asset_type,
+                        on_progress=progress,
+                    ),
+                )
+            result["data_kind"] = data_kind
+            job_store.succeed(job_id, result)
+        except JobCancelledError:
+            invalidate_storage_cache()
+        except HistoryCsvError as e:
+            job_store.fail(job_id, str(e))
+        except Exception as e:  # noqa: BLE001
+            logger.exception("import_history failed: job_id=%s", job_id)
+            job_store.fail(job_id, str(e))
+        finally:
+            invalidate_storage_cache()
+            release_run_slot(job_id)
+            if tmp_dir is not None:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    asyncio.create_task(task())
+    return {"status": "started", "job_id": job_id}
 
 
 # 长时间任务专用线程池（隔离于 FastAPI 默认线程池，防止阻塞请求处理）

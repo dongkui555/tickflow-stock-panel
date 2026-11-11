@@ -114,7 +114,7 @@ export function Settings() {
               <button
                 onClick={toggleCollapsed}
                 className={cn(
-                  'flex items-center gap-2 rounded-btn text-muted hover:text-foreground hover:bg-elevated/60 transition-colors duration-150 ease-smooth mb-1',
+                  'hidden md:flex items-center gap-2 rounded-btn text-muted hover:text-foreground hover:bg-elevated/60 transition-colors duration-150 ease-smooth mb-1',
                   collapsed ? 'justify-center px-0 py-2' : 'px-3 py-2 text-xs',
                 )}
                 title={collapsed ? '展开菜单' : '收起菜单'}
@@ -131,9 +131,9 @@ export function Settings() {
                 <button
                   key={key}
                   onClick={() => setSearchParams({ tab: key }, { replace: true })}
-                  title={collapsed ? label : undefined}
+                  title={label}
                   className={cn(
-                    'relative flex items-center rounded-btn text-sm transition-colors duration-150 ease-smooth',
+                    'relative flex shrink-0 whitespace-nowrap items-center rounded-btn text-sm transition-colors duration-150 ease-smooth',
                     collapsed ? 'justify-center px-0 py-2' : 'items-center gap-2 px-3 py-2 text-left',
                     activeTab.key === key
                       ? 'bg-accent/10 text-accent font-medium'

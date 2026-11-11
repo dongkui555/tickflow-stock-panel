@@ -24,6 +24,7 @@ from pathlib import Path
 import polars as pl
 
 from app.config import settings
+from app.services.security_identity import exchange_for_code
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.client import get_client
 from app.tickflow.rate_limits import chunked, resolve_limit
@@ -63,6 +64,62 @@ _ENTRY_SCHEMA = {
 }
 
 
+def _compact_digits(value: object) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits[-6:].zfill(6) if digits else ""
+
+
+def _normalize_symbol(symbol: object) -> str:
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        return ""
+    if "." in raw:
+        body, suffix = raw.rsplit(".", 1)
+        suffix = suffix.strip().upper()
+        code = _compact_digits(body)
+        stock_exchange = exchange_for_code(code, "stock")
+        # Qualified ETF symbols carry their market explicitly. The stock
+        # prefix check applies only when the code identifies a stock market.
+        if suffix in {"SH", "SZ", "BJ"} and code.isdigit() and stock_exchange in {None, suffix}:
+            return f"{code}.{suffix}"
+        if suffix in {"SH", "SZ", "BJ"}:
+            return ""
+    for suffix in ("SH", "SZ", "BJ"):
+        if raw.startswith(suffix):
+            code = _compact_digits(raw[len(suffix):])
+            if code.isdigit():
+                return f"{code}.{suffix}"
+    code = _compact_digits(raw)
+    if code.isdigit():
+        exchange = exchange_for_code(code, "stock")
+        return f"{code}.{exchange}" if exchange else ""
+    return raw
+
+
+def _normalize_entry_rows(rows: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    by_symbol: dict[str, dict] = {}
+    for row in rows:
+        symbol = _normalize_symbol(row.get("symbol"))
+        if not symbol:
+            continue
+        group_ids = [str(g) for g in (row.get("group_ids") or []) if g]
+        if symbol in by_symbol:
+            existing = by_symbol[symbol]
+            merged = list(dict.fromkeys([*(existing.get("group_ids") or []), *group_ids]))
+            existing["group_ids"] = merged
+            continue
+        clean = {
+            "symbol": symbol,
+            "added_at": str(row.get("added_at") or datetime.utcnow().isoformat(timespec="seconds")),
+            "note": row.get("note") or "",
+            "group_ids": list(dict.fromkeys(group_ids)),
+        }
+        by_symbol[symbol] = clean
+        normalized.append(clean)
+    return normalized
+
+
 def _path() -> Path:
     p = settings.data_dir / "user_data" / "watchlist.parquet"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +153,8 @@ def _read_entries() -> pl.DataFrame:
         df = df.with_columns(pl.lit("", dtype=pl.Utf8).alias("added_at"))
     if "note" not in df.columns:
         df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("note"))
-    return df.select(list(_ENTRY_SCHEMA))
+    rows = _normalize_entry_rows(df.select(list(_ENTRY_SCHEMA)).to_dicts())
+    return pl.DataFrame(rows, schema=_ENTRY_SCHEMA) if rows else _empty_entries()
 
 
 def _write_entries(df: pl.DataFrame) -> None:
@@ -110,7 +168,9 @@ def _write_entries(df: pl.DataFrame) -> None:
         except OSError as e:
             logger.warning("watchlist backup before migration failed: %s", e)
     tmp = p.with_suffix(p.suffix + ".tmp")
-    df.select(list(_ENTRY_SCHEMA)).write_parquet(tmp)
+    rows = _normalize_entry_rows(df.select(list(_ENTRY_SCHEMA)).to_dicts())
+    out = pl.DataFrame(rows, schema=_ENTRY_SCHEMA) if rows else _empty_entries()
+    out.select(list(_ENTRY_SCHEMA)).write_parquet(tmp)
     os.replace(tmp, p)
     _REVISION += 1
 
@@ -202,7 +262,10 @@ def add_batch(
             apply_ids.append(gid)
         rows = _read_entries().to_dicts()
         added = 0
-        for symbol in symbols:
+        for raw_symbol in symbols:
+            symbol = _normalize_symbol(raw_symbol)
+            if not symbol:
+                continue
             existing = next((row for row in rows if row["symbol"] == symbol), None)
             if existing is None:
                 added += 1
@@ -223,6 +286,7 @@ def add_batch(
 
 
 def remove(symbol: str) -> list[dict]:
+    symbol = _normalize_symbol(symbol)
     with _LOCK:
         df = _read_entries().filter(pl.col("symbol") != symbol)
         _write_entries(df)
@@ -230,6 +294,7 @@ def remove(symbol: str) -> list[dict]:
 
 
 def move_to_top(symbol: str) -> list[dict]:
+    symbol = _normalize_symbol(symbol)
     with _LOCK:
         df = _read_entries()
         if df.is_empty() or symbol not in df["symbol"].to_list():
@@ -323,6 +388,7 @@ def set_group(symbol: str, group_id: str | None) -> list[dict]:
     多组模型的日常操作走 add_to_group / remove_from_group; 本函数服务于
     「仅保留此组」的显式场景。
     """
+    symbol = _normalize_symbol(symbol)
     with _LOCK:
         groups = _read_groups()
         _validate_group_id(group_id, groups)
@@ -339,6 +405,7 @@ def set_group(symbol: str, group_id: str | None) -> list[dict]:
 
 def add_to_group(symbol: str, group_id: str) -> list[dict]:
     """把标的加入一个分组(多组成员关系: 不影响已属于的其他分组)。"""
+    symbol = _normalize_symbol(symbol)
     with _LOCK:
         groups = _read_groups()
         _validate_group_id(group_id, groups)
@@ -360,7 +427,7 @@ def transfer_members(
     source_group_id: str, target_group_id: str, symbols: list[str], action: str,
 ) -> tuple[list[dict], int]:
     """一次保存整批成员关系；过期的来源或选择不产生部分写入。"""
-    wanted = set(symbols)
+    wanted = {_normalize_symbol(symbol) for symbol in symbols}
     if not wanted or action not in {"move", "copy"}:
         raise ValueError("请选择自选标的及有效的分组操作")
     if source_group_id == target_group_id:
@@ -402,6 +469,7 @@ def transfer_members(
 
 def remove_from_group(symbol: str, group_id: str) -> list[dict]:
     """把标的移出一个分组(仅摘本组标签; 标的仍在自选, 可能落入未分组)。"""
+    symbol = _normalize_symbol(symbol)
     with _LOCK:
         groups = _read_groups()
         _validate_group_id(group_id, groups)

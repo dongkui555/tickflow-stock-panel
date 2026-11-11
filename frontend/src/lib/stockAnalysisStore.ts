@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react'
-import { api, friendlyStreamError, type PriceLevel, type LevelType } from './api'
+import { api, friendlyStreamError, type PriceLevel, type LevelType, type StockAnalysisMode } from './api'
 
 /**
  * AI 个股分析 —— 全局任务/报告 store(与 aiReportStore 解耦、并行存在)。
@@ -14,11 +14,19 @@ import { api, friendlyStreamError, type PriceLevel, type LevelType } from './api
 
 export type Phase = 'loading' | 'streaming' | 'done' | 'error'
 
+export interface AgentProgress {
+  key: string
+  name: string
+  status: 'pending' | 'running' | 'done' | 'error'
+  message?: string
+}
+
 export interface ActiveTask {
   id: string
   symbol: string
   name: string
   focus: string
+  analysisMode: StockAnalysisMode
   phase: Phase
   content: string
   error: string
@@ -27,6 +35,7 @@ export interface ActiveTask {
     levels?: Record<LevelType, PriceLevel[]>
     close?: number | null
   } | null
+  agents: AgentProgress[]
   createdAt: number
   savedReportId?: string
   doneAt?: number
@@ -38,6 +47,7 @@ export interface HistoryReport {
   symbol: string
   name: string
   focus: string
+  analysis_mode?: StockAnalysisMode
   content: string
   summary?: string
   close?: number | null
@@ -157,7 +167,12 @@ export async function findTodayReport(symbol: string): Promise<HistoryReport | n
   return history.find(r => r.symbol === symbol && (r.created_at ?? '').slice(0, 10) === today) ?? null
 }
 
-export async function startAnalysis(symbol: string, name: string, focus = ''): Promise<{ id?: string; error?: string }> {
+export async function startAnalysis(
+  symbol: string,
+  name: string,
+  focus = '',
+  analysisMode: StockAnalysisMode = 'multi_agent',
+): Promise<{ id?: string; error?: string }> {
   const existing = activeTasks.find(t => t.symbol === symbol && (t.phase === 'loading' || t.phase === 'streaming'))
   if (existing) {
     activeDialogTaskId = existing.id
@@ -173,9 +188,9 @@ export async function startAnalysis(symbol: string, name: string, focus = ''): P
 
   const id = `stask_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
   const task: ActiveTask = {
-    id, symbol, name, focus,
+    id, symbol, name, focus, analysisMode,
     phase: 'loading', content: '', error: '',
-    meta: null, createdAt: Date.now(),
+    meta: null, agents: [], createdAt: Date.now(),
   }
   activeTasks = [...activeTasks, task]
   activeDialogTaskId = id
@@ -183,19 +198,57 @@ export async function startAnalysis(symbol: string, name: string, focus = ''): P
   rebuildSnap()
   emit()
 
-  runStream(id, symbol, name, focus)
+  runStream(id, symbol, name, focus, analysisMode)
   return { id }
 }
 
-async function runStream(id: string, symbol: string, _name: string, focus: string) {
+function normalizeAgentStatus(status: string | undefined): AgentProgress['status'] {
+  if (status === 'running' || status === 'done' || status === 'error') return status
+  return 'pending'
+}
+
+function patchAgent(task: ActiveTask, agent: AgentProgress): AgentProgress[] {
+  const idx = task.agents.findIndex(a => a.key === agent.key)
+  if (idx < 0) return [...task.agents, agent]
+  return task.agents.map(a => a.key === agent.key ? { ...a, ...agent } : a)
+}
+
+async function runStream(
+  id: string,
+  symbol: string,
+  _name: string,
+  focus: string,
+  analysisMode: StockAnalysisMode,
+) {
   try {
     let firstDelta = true
-    for await (const chunk of api.stockAnalyzeStream(symbol, focus)) {
+    for await (const chunk of api.stockAnalyzeStream(symbol, focus, analysisMode)) {
       const cur = activeTasks.find(t => t.id === id)
       if (!cur) return
       switch (chunk.type) {
         case 'meta':
-          patchTask(id, { meta: { summary: chunk.summary, levels: chunk.levels, close: chunk.close } })
+          patchTask(id, {
+            analysisMode: chunk.analysis_mode ?? analysisMode,
+            meta: { summary: chunk.summary, levels: chunk.levels, close: chunk.close },
+            agents: (chunk.agents ?? []).map(a => ({
+              key: a.key,
+              name: a.name,
+              status: normalizeAgentStatus(a.status),
+              message: a.message,
+            })),
+          })
+          break
+        case 'agent':
+          if (chunk.agent_key && chunk.agent_name) {
+            patchTask(id, {
+              agents: patchAgent(cur, {
+                key: chunk.agent_key,
+                name: chunk.agent_name,
+                status: normalizeAgentStatus(chunk.status),
+                message: chunk.message,
+              }),
+            })
+          }
           break
         case 'delta':
           if (firstDelta) { patchTask(id, { phase: 'streaming' }); firstDelta = false }
@@ -219,6 +272,7 @@ async function runStream(id: string, symbol: string, _name: string, focus: strin
       try {
         const res = await api.stockAnalysisReportSave({
           symbol: final.symbol, name: final.name, focus: final.focus,
+          analysis_mode: final.analysisMode,
           content: final.content, summary: final.meta?.summary ?? '',
           close: final.meta?.close ?? null, levels: final.meta?.levels,
         })
@@ -256,8 +310,8 @@ export function restoreDialog(taskId: string) {
   }
   activeDialogTaskId = taskId; dialogMinimized = false; rebuildSnap(); emit()
 }
-export async function retryAnalysis(task: { symbol: string; name: string; focus: string }): Promise<{ error?: string }> {
-  return startAnalysis(task.symbol, task.name, task.focus)
+export async function retryAnalysis(task: { symbol: string; name: string; focus: string; analysisMode?: StockAnalysisMode }): Promise<{ error?: string }> {
+  return startAnalysis(task.symbol, task.name, task.focus, task.analysisMode ?? 'multi_agent')
 }
 export async function deleteReport(reportId: string): Promise<void> {
   try {

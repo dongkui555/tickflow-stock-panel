@@ -2,7 +2,7 @@
 
 标的列表优先用免费的 exchanges.get_instruments(type=index/etf) 拉取
 (None/Free 档均可用,无需 quote.pool 权限);付费档可额外用
-quotes.get_by_universes 作为补充来源。日K统一走 klines.batch。
+quotes.get_by_universes 作为补充来源。日K优先使用已配置源的资产专用接口。
 """
 from __future__ import annotations
 
@@ -21,6 +21,31 @@ from app.tickflow.rate_limits import chunked, min_batch, resolve_limit, sleep_be
 from app.tickflow.repository import KlineRepository
 
 logger = logging.getLogger(__name__)
+
+
+def custom_asset_provider():
+    from app.data_providers import custom
+    name = preferences.get_daily_data_provider()
+    if name != "tickflow" and custom.provider_has_dataset(name, "daily"):
+        provider = custom.get_provider(name)
+        if callable(getattr(provider, "get_asset_daily", None)):
+            return provider
+    return None
+
+
+def qmt_index_provider():
+    """Return QMT only after a real two-index daily-bar capability probe."""
+    try:
+        from app.data_providers import custom
+        from app.plugins.qmt.bridge import index_daily_availability
+        usable, reason = index_daily_availability()
+        if usable:
+            return custom.get_provider("qmt")
+        logger.info("QMT index backup unavailable: %s", reason)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("QMT index backup probe failed: %s", type(exc).__name__)
+    return None
+
 
 # exchanges.get_instruments 查询的交易所(沪深京)
 _EXCHANGES = ["SH", "SZ", "BJ"]
@@ -82,6 +107,8 @@ def _fetch_instruments_by_type(instrument_type: str, asset_type_label: str) -> p
     asset_type_label: 写入 instruments 表的 asset_type 标记('index' / 'etf')
     """
     tf = get_client()
+    from app.services.security_identity import IdentityBatchError, canonicalize_identity_frame
+
     rows: list[dict] = []
     for ex in _EXCHANGES:
         try:
@@ -94,6 +121,7 @@ def _fetch_instruments_by_type(instrument_type: str, asset_type_label: str) -> p
                 rows.append({
                     "symbol": str(symbol),
                     "name": item.get("name") or str(symbol),
+                    "exchange": ex,
                 })
         except Exception as e:  # noqa: BLE001
             logger.warning("get_instruments(%s, type=%s) failed: %s", ex, instrument_type, e)
@@ -101,15 +129,15 @@ def _fetch_instruments_by_type(instrument_type: str, asset_type_label: str) -> p
     if not rows:
         return pl.DataFrame()
 
-    return (
-        pl.DataFrame(rows)
-        .with_columns([
-            pl.col("symbol").str.split(".").list.first().alias("code"),
-            pl.lit(asset_type_label).alias("asset_type"),
+    # The endpoint is exchange-scoped; retain that evidence for bare ETF/index
+    # codes instead of guessing an exchange from a stock-code prefix.
+    identities = canonicalize_identity_frame(pl.DataFrame(rows), asset_type=asset_type_label)
+    if not identities.quarantined.is_empty():
+        raise IdentityBatchError([
+            {"raw": row["original_symbol"], "reason": row["identity_reason"]}
+            for row in identities.quarantined.to_dicts()
         ])
-        .unique(subset=["symbol"], keep="last")
-        .sort("symbol")
-    )
+    return identities.accepted.unique(subset=["symbol"], keep="last").sort("symbol")
 
 
 def sync_index_instruments(
@@ -226,17 +254,18 @@ def _sync_custom_daily(
     返回行数 —— 指数/ETF 各自复用与 TickFlow 路径相同的落盘逻辑, 不另起一套。
     """
     provider_name = preferences.get_daily_data_provider()
-    if provider_name == "tickflow":
-        return -1
-    from app.data_providers import custom as custom_sources
-    if not custom_sources.provider_has_dataset(provider_name, "daily"):
-        return -1
+    asset_provider = custom_asset_provider()
+    if asset_provider is not None:
+        frames = (asset_provider.get_asset_daily(symbols, start_time, end_time, asset_type, on_chunk_done),)
+    else:
+        from app.data_providers import custom as custom_sources
+        if provider_name == "tickflow" or not custom_sources.provider_has_dataset(provider_name, "daily"):
+            return -1
+        provider = custom_sources.get_provider(provider_name)
+        frames = _iter_custom_daily_frames(provider, symbols, asset_type, start_time, end_time, on_chunk_done)
 
-    provider = custom_sources.get_provider(provider_name)
     total_rows = 0
-    for raw in _iter_custom_daily_frames(
-        provider, symbols, asset_type, start_time, end_time, on_chunk_done,
-    ):
+    for raw in frames:
         if raw is None or raw.is_empty():
             continue
         total_rows += persist_frame(raw)

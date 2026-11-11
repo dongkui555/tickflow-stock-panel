@@ -1,6 +1,8 @@
 import { lazy, Suspense, useCallback, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { type KlineRow } from '@/lib/api'
+import { api } from '@/lib/api'
+import { QK } from '@/lib/queryKeys'
 import { klineDailyQueryOptions, klineDateRange } from '@/lib/kline'
 import { storage } from '@/lib/storage'
 import type { ChartMarker, ChartPriceLine, ChartRange, ChartRenderer, DailyMarkerStyle, OHLC, VolumeCompareConfig } from '@/lib/chart-types'
@@ -23,6 +25,9 @@ function normalizeVolumeCompare(config: VolumeCompareConfig): VolumeCompareConfi
 
 interface Props {
   symbol: string
+  minutePeriod?: 5 | 15 | 30 | 60
+  minuteDays?: number
+  refetchIntervalMs?: number
   renderer?: ChartRenderer
   height?: number
   className?: string
@@ -47,14 +52,21 @@ interface Props {
 }
 
 function isValidRow(r: any): boolean {
-  return r && r.date != null && r.open != null && r.close != null
+  if (!r || r.date == null) return false
+  const open = Number(r.open)
+  const high = Number(r.high)
+  const low = Number(r.low)
+  const close = Number(r.close)
+  return [open, high, low, close].every(v => Number.isFinite(v) && v > 0)
+    && high >= Math.max(open, close)
+    && low <= Math.min(open, close)
 }
 
-export function toOHLC(rows: KlineRow[]): OHLC[] {
+export function toOHLC(rows: KlineRow[], keepTime = false): OHLC[] {
   return rows
     .filter(isValidRow)
     .map(r => ({
-      date: typeof r.date === 'string' ? r.date.slice(0, 10) : String(r.date),
+      date: typeof r.date === 'string' ? (keepTime ? r.date.replace('T', ' ').slice(0, 16) : r.date.slice(0, 10)) : String(r.date),
       open: Number(r.open),
       high: Number(r.high),
       low: Number(r.low),
@@ -135,6 +147,8 @@ function ChartPill({
 
 export function StockDailyKChart({
   symbol,
+  minutePeriod,
+  minuteDays = 20,
   renderer = 'echarts',
   height = 520,
   className,
@@ -153,6 +167,7 @@ export function StockDailyKChart({
   onPriceDoubleClick,
   extColumns,
   addedDate,
+  refetchIntervalMs = 0,
 }: Props) {
   const [activeIndicators, setActiveIndicators] = useState<string[]>(['vol'])
   const [showMarkers, setShowMarkers] = useState(true)
@@ -167,16 +182,23 @@ export function StockDailyKChart({
   )
   const dateRange = externalDateRange ?? getDefaultRange()
 
-  // 查询配置统一来自 klineDailyQueryOptions, 与 StockPanel 信息条/邻近预取共享同一 cache key (只发一次请求)
-  const kline = useQuery({ ...klineDailyQueryOptions(symbol, dateRange, extColumns), enabled: !!symbol })
+  // extColumns 纳入 query key：勾选/取消扩展字段时需重新请求（带 ext_columns 参数）
+  const kline = useQuery({
+    ...(!minutePeriod ? klineDailyQueryOptions(symbol, dateRange, extColumns) : {}),
+    queryKey: minutePeriod ? QK.klineMinuteBars(symbol, minutePeriod, minuteDays) : QK.kline(symbol, dateRange.start, dateRange.end, extColumns),
+    queryFn: () => minutePeriod ? api.klineMinuteBars(symbol, minutePeriod, minuteDays) : api.klineDaily(symbol, 365, dateRange, extColumns),
+    enabled: !!symbol,
+    refetchInterval: refetchIntervalMs,
+    placeholderData: minutePeriod ? undefined : (prev) => prev,
+  })
 
-  const rows = useMemo(() => toOHLC(kline.data?.rows ?? []), [kline.data?.rows])
+  const rows = useMemo(() => toOHLC(kline.data?.rows ?? [], !!minutePeriod), [kline.data?.rows, minutePeriod])
   const stockInfo = kline.data?.stock_info
   const limitMarkers = useMemo(() => buildLimitMarkers(kline.data?.rows ?? [], renderer === 'lightweight'), [kline.data?.rows, renderer])
   const allMarkers = useMemo(() => [
     ...(markers ?? []),
-    ...(showLimitMarkers ? limitMarkers : []),
-  ], [limitMarkers, markers, showLimitMarkers])
+    ...(showLimitMarkers && !minutePeriod ? limitMarkers : []),
+  ], [limitMarkers, markers, showLimitMarkers, minutePeriod])
 
   const toggleIndicator = useCallback((key: string) => {
     setActiveIndicators(prev => prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key])
@@ -229,7 +251,7 @@ export function StockDailyKChart({
               onClick={() => toggleIndicator(ind.key)}
             />
           ))}
-          {activeIndicators.includes('vol') && (
+          {!minutePeriod && activeIndicators.includes('vol') && (
             <div className="ml-0.5 flex h-5 items-center gap-1.5 border-l border-border/70 pl-2">
               <span className="text-[10px] text-muted">量比</span>
               <button
@@ -262,7 +284,7 @@ export function StockDailyKChart({
           )}
           {/* 两个标注开关统一右对齐 */}
           <div className="ml-auto flex items-center gap-1.5">
-            {showMarkerToggle && showLimitMarkers && (
+            {!minutePeriod && showMarkerToggle && showLimitMarkers && (
               <div className="flex items-center gap-1">
                 <ChartPill
                   active={showMarkers}
@@ -284,7 +306,7 @@ export function StockDailyKChart({
               </div>
             )}
             {/* 激活色与图表里的 ADDED_DATE_COLOR 一致; Tailwind 只认字面量类名, 故写死色值 */}
-            {showMarkerToggle && addedDate && (
+            {!minutePeriod && showMarkerToggle && addedDate && (
               <ChartPill
                 active={showAddedMark}
                 label="自选"
@@ -297,7 +319,13 @@ export function StockDailyKChart({
         </div>
       )}
       {kline.isLoading && <div className="text-sm text-muted py-4">加载中…</div>}
-      {kline.isError && <div className="text-sm text-danger py-2">日K加载失败</div>}
+      {kline.isError && <div className="text-sm text-danger py-2">{minutePeriod ? `${minutePeriod}分钟K` : '日K'}加载失败</div>}
+      {minutePeriod && rows.length > 0 && <div className="py-1 text-xs text-muted">
+        本地分钟K · {minutePeriod}分钟 · 截至 {rows[rows.length - 1].date} · 成交量：手
+      </div>}
+      {minutePeriod && kline.data && 'warning' in kline.data && !!kline.data.warning && <div className="text-xs text-warning py-1">{String(kline.data.warning)}</div>}
+      {minutePeriod && kline.data && 'forming_bars' in kline.data && Number(kline.data.forming_bars) > 0 && <div className="text-xs text-muted py-1">最新K线未收盘</div>}
+      {!kline.isLoading && !kline.isError && !rows.length && <div className="text-sm text-muted py-4">暂无可用K线</div>}
       {!kline.isLoading && !kline.isError && (kline.data?.rows?.length ?? 0) > 0 && rows.length === 0 && (
         <div className="text-sm text-danger py-2">数据格式异常，请刷新页面</div>
       )}
@@ -321,8 +349,8 @@ export function StockDailyKChart({
           onPriceDoubleClick={onPriceDoubleClick}
           visibleBars={visibleBars ?? (renderer === 'lightweight' ? undefined : 60)}
           activeIndicators={activeIndicators}
-          volumeCompare={volumeCompare}
-          addedDate={showAddedMark ? addedDate : null}
+          volumeCompare={minutePeriod ? { enabled: false, days: 1 } : volumeCompare}
+          addedDate={minutePeriod ? null : (showAddedMark ? addedDate : null)}
         />
         </Suspense>
       )}

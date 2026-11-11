@@ -650,6 +650,13 @@ def _register_one_plugin(manifest: dict) -> None:
         provider_cls = _load_entry(manifest["entry"])
         provider = provider_cls() if isinstance(provider_cls, type) else provider_cls
         provider.builtin = True  # 标记为内置 (list_sources 过滤, 不可被用户编辑/删除)
+        runtime_datasets = getattr(getattr(provider, "config", None), "datasets", None)
+        if isinstance(runtime_datasets, dict):
+            # A ready plugin can still lack individual datasets (e.g. QMT
+            # history without live quotes). UI and routing share that subset.
+            datasets = [ds for ds in _PLUGIN_STATUS[name]["datasets"] if ds in runtime_datasets]
+            provider.config.datasets = {ds: runtime_datasets[ds] for ds in datasets}
+            _PLUGIN_STATUS[name]["datasets"] = datasets
         old = _PROVIDERS.get(name)
         if isinstance(old, ManagedProvider):
             old.replace(provider)

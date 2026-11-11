@@ -34,6 +34,12 @@ def _group(symbol, bars=None):
     return {"thscode": symbol, "timestamp": START, "item": [_bar()] if bars is None else bars}
 
 
+def _write_instruments(root, symbols):
+    target = root / "instruments" / "instruments.parquet"
+    target.parent.mkdir()
+    pl.DataFrame({"symbol": symbols, "code": [symbol[:6] for symbol in symbols]}).write_parquet(target)
+
+
 def _http_client(monkeypatch, payload, status=200):
     calls = []
     real_client = httpx.Client
@@ -150,7 +156,7 @@ def test_provider_falls_back_from_rejected_http_batch_without_changing_price(mon
     finally:
         client.close()
     assert result["close"].to_list() == [11.63]
-    assert result["volume"].to_list() == [16126.0]
+    assert result["volume"].to_list() == [1612611.0]  # 日 K 内部口径为股
     assert [r.url.path for r in calls] == ["/api/a-share/prices/historical-batch", "/api/a-share/prices/historical"]
     assert all(r.url.params["adjust"] == "none" for r in calls)
 
@@ -202,7 +208,7 @@ def test_small_query_prefers_batch_and_preserves_raw_price_units_and_date(monkey
     assert df.columns == ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
     assert df.schema["date"] == pl.Date
     assert dict(zip(df["symbol"], df["close"], strict=True)) == {"000001.SZ": 11.63, "600519.SH": 1480.12}
-    assert df["volume"].to_list() == [16126.0, 16126.0]
+    assert df["volume"].to_list() == [1612611.0, 1612611.0]
     assert df["amount"].to_list() == [18754665.93, 18754665.93]
     assert df["date"].to_list() == [DAY, DAY]
     assert client.single_calls == []
@@ -302,6 +308,7 @@ def test_terminal_fallback_failure_rolls_back_staging_and_keeps_existing_data(mo
     from app.data_providers import custom
     monkeypatch.setattr(custom, "provider_has_dataset", lambda *_: True)
     monkeypatch.setattr(custom, "get_provider", lambda _: provider)
+    _write_instruments(tmp_path, symbols)
     repo = KlineRepository(DataStore(tmp_path))
     target = tmp_path / "kline_daily" / f"date={DAY}" / "part.parquet"
     target.parent.mkdir(parents=True)
@@ -338,7 +345,7 @@ def test_unknown_symbol_does_not_discard_other_stocks(monkeypatch, caplog):
         client.close()
     assert df["symbol"].to_list() == ["000001.SZ"]
     assert df["close"].to_list() == [11.63]
-    assert df["volume"].to_list() == [16126.0]
+    assert df["volume"].to_list() == [1612611.0]
     assert "000004.SZ" in caplog.text and "未覆盖" in caplog.text
     assert len(calls) == 3  # 整批拒绝后仅在源内单票兜底,不跨数据源。
 
@@ -391,6 +398,7 @@ def test_unknown_symbol_preserves_local_history_and_reports_zero_rows(monkeypatc
     from polars.testing import assert_frame_equal
 
     client, _ = _http_client(monkeypatch, _unknown_symbol_response)
+    _write_instruments(tmp_path, ["000001.SZ", "000004.SZ"])
     repo = KlineRepository(DataStore(tmp_path))
     provider = _provider(monkeypatch, client)
     monkeypatch.setattr(kline_sync.preferences, "get_daily_data_provider", lambda: "fuyao")

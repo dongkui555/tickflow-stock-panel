@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
@@ -59,6 +62,14 @@ _FINAL_CONFIRM_SLACK_MS = 5_000
 # 由管道按官方日线值级校正 —— 避免定版重试与权威重建互相覆盖。
 _FINAL_BOUNDARY = {"morning_final": dt_time(11, 30), "close_final": dt_time(15, 0)}
 _FINAL_DEADLINE = {"morning_final": dt_time(12, 10), "close_final": dt_time(15, 30)}
+
+
+@dataclass
+class _PrimaryQuotes:
+    records: list[dict]
+    partial: bool = False
+    partial_assets: frozenset[str] = frozenset()
+    replace_index_cache: bool = True
 
 
 def _body_with_quote(body: str, ev: dict) -> str:
@@ -278,7 +289,7 @@ class QuoteService:
         "starter": 6.0,
         "free": 6.0,
     }
-    # 插件/自定义源: 不受 TickFlow 档位保护约束, 通用下限 1s (默认间隔仍为 DEFAULT_INTERVAL)
+    # 插件/自定义源不受 TickFlow 档位保护约束；源自身的限流由插件处理。
     CUSTOM_PROVIDER_MIN_INTERVAL = 1.0
     DEFAULT_INTERVAL = 6.0
     MAX_INTERVAL = 60.0
@@ -321,6 +332,9 @@ class QuoteService:
         # 拉取元信息 (给 SSE / status 用)
         self._fetch_time: float = 0.0       # perf_counter (用于计算 quote_age_ms)
         self._fetch_ms: float = 0.0         # 拉取耗时 (毫秒)
+        self._fetch_failures: int = 0
+        self._fetch_backoff_until: float = 0.0
+        self._last_fetch_error: str | None = None
         # _fetched_at 持久化到 preferences: 进程重启后仍能显示"最后获取"时间,
         # 不因关闭开关/重启而归零 (数据页卡片常驻显示, 方便判断上次拉取时刻)。
         try:
@@ -332,6 +346,11 @@ class QuoteService:
         self._index_symbol_count: int = 0
         self._etf_symbol_count: int = 0
         self._index_quotes_cache: pl.DataFrame | None = None
+        # TDX/AIAgents 这类按标的实时源只覆盖自选/持仓/监控清单, 不能污染
+        # repo 的全市场 enriched 最新缓存；否则选股/StockFormer 会把样本 universe
+        # 误判为几只股票。部分实时行情单独存在这里, 由自选/个股/监控叠加读取。
+        self._partial_enriched_cache: pl.DataFrame | None = None
+        self._partial_enriched_cache_date: date | None = None
         self._intraday_signal_evaluator = IntradaySignalEvaluator()
         self._intraday_signal_bucket: dict[str, str] = {}
         # 午休/收盘最终同步状态: 到边界后必须成功拉取一版行情, 再进入休盘态。
@@ -375,7 +394,7 @@ class QuoteService:
         self._save_enabled(True)
         logger.info("行情服务已启动, 轮询间隔 %.1fs", self._interval)
 
-    def stop(self) -> None:
+    def stop(self, *, persist: bool = False) -> None:
         """停止后台行情轮询线程。"""
         with self._lifecycle_lock:
             self._running = False
@@ -388,6 +407,8 @@ class QuoteService:
         # 此处不持久化关闭: lifespan shutdown (容器停止/重启) 也调用 stop,
         # 持久化 False 会让每次重启后实时行情都变关闭、需手动再开。
         # 持久化语义归 disable() (用户主动关闭)。
+        if persist:
+            self._save_enabled(False)
         logger.info("行情服务已停止")
 
     def enable(self) -> bool:
@@ -414,7 +435,7 @@ class QuoteService:
 
     def disable(self) -> None:
         """关闭自动行情。"""
-        self.stop()
+        self.stop(persist=False)
         self._save_enabled(False)
         logger.info("行情服务已关闭")
 
@@ -611,18 +632,30 @@ class QuoteService:
 
     @classmethod
     def realtime_mode(cls) -> str:
-        """当前实时行情模式: none / full_market。
+        """当前实时行情模式: none / watchlist / full_market。
 
         TickFlow 免费档不再提供"自选前 5 只"降级实时(自定义源 fuyao 的全市场
         快照已全面覆盖且免费); TickFlow 免费档 = 无实时, 接入自定义实时源
         (如 fuyao)或升级 TickFlow 后恢复全市场模式。
         """
         from app.services import preferences
-        if preferences.get_realtime_data_provider() != "tickflow":
-            return "full_market"
+        from app.config import settings
+        unavailable = "watchlist" if settings.public_market_fallback_enabled else "none"
+        provider_name = preferences.get_realtime_data_provider()
+        if provider_name != "tickflow":
+            try:
+                from app.data_providers import custom as custom_sources
+
+                if not custom_sources.provider_has_dataset(provider_name, "realtime"):
+                    return unavailable
+                provider = custom_sources.get_provider(provider_name)
+                scope = str(getattr(provider, "realtime_scope", "all") or "all").lower()
+                return "watchlist" if scope == "symbols" else "full_market"
+            except Exception:  # noqa: BLE001
+                return unavailable
         tier = cls._current_tier()
         if tier in ("none", "free"):
-            return "none"
+            return unavailable
         return "full_market"
 
     @classmethod
@@ -633,7 +666,7 @@ class QuoteService:
     @classmethod
     def _tier_min_interval(cls) -> float:
         # 实时源路由到插件/自定义源时, TickFlow 档位限速不适用 (中立能力原则):
-        # 下限放宽到通用 1s, 默认/已保存间隔不变
+        # 但外部网关仍需 provider 级保护, 否则盘中会触发 429。
         from app.services import preferences
         if preferences.get_realtime_data_provider() != "tickflow":
             return cls.CUSTOM_PROVIDER_MIN_INTERVAL
@@ -652,6 +685,12 @@ class QuoteService:
 
         所有页面统一通过此方法获取实时行情 + 技术指标。
         """
+        if self.realtime_mode() != "full_market" or getattr(self, "_fallback_partial", False):
+            with self._lock:
+                if self._partial_enriched_cache is not None and not self._partial_enriched_cache.is_empty():
+                    return self._partial_enriched_cache.clone(), self._partial_enriched_cache_date
+                if getattr(self, "_fallback_partial", False):
+                    return pl.DataFrame(), None
         if not self._repo:
             return pl.DataFrame(), None
         return self._repo.get_enriched_latest()
@@ -711,7 +750,10 @@ class QuoteService:
     def status(self) -> dict:
         """返回行情服务状态。"""
         age = (time.perf_counter() - self._fetch_time) * 1000 if self._fetch_time else -1
+        backoff_remaining = max(0.0, self._fetch_backoff_until - time.perf_counter())
         mode = self.realtime_mode()
+        if getattr(self, "_fallback_partial", False):
+            mode = "watchlist"
         phase = self._market_phase()
         final_key = self._final_sync_key(phase)
         final_done = bool(final_key and final_key in self._final_sync_done)
@@ -727,6 +769,9 @@ class QuoteService:
             "index_symbol_count": self._index_symbol_count,
             "etf_symbol_count": self._etf_symbol_count,
             "quote_age_ms": round(age, 0) if age >= 0 else None,
+            "fetch_failures": self._fetch_failures,
+            "backoff_remaining_s": round(backoff_remaining, 1),
+            "last_fetch_error": self._last_fetch_error,
             # 交易时段 = 连续竞价; polling_window 另行返回,避免午休/收盘缓冲误显示为交易中。
             "is_trading_hours": self._is_continuous_trading(),
             "is_polling_window": self._should_poll_for_phase(phase),
@@ -734,6 +779,7 @@ class QuoteService:
             "final_sync_done": final_done,
             "final_sync_failed": final_failed,
             "last_fetch_ms": round(self._fetched_at, 0) if self._fetched_at else None,
+            "backup_route": getattr(self, "_backup_route", None),
         }
 
     def refresh(self) -> dict:
@@ -762,14 +808,16 @@ class QuoteService:
             try:
                 # 管道/数据修正运行期间临时暂停取数, 防止与管道写同一批 parquet 竞态。
                 # 线程继续存活 + 分片 sleep, resume() 后即时恢复, 无需重启线程。
-                if not self._paused:
-                    phase = self._market_phase()
-                    if self._should_fetch_for_phase(phase):
-                        is_final = phase in {"morning_final", "close_final"}
-                        ok = self._fetch_quotes(
-                            final=is_final,
-                            final_boundary_ms=self._final_boundary_ms(phase),
-                        )
+                phase = self._market_phase()
+                if self._should_fetch_for_phase(phase):
+                    is_final = phase in {"morning_final", "close_final"}
+                    backoff_remaining = max(0.0, self._fetch_backoff_until - time.perf_counter())
+                    if backoff_remaining > 0 and not is_final:
+                        logger.debug("行情源退避中, %.1fs 后重试", backoff_remaining)
+                    else:
+                        # 管道/数据修正运行期间仍允许刷新内存行情, 但不写 parquet。
+                        # 这样页面与 SSE 不会长时间读旧价, 同时避免与重任务抢同一分区文件。
+                        ok = self._fetch_quotes(final=is_final, memory_only=self._paused, final_boundary_ms=self._final_boundary_ms(phase))
                         if is_final:
                             key = self._final_sync_key(phase)
                             label = "午休" if phase == "morning_final" else "收盘"
@@ -796,8 +844,8 @@ class QuoteService:
                                 )
                                 if not ok:
                                     logger.warning("%s 最终行情同步失败, 将继续重试", label)
-                    else:
-                        logger.debug("非轮询阶段(%s), 跳过行情轮询", phase)
+                else:
+                    logger.debug("非轮询阶段(%s), 跳过行情轮询", phase)
             except Exception as e:  # noqa: BLE001
                 logger.warning("行情轮询异常: %s", e)
 
@@ -819,7 +867,7 @@ class QuoteService:
         if self._final_sync_failed and any(k[0] != today for k in self._final_sync_failed):
             self._final_sync_failed = {k: v for k, v in self._final_sync_failed.items() if k[0] == today}
 
-    def _fetch_quotes(self, *, final: bool = False, final_boundary_ms: int | None = None) -> bool:
+    def _fetch_quotes(self, *, final: bool = False, final_boundary_ms: int | None = None, memory_only: bool = False) -> bool:
         """拉取行情。加锁串行化 (后台轮询 vs 手动 refresh)。返回本轮是否成功更新。
 
         final_boundary_ms: final 定版的边界时间戳 (ms)。传入时快照时间戳未达边界
@@ -840,7 +888,7 @@ class QuoteService:
             before = self._fetched_at
             if final:
                 logger.info("最终行情同步开始")
-            snapshot = self._fetch_full_market_quotes(final_boundary_ms=final_boundary_ms)
+            snapshot = self._fetch_full_market_quotes(final_boundary_ms=final_boundary_ms, memory_only=memory_only)
             updated = self._fetched_at > before
             self._last_quote_key = key
             self._last_quote_outcome = updated
@@ -850,32 +898,240 @@ class QuoteService:
         if snapshot is not None:
             with self._evaluate_lock:
                 self._evaluate_monitors(*snapshot)
+        if updated:
+            self._record_fetch_success()
+        else:
+            self._record_fetch_failure("empty_or_rate_limited")
         return updated
 
-    def _fetch_full_market_quotes(
-        self, final_boundary_ms: int | None = None
-    ) -> tuple[pl.DataFrame, pl.DataFrame | None] | None:
-        """拉取全市场行情 → 写 daily + 计算 enriched + 更新缓存。
+    def _record_fetch_success(self) -> None:
+        with self._lock:
+            had_failure = self._fetch_failures > 0 or bool(self._last_fetch_error)
+            self._fetch_failures = 0
+            self._fetch_backoff_until = 0.0
+            self._last_fetch_error = None
+        if had_failure:
+            logger.info("行情刷新恢复")
 
-        返回 (daily_df, quote_extra) 快照供调用方在锁外评估监控; 空/失败轮返回 None。
-        """
+    def _record_fetch_failure(self, reason: str) -> None:
+        base_interval = max(self._interval, self._tier_min_interval())
+        with self._lock:
+            self._fetch_failures += 1
+            failures = self._fetch_failures
+            delay = min(self.MAX_INTERVAL, base_interval * (2 ** min(failures - 1, 3)))
+            self._fetch_backoff_until = time.perf_counter() + delay
+            self._last_fetch_error = reason
+        logger.warning("行情刷新未成功(%s), 连续失败 %d 次, %.0fs 后重试", reason, failures, delay)
+
+    def _fetch_full_market_quotes(self, *, memory_only: bool = False, final_boundary_ms: int | None = None):
+        from app.config import settings
+        from app.data_providers.public_market import public_market_backup, timestamp_ms, valid_quote
         from app.services import preferences
 
+        t0 = time.perf_counter()
         source_stamp = preferences.data_source_stamp()
-        provider_name = preferences.get_realtime_data_provider()
+        primary = preferences.get_realtime_data_provider()
+        enabled = settings.public_market_fallback_enabled
+        batch = _PrimaryQuotes([], partial=True, replace_index_cache=False)
+        key = "primary_realtime:" + primary
+        error = ""
+        try:
+            if not enabled or public_market_backup.available(key):
+                batch = (self._bounded_primary_quotes(primary) if enabled
+                         else self._fetch_primary_quote_records())
+            else:
+                error = "primary_cooldown"
+        except Exception as exc:  # noqa: BLE001
+            error = type(exc).__name__
+            logger.warning("Primary realtime %s failed: %s", primary, error)
+
+        if preferences.data_source_stamp() != source_stamp:
+            logger.info("行情数据源配置已变化，跳过旧轮次发布")
+            return None
+        records, partial = batch.records, batch.partial
+        if not enabled:
+            self._fallback_partial = False
+            self._validated_quote_symbols = None
+            if not records:
+                return None
+            return self._process_full_market_records(records, t0=t0, now_ts=time.perf_counter(),
+                                              partial=partial, memory_only=memory_only, require_stock=not partial,
+                                              replace_index_cache=batch.replace_index_cache,
+                                              final_boundary_ms=final_boundary_ms,
+                                              **({"partial_assets": batch.partial_assets} if batch.partial_assets else {}))
+
+        assets = self._backup_assets()
+        storage_symbols = {}
+        compact_assets = set()
+        asset_types = dict(assets)
+        for asset, getter in (("stock", "get_instruments"), ("etf", "get_etf_instruments")):
+            get_frame = getattr(self._repo, getter, None)
+            frame = get_frame() if callable(get_frame) else pl.DataFrame()
+            if "symbol" not in frame.columns:
+                continue
+            local_symbols = frame["symbol"].to_list()
+            if local_symbols and all(len(str(s)) == 6 and str(s).isdigit() for s in local_symbols):
+                compact_assets.add(asset)
+            for symbol in local_symbols:
+                qualified = self._normalize_realtime_symbol(symbol)
+                storage_symbols[qualified] = str(symbol)
+                asset_types[qualified] = asset
+        now = cn_now()
+        valid = {}
+        for row in records:
+            row = dict(row)
+            row["symbol"] = self._normalize_realtime_symbol(row.get("symbol"))
+            row["asset_type"] = asset_types.get(row["symbol"], row.get("asset_type", "stock"))
+            if valid_quote(row, now):
+                row["source"] = primary
+                row["timestamp"] = timestamp_ms(row["timestamp"])
+                valid[row["symbol"]] = row
+        rejected = len(records) - len(valid)
+        primary_ok = bool(valid) and len(valid) >= len(records) * 0.9
+        if not partial and preferences.get_realtime_pull_stock():
+            stock_count = sum(r["asset_type"] == "stock" for r in valid.values())
+            expected = self._repo.get_instruments().height if self._repo else 0
+            if not stock_count or (expected and stock_count < expected * 0.9):
+                partial = True
+                primary_ok = False
+        if error != "primary_cooldown":
+            public_market_backup.record(key, primary_ok, error or ("invalid_or_empty" if not primary_ok else ""))
+        missing = {s: a for s, a in assets.items() if s not in valid}
+        qmt_rows = self._qmt_quote_backup(missing, now=now, primary=primary)
+        valid.update({r["symbol"]: r for r in qmt_rows})
+        missing = {s: a for s, a in missing.items() if s not in valid}
+        backup_rows = public_market_backup.fetch(missing, now=now) if missing else []
+        valid.update({r["symbol"]: r for r in backup_rows})
+        # Sparse/invalid responses must not replace a full-market partition.
+        degraded = partial or not primary_ok
+        self._fallback_partial = degraded
+        self._validated_quote_symbols = frozenset(valid)
+        sources = {}
+        for row in valid.values():
+            sources[row["source"]] = sources.get(row["source"], 0) + 1
+        self._backup_route = dict(primary=primary, sources=sources, degraded=degraded,
+                                  rejected_primary=rejected, priority_requested=len(assets),
+                                  priority_missing=sum(s not in valid for s in assets),
+                                  missing_priority_symbols=[s for s in assets if s not in valid][:100],
+                                  validated_count=len(valid),
+                                  checked_at=now.isoformat(), error=error or None)
+        if degraded:
+            self._clear_partial_enriched()
+        if not valid:
+            logger.warning("Realtime primary and backups unavailable; no stale data published")
+            return
+        # Exchange suffixes belong to the vendor boundary, not a new database identity.
+        rows = [dict(r, symbol=storage_symbols.get(s, s.split(".")[0] if r["asset_type"] in compact_assets else s))
+                for s, r in valid.items()]
+        if preferences.data_source_stamp() != source_stamp:
+            logger.info("行情数据源配置已变化，跳过旧轮次发布")
+            return None
+        return self._process_full_market_records(rows, t0=t0, now_ts=time.perf_counter(),
+                                          partial=degraded, memory_only=memory_only, merge_existing=True,
+                                          replace_index_cache=batch.replace_index_cache
+                                          or any(r.get("asset_type") == "index" and r.get("source") != primary for r in rows),
+                                          final_boundary_ms=final_boundary_ms,
+                                          partial_assets=batch.partial_assets)
+
+    @staticmethod
+    def _qmt_quote_backup(assets: dict[str, str], *, now, primary: str) -> list[dict]:
+        """Read a bounded, fresh symbol set from the local iQuant push cache."""
+        from app.config import settings
+        from app.data_providers.public_market import timestamp_ms, valid_quote
+
+        if primary == "qmt" or not assets:
+            return []
+        if str(os.getenv("QMT_ENABLED", "")).strip().lower() not in {"1", "true", "yes", "on"}:
+            return []
+        limit = max(1, int(settings.public_market_fallback_max_symbols))
+        symbols = list(assets)[:limit]
+        try:
+            from app.plugins.qmt.provider import QmtProvider
+
+            provider = QmtProvider()
+            try:
+                frame = provider.get_realtime(symbols=symbols)
+            finally:
+                provider.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("QMT realtime backup unavailable: %s", type(exc).__name__)
+            return []
+        rows = []
+        for raw in frame.to_dicts() if frame is not None and not frame.is_empty() else []:
+            row = dict(raw)
+            row["symbol"] = QuoteService._normalize_realtime_symbol(row.get("symbol"))
+            row["asset_type"] = assets.get(row["symbol"], "stock")
+            if row["symbol"] in assets and valid_quote(row, now):
+                row["source"] = "qmt"
+                row["timestamp"] = timestamp_ms(row.get("timestamp"))
+                rows.append(row)
+        return rows
+
+    def is_symbol_quote_current(self, symbol: str) -> bool:
+        symbols = getattr(self, "_validated_quote_symbols", None)
+        return symbols is None or self._normalize_realtime_symbol(symbol) in symbols
+
+    def _backup_assets(self) -> dict[str, str]:
+        """Existing watch/position/monitor pool, typed before public unit mapping."""
+        symbols = self._collect_symbol_scoped_realtime_symbols()
+        indices = set(CORE_INDEX_SYMBOLS) | self._collect_monitor_index_symbols()
+        etfs = set()
+        if self._repo:
+            indices.update(self._repo.get_index_symbol_set())
+            frame = self._repo.get_etf_instruments()
+            if not frame.is_empty() and "symbol" in frame.columns:
+                etfs.update(frame["symbol"].to_list())
+        ordered = sorted(set(CORE_INDEX_SYMBOLS)) + [s for s in symbols if s not in CORE_INDEX_SYMBOLS]
+        return {s: "index" if s in indices else "etf" if s in etfs else "stock" for s in ordered}
+
+    def _bounded_primary_quotes(self, primary):
+        """At most one in-flight primary call, even when its SDK retries slowly."""
+        from app.services import preferences
+
+        source = (primary, preferences.data_source_stamp())
+        future = getattr(self, "_primary_quote_future", None)
+        if future is not None and self._primary_quote_name != source:
+            if not future.done():
+                raise TimeoutError("previous primary still running")
+            future = None
+        if future is None:
+            if not hasattr(self, "_primary_quote_executor"):
+                self._primary_quote_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="primary-quote")
+            self._primary_quote_name = source
+            future = self._primary_quote_executor.submit(self._fetch_primary_quote_records, primary)
+            self._primary_quote_future = future
+        try:
+            return future.result(timeout=8)
+        finally:
+            if future.done():
+                self._primary_quote_future = None
+
+    def _fetch_primary_quote_records(self, provider_name=None) -> _PrimaryQuotes:
+        """拉取全市场行情 → 写 daily + 计算 enriched + 更新缓存。"""
+        from app.services import preferences
+
+        provider_name = provider_name or preferences.get_realtime_data_provider()
         configured = str(preferences.load().get("realtime_data_provider") or "").strip().lower()
         if configured and configured != "tickflow" and provider_name == "tickflow":
             provider_name = configured
         demand = self._wanted_quotes()
+        partial_assets = set()
         if provider_name != "tickflow":
             from app.data_providers import custom as custom_sources
             if custom_sources.provider_has_dataset(provider_name, "realtime"):
                 try:
-                    t0 = time.perf_counter()
-                    now_ts = time.perf_counter()
                     provider = custom_sources.get_provider(provider_name)
-                    records = provider.get_realtime()
-                    partial_assets = set()
+                    scope = str(getattr(provider, "realtime_scope", "all") or "all").lower()
+                    partial = scope == "symbols"
+                    kwargs = {}
+                    if partial:
+                        symbols = self._collect_symbol_scoped_realtime_symbols()
+                        if not symbols:
+                            logger.warning("自定义实时行情源 %s 需要指定标的, 但当前标的池为空", provider_name)
+                            return _PrimaryQuotes([], partial=True, replace_index_cache=False)
+                        kwargs["symbols"] = symbols
+                        logger.info("拉取按标的实时行情源 %s: %d 只", provider_name, len(symbols))
+                    records = self._coerce_realtime_records(provider.get_realtime(**kwargs))
                     fetch_symbols = getattr(provider, "get_realtime_symbols", None)
                     if callable(fetch_symbols):
                         received = {r.get("symbol") for r in records}
@@ -910,37 +1166,22 @@ class QuoteService:
                             if fetched_indices is None:
                                 replace_index_cache = False
                             else:
-                                records = records + fetched_indices
+                                records.extend(self._coerce_realtime_records(fetched_indices))
                         except Exception as e:  # noqa: BLE001
                             logger.warning("自定义源指数行情拉取失败: %s", e)
                             replace_index_cache = False
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("自定义实时行情拉取失败: %s", e)
-                    return
-                if preferences.data_source_stamp() != source_stamp:
-                    logger.info("行情数据源配置已变化，跳过旧轮次发布")
-                    return None
-                return self._process_full_market_records(
-                    records,
-                    t0=t0,
-                    now_ts=now_ts,
-                    replace_index_cache=replace_index_cache,
-                    final_boundary_ms=final_boundary_ms,
-                    **({"partial_assets": partial_assets} if partial_assets else {}),
-                )
-            logger.warning("所选实时数据源不可用或未声明 realtime，保留已有行情")
-            return None
+                    raise RuntimeError("custom realtime failed") from e
+                return _PrimaryQuotes(records, partial, frozenset(partial_assets), replace_index_cache)
+            raise RuntimeError("所选实时数据源不可用或未声明 realtime")
 
         from app.tickflow.client import get_paid_realtime_client
 
         tf = get_paid_realtime_client()
         if tf is None:
-            logger.warning("实时行情拉取失败:未配置付费服务器 API Key")
-            return
-        t0 = time.perf_counter()
-        now_ts = time.perf_counter()
-        replace_index_cache = True
+            return _PrimaryQuotes([], partial=True, replace_index_cache=False)
 
+        replace_index_cache = True
         try:
             from app.services import preferences
             all_index_symbols = set(self._repo.get_index_symbol_set()) if self._repo else set()
@@ -975,7 +1216,6 @@ class QuoteService:
             from app.indicators.pipeline import BENCHMARK_INDEX_SYMBOLS
             base_indices = core_index_symbols | BENCHMARK_INDEX_SYMBOLS | monitor_index_symbols
             _core_syms = sorted(base_indices | demand["index"])
-            partial_assets = set()
             received = {q.get("symbol") for q in resp}
             for asset in ("stock", "etf"):
                 missing = demand[asset] - received
@@ -1012,12 +1252,11 @@ class QuoteService:
                             logger.warning("核心指数行情拉取失败，保留上一轮数据: %s", core_exc)
                 logger.info("指数及订阅行情拉取完成: %d 只 (%.2fs)", len(_core_syms), time.perf_counter() - _i0)
         except Exception as e:  # noqa: BLE001
-            logger.warning("行情拉取失败 (%.2fs): %s", time.perf_counter() - t0, e)
-            return
+            raise RuntimeError("tickflow realtime failed") from e
 
         if not resp:
             logger.warning("行情数据为空")
-            return
+            return _PrimaryQuotes([], replace_index_cache=False)
 
         # ---- 解析 API 响应 (临时变量, 用完丢弃) ----
         records = []
@@ -1051,14 +1290,71 @@ class QuoteService:
                 "session": q.get("session"),
             })
 
-        if preferences.data_source_stamp() != source_stamp:
-            logger.info("行情数据源配置已变化，跳过旧轮次发布")
-            return None
-        return self._process_full_market_records(
-            records, t0=t0, now_ts=now_ts, final_boundary_ms=final_boundary_ms,
-            **({"partial_assets": partial_assets} if partial_assets else {}),
-            **({"replace_index_cache": False} if not replace_index_cache else {}),
-        )
+        return _PrimaryQuotes(records, partial_assets=frozenset(partial_assets), replace_index_cache=replace_index_cache)
+
+    @staticmethod
+    def _coerce_realtime_records(data) -> list[dict]:
+        """兼容不同插件返回形态: list[dict] / Polars / Pandas / {"rows": ...}."""
+        if data is None:
+            return []
+        if isinstance(data, pl.DataFrame):
+            return data.to_dicts() if not data.is_empty() else []
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            for key in ("rows", "data", "items", "list", "List"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+            return [data]
+        if hasattr(data, "reset_index"):
+            try:
+                return pl.from_pandas(data.reset_index()).to_dicts()
+            except Exception:  # noqa: BLE001
+                return []
+        try:
+            frame = pl.DataFrame(data)
+            return frame.to_dicts() if not frame.is_empty() else []
+        except Exception:  # noqa: BLE001
+            return []
+
+    @staticmethod
+    def _normalize_realtime_symbol(symbol) -> str:
+        from app.data_providers.public_market import qualified_symbol
+        return qualified_symbol(symbol)
+
+    def _collect_symbol_scoped_realtime_symbols(self) -> list[str]:
+        """按标的实时源的请求清单: 自选、模拟持仓、显式监控规则和核心指数。"""
+        symbols: set[str] = set(CORE_INDEX_SYMBOLS)
+        symbols.update(self._collect_monitor_index_symbols())
+
+        try:
+            from app.services import watchlist
+            symbols.update(self._normalize_realtime_symbol(row.get("symbol")) for row in watchlist.list_symbols())
+        except Exception as e:  # noqa: BLE001
+            logger.debug("实时标的池读取自选失败: %s", e)
+
+        engine = getattr(self._app_state, "monitor_engine", None) if self._app_state else None
+        if engine:
+            try:
+                for rule in list(engine.rules.values()):
+                    if not rule.get("enabled", True) or rule.get("scope") != "symbols":
+                        continue
+                    symbols.update(self._normalize_realtime_symbol(s) for s in rule.get("symbols", []) if s)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("实时标的池读取监控规则失败: %s", e)
+
+        try:
+            from app.config import settings
+            db_path = settings.data_dir / "aiagents_paper.db"
+            if db_path.exists():
+                with sqlite3.connect(db_path) as conn:
+                    rows = conn.execute("SELECT DISTINCT symbol FROM positions").fetchall()
+                symbols.update(self._normalize_realtime_symbol(row[0]) for row in rows if row and row[0])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("实时标的池读取模拟持仓失败: %s", e)
+
+        return sorted(s for s in symbols if s)
 
     def _process_full_market_records(
         self,
@@ -1066,15 +1362,19 @@ class QuoteService:
         *,
         t0: float,
         now_ts: float,
+        partial: bool = False,
+        memory_only: bool = False,
+        require_stock: bool = False,
+        merge_existing: bool = False,
         replace_index_cache: bool = True,
         final_boundary_ms: int | None = None,
-        partial_assets: set[str] | None = None,
+        partial_assets: set[str] | frozenset[str] | None = None,
     ) -> tuple[pl.DataFrame, pl.DataFrame | None] | None:
-        """把全市场 records 写盘并增量计算 enriched。
+        """把 records 写入实时缓存。
 
-        final_boundary_ms (final 定版边界) 传入时, 快照最大时间戳未达边界的本轮
-        只更新展示缓存, 不写 daily/enriched、不评估监控 —— 防止收盘后数据源仍
-        返回竞价前旧价时把陈旧收盘价固化到当日分区。
+        partial=True 表示数据源只返回自选/监控/持仓等部分标的, 必须按 symbol
+        合并, 不能覆盖今日全市场分区。memory_only=True 用于重任务暂停期间:
+        只更新内存缓存与 SSE, 不写 parquet。
         """
         from app.services import preferences
         all_index_symbols = set(self._repo.get_index_symbol_set()) if self._repo else set()
@@ -1112,6 +1412,19 @@ class QuoteService:
         ]
 
         fetch_ms = (time.perf_counter() - t0) * 1000
+        if require_stock and not stock_records:
+            if index_records:
+                with self._lock:
+                    self._index_symbol_count = len(index_records)
+                    self._index_quotes_cache = self._build_index_quotes(index_records)
+                self._broadcast_quote_updated()
+            logger.warning(
+                "全市场股票行情为空，保留上一轮实时股票缓存 (指数=%d, 耗时 %.0fms)",
+                len(index_records),
+                fetch_ms,
+            )
+            return
+
         fetched_at = time.time() * 1000
 
         # ---- 更新元信息 ----
@@ -1128,7 +1441,12 @@ class QuoteService:
                 logger.info("指数本轮获取失败,沿用上轮缓存: %d 只", self._index_symbol_count)
 
         _persist_last_fetch(fetched_at)
-        logger.info("行情刷新: %d 只股票, %d 只ETF, %d 只指数, 耗时 %.0fms", len(stock_records), len(etf_records), len(index_records), fetch_ms)
+        logger.info(
+            "行情刷新%s%s: %d 只股票, %d 只ETF, %d 只指数, 耗时 %.0fms",
+            "(部分标的)" if partial else "",
+            "(仅内存)" if memory_only else "",
+            len(stock_records), len(etf_records), len(index_records), fetch_ms,
+        )
 
         if confirmed_final is False:
             # 边界前的陈旧快照: 展示缓存已更新, 落盘与监控评估留待边界后快照。
@@ -1141,13 +1459,21 @@ class QuoteService:
             return
 
         # 轮询放量状态更新 (volume_delta 规则的差值来源)
+        previous_sources = getattr(self, "_previous_quote_sources", {})
+        current_sources = {r["symbol"]: r.get("source") for r in stock_records}
+        if self._prev_stock_volume:
+            for symbol, source in current_sources.items():
+                if source != previous_sources.get(symbol):
+                    self._prev_stock_volume.pop(symbol, None)
+        self._previous_quote_sources = current_sources
         self._update_volume_delta(stock_records, fetched_at)
 
         # ---- 写 kline_daily (不复权原始价格, 只有 OHLCV) ----
         daily_df = self._build_daily(stock_records)
-        if not daily_df.is_empty() and self._repo:
+        persist_to_disk = not memory_only and not partial
+        if not daily_df.is_empty() and self._repo and persist_to_disk:
             try:
-                if partial_assets and "stock" in partial_assets:
+                if merge_existing or (partial_assets and 'stock' in partial_assets):
                     self._repo.merge_live_daily_asset("stock", daily_df)
                 else:
                     self._repo.flush_live_daily(daily_df)
@@ -1155,9 +1481,9 @@ class QuoteService:
                 logger.warning("日K写盘失败: %s", e)
 
         etf_daily_df = self._build_daily(etf_records)
-        if not etf_daily_df.is_empty() and self._repo:
+        if not etf_daily_df.is_empty() and self._repo and persist_to_disk:
             try:
-                if partial_assets and "etf" in partial_assets:
+                if merge_existing or (partial_assets and 'etf' in partial_assets):
                     self._repo.merge_live_daily_asset("etf", etf_daily_df)
                 else:
                     self._repo.flush_live_daily_asset("etf", etf_daily_df)
@@ -1170,11 +1496,19 @@ class QuoteService:
 
         # ---- 增量计算 enriched + 写盘 + 更新缓存 ----
         if not daily_df.is_empty() and self._repo:
-            self._flush_live_enriched(daily_df, quote_extra, asset_type="stock",
-                                      merge=bool(partial_assets and "stock" in partial_assets))
+            self._flush_live_enriched(
+                daily_df, quote_extra,
+                asset_type="stock", merge=partial or merge_existing or bool(partial_assets and "stock" in partial_assets),
+                memory_only=memory_only or partial,
+                partial_cache=partial,
+            )
         if not etf_daily_df.is_empty() and self._repo:
-            self._flush_live_enriched(etf_daily_df, etf_quote_extra, asset_type="etf",
-                                      merge=bool(partial_assets and "etf" in partial_assets))
+            self._flush_live_enriched(
+                etf_daily_df, etf_quote_extra,
+                asset_type="etf", merge=partial or merge_existing or bool(partial_assets and "etf" in partial_assets),
+                memory_only=memory_only or partial,
+                partial_cache=partial,
+            )
         # ---- 指数: 核心四只每轮已显式拉取, 与股票/ETF 同口径 merge 写盘 ----
         # 不能再门控 has_asset_rules("index"): 默认配置无指数监控规则, 否则
         # 盘中 kline_index_enriched 停在上一交易日, 读侧守卫直接跳过不注入。
@@ -1182,11 +1516,19 @@ class QuoteService:
         if self._repo:
             index_daily_df = self._build_daily(index_records)
             if not index_daily_df.is_empty():
-                try:
-                    self._repo.merge_live_daily_asset("index", index_daily_df)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("指数日K写盘失败: %s", e)
-                self._flush_live_enriched(index_daily_df, self._build_quote_extra(index_records), asset_type="index", merge=True)
+                if persist_to_disk:
+                    try:
+                        self._repo.merge_live_daily_asset("index", index_daily_df)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("指数日K写盘失败: %s", e)
+                self._flush_live_enriched(
+                    index_daily_df, self._build_quote_extra(index_records),
+                    asset_type="index", merge=True,
+                    memory_only=memory_only or partial,
+                )
+
+        if not partial:
+            self._clear_partial_enriched()
 
         # ---- 通知 SSE ----
         self._broadcast_quote_updated()
@@ -2109,7 +2451,15 @@ class QuoteService:
             self._etf_history_cache = (key, frame)
         return frame
 
-    def _flush_live_enriched(self, daily_df: pl.DataFrame, quote_extra: pl.DataFrame = None, asset_type: str = "stock", merge: bool = False) -> None:
+    def _flush_live_enriched(
+        self,
+        daily_df: pl.DataFrame,
+        quote_extra: pl.DataFrame = None,
+        asset_type: str = "stock",
+        merge: bool = False,
+        memory_only: bool = False,
+        partial_cache: bool = False,
+    ) -> None:
         """增量计算今天的 enriched: 用昨天的递推状态 + 今天 OHLCV → 只算今天 5500 行。
 
         quote_extra: API 直接提供的补充字段 (prev_close, change_pct 等),
@@ -2156,6 +2506,7 @@ class QuoteService:
                     today_ohlcv=today_ohlcv,
                     instruments=instruments,
                     elapsed_minutes=elapsed_minutes,
+                    historical_shares=self._repo.get_historical_shares(),
                 )
                 if enriched_today.is_empty():
                     logger.warning("增量计算结果为空, 回退到全量计算")
@@ -2165,7 +2516,7 @@ class QuoteService:
             if not use_incremental:
                 from datetime import timedelta
 
-                from app.indicators.pipeline import compute_enriched
+                from app.indicators.pipeline import compute_enriched, restore_daily_symbol_identity
                 from app.tickflow.repository import _live_agg_window_start
 
                 logger.info("enriched 全量计算 (live_agg=%s, 上次日期=%s)",
@@ -2226,7 +2577,9 @@ class QuoteService:
                 enriched_full = enriched_full.sort(["symbol", "date"]).with_columns(
                     (pl.col("close") / pl.col("close").shift(3).over("symbol") - 1).alias("momentum_3d")
                 )
-                enriched_today = enriched_full.filter(pl.col("date") == today)
+                enriched_today = restore_daily_symbol_identity(
+                    enriched_full.filter(pl.col("date") == today), daily_ohlcv,
+                )
 
             if enriched_today.is_empty():
                 return
@@ -2243,15 +2596,49 @@ class QuoteService:
                     enriched_today, self._repo.store.data_dir, index_quotes
                 )
 
-            # ---- 写盘 + 更新缓存 ----
-            if merge:
+            # ---- 写盘/内存更新 ----
+            if partial_cache and asset_type == "stock":
+                self._merge_partial_enriched(enriched_today)
+            elif memory_only:
+                if merge:
+                    self._repo.merge_live_enriched_memory_asset(asset_type, enriched_today)
+                else:
+                    self._repo.flush_live_enriched_memory_asset(asset_type, enriched_today)
+            elif merge:
                 self._repo.merge_live_enriched_asset(asset_type, enriched_today)
             else:
                 self._repo.flush_live_enriched_asset(asset_type, enriched_today)
 
             elapsed = time.perf_counter() - t0
             mode_label = "增量" if use_incremental else "全量"
-            logger.info("enriched %s: %d 只, %s, 耗时 %.0fms",
-                        mode_label, len(enriched_today), today, elapsed * 1000)
+            logger.info("enriched %s%s: %d 只, %s, 耗时 %.0fms",
+                        mode_label, "(仅内存)" if memory_only else "",
+                        len(enriched_today), today, elapsed * 1000)
         except Exception as e:  # noqa: BLE001
             logger.warning("enriched 计算失败: %s", e)
+
+    def _merge_partial_enriched(self, df: pl.DataFrame) -> None:
+        """保存按标的实时源的部分 enriched 缓存，不写入 repo 全市场缓存。"""
+        if df.is_empty() or "date" not in df.columns:
+            return
+        dt = df["date"][0]
+        cache_df = self._repo._with_instrument_metadata("stock", df) if self._repo else df  # noqa: SLF001
+        with self._lock:
+            existing = (
+                self._partial_enriched_cache
+                if self._partial_enriched_cache_date == dt
+                else pl.DataFrame()
+            )
+            merged = cache_df
+            if existing is not None and not existing.is_empty():
+                merged = pl.concat([existing, cache_df], how="diagonal_relaxed").unique(
+                    subset=["symbol", "date"], keep="last", maintain_order=True
+                )
+            self._partial_enriched_cache = merged.sort(["symbol"])
+            self._partial_enriched_cache_date = dt
+
+    def _clear_partial_enriched(self) -> None:
+        """全市场实时刷新成功后清空旧的按标的缓存。"""
+        with self._lock:
+            self._partial_enriched_cache = None
+            self._partial_enriched_cache_date = None

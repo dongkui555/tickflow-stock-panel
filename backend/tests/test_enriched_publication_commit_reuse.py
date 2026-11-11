@@ -52,6 +52,9 @@ def test_repeated_commit_is_idempotent(tmp_path) -> None:
 
 def test_multi_partition_write_tolerates_unchanged_partition(tmp_path) -> None:
     """一次写两个分区, 第二个完全无变化 —— 修复前整批写入会被打断。"""
+    instruments = tmp_path / "instruments" / "instruments.parquet"
+    instruments.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"code": ["000001"], "symbol": ["000001.SZ"], "name": ["Ping An"]}).write_parquet(instruments)
     repo = KlineRepository(DataStore(tmp_path))
 
     repo.append_enriched(_two_days(10.0, 11.0))

@@ -33,6 +33,24 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 DEFAULT_PAID_ENDPOINT = "https://api.tickflow.org"
 
 
+def _current_wecom_bot_status(request: Request | None = None) -> dict:
+    """返回企业微信智能机器人长连接实时状态。"""
+    from app.services import preferences
+
+    state = getattr(getattr(request, "app", None), "state", None) if request else None
+    bot_svc = getattr(state, "wecom_bot_service", None)
+    if bot_svc:
+        return bot_svc.status()
+    return {
+        "enabled": preferences.get_wecom_bot_enabled(),
+        "running": False,
+        "connected": False,
+        "bot_id_configured": bool(preferences.get_wecom_bot_id()),
+        "secret_configured": bool(preferences.get_wecom_bot_secret()),
+        "last_error": "智能机器人服务未初始化",
+    }
+
+
 def _sync_financial_scheduler_caps(app_state, capset) -> None:
     """把重新探测出的能力同步给财务调度器。
 
@@ -548,6 +566,9 @@ class MinuteSyncPrefs(BaseModel):
     minute_sync_days: int = 5
     # 单段大小(交易日),None 表示不修改现有值。范围 [5, 30],默认 20。
     minute_sync_segment_days: int | None = None
+    minute_sync_scope: str | None = None
+    minute_sync_top_n: int | None = None
+    minute_sync_symbols: list[str] | None = None
 
 
 class DataProvidersIn(BaseModel):
@@ -634,7 +655,7 @@ class MiningSchedulePrefs(BaseModel):
 
 
 @router.get("/preferences")
-def get_preferences() -> dict:
+def get_preferences(request: Request = None) -> dict:
     """返回用户偏好设置。"""
     from app.services import preferences
     return {
@@ -644,6 +665,9 @@ def get_preferences() -> dict:
         "minute_sync_enabled": preferences.get_minute_sync_enabled(),
         "minute_sync_days": preferences.get_minute_sync_days(),
         "minute_sync_segment_days": preferences.get_minute_sync_segment_days(),
+        "minute_sync_scope": preferences.get_minute_sync_scope(),
+        "minute_sync_top_n": preferences.get_minute_sync_top_n(),
+        "minute_sync_symbols": preferences.get_minute_sync_symbols(),
         "minute_refresh_enabled": preferences.get_minute_refresh_enabled(),
         "minute_refresh_interval": preferences.get_minute_refresh_interval(),
         "daily_data_provider": preferences.get_daily_data_provider(),
@@ -667,6 +691,7 @@ def get_preferences() -> dict:
         "regime_warmup_days": preferences.get_regime_warmup_days(),
         "pipeline_index_symbols": preferences.get_pipeline_index_symbols(),
         "pipeline_schedule": preferences.get_pipeline_schedule(),
+        "full_sync_schedule": preferences.get_full_sync_schedule(),
         "instruments_schedule": preferences.get_instruments_schedule(),
         "enriched_batch_size": preferences.get_enriched_batch_size(),
         "index_daily_batch_size": preferences.get_index_daily_batch_size(),
@@ -689,6 +714,7 @@ def get_preferences() -> dict:
         "wecom_bot_id": preferences.get_wecom_bot_id(),
         "wecom_bot_secret": preferences.get_wecom_bot_secret(),
         "wecom_bot_enabled": preferences.get_wecom_bot_enabled(),
+        "wecom_bot_status": _current_wecom_bot_status(request),
         "webhook_enabled_default": preferences.get_webhook_enabled_default(),
         "webhook_default_channels": preferences.get_webhook_default_channels(),
         "minute_intraday_refresh": preferences.get_minute_intraday_refresh(),
@@ -751,6 +777,36 @@ def get_capability_matrix() -> dict:
         },
         tickflow_tier=policy.base_tier_name(),
     )
+
+
+@router.get("/backup-routes")
+def get_backup_routes(request: Request) -> dict:
+    from app.config import settings
+    from app.data_providers.public_market import public_market_backup
+    from app.services import preferences
+    from app.plugins.qmt.bridge import availability as qmt_availability
+
+    result = public_market_backup.status()
+    service = getattr(request.app.state, "quote_service", None)
+    result["realtime"] = service.status().get("backup_route") if service else None
+    result["primary"] = preferences.get_realtime_data_provider()
+    primary = preferences.get_minute_data_provider()
+    qmt_ok, qmt_note = qmt_availability()
+    chain = ["qmt"] if qmt_ok else []
+    if settings.stockdb_enabled and settings.stockdb_minute_fallback_enabled:
+        chain.append("stockdb")
+    chain.append(primary)
+    if settings.minute_fallback_provider:
+        chain.append(settings.minute_fallback_provider)
+    chain.append("offline")
+    result["minute"] = {
+        "primary": primary,
+        "backup": settings.minute_fallback_provider or None,
+        "chain": list(dict.fromkeys(chain)),
+        "qmt": {"available": qmt_ok, "note": qmt_note},
+        "validation": "identity_session_daily_ohlcv_existing_values",
+    }
+    return result
 
 
 @router.post("/plugin-key")
@@ -1134,11 +1190,20 @@ def update_minute_sync(req: MinuteSyncPrefs) -> dict:
     }
     if req.minute_sync_segment_days is not None:
         updates["minute_sync_segment_days"] = max(5, min(30, req.minute_sync_segment_days))
+    if req.minute_sync_scope is not None:
+        updates["minute_sync_scope"] = req.minute_sync_scope
+    if req.minute_sync_top_n is not None:
+        updates["minute_sync_top_n"] = max(1, min(1000, req.minute_sync_top_n))
+    if req.minute_sync_symbols is not None:
+        updates["minute_sync_symbols"] = req.minute_sync_symbols
     preferences.save(updates)
     return {
         "minute_sync_enabled": req.minute_sync_enabled,
         "minute_sync_days": days,
         "minute_sync_segment_days": preferences.get_minute_sync_segment_days(),
+        "minute_sync_scope": preferences.get_minute_sync_scope(),
+        "minute_sync_top_n": preferences.get_minute_sync_top_n(),
+        "minute_sync_symbols": preferences.get_minute_sync_symbols(),
     }
 
 
@@ -1149,6 +1214,15 @@ def minute_refresh_status(request: Request) -> dict:
     if svc is None:
         return {"available": False}
     return {"available": True, **svc.status()}
+
+
+@router.post("/minute-refresh/run")
+def minute_refresh_run(request: Request) -> dict:
+    """手动触发一轮盘中分钟增量刷新。"""
+    svc = getattr(request.app.state, "minute_refresh", None)
+    if svc is None:
+        raise HTTPException(status_code=404, detail="分钟增量刷新服务未初始化")
+    return svc.trigger_manual_round()
 
 
 class RealtimeQuotesPrefs(BaseModel):
@@ -1550,6 +1624,10 @@ def update_wecom_webhook(req: WecomWebhookPrefsIn) -> dict:
     return {"wecom_webhook_url": saved_url}
 
 
+@router.get("/preferences/wecom-bot-status")
+def get_wecom_bot_status(request: Request) -> dict:
+    """设置页轮询用: 返回智能机器人长连接当前状态。"""
+    return _current_wecom_bot_status(request)
 class CustomWebhookPrefsIn(BaseModel):
     url: str
     # None preserves the stored secret; an explicit empty string clears it.
@@ -2129,6 +2207,14 @@ class LimitLadderMonitorIn(BaseModel):
     enabled: bool
 
 
+def _require_depth_route(request: Request) -> None:
+    from app.config import settings
+    from app.tickflow.capabilities import Cap
+
+    if not settings.public_market_fallback_enabled:
+        request.app.state.capabilities.require(Cap.DEPTH5_BATCH)
+
+
 @router.put("/preferences/limit-ladder-monitor")
 def update_limit_ladder_monitor(req: LimitLadderMonitorIn, request: Request) -> dict:
     """连板梯队 5 档监控开关。开启→启动 depth 轮询, 关闭→停止。"""
@@ -2146,9 +2232,7 @@ def update_limit_ladder_monitor(req: LimitLadderMonitorIn, request: Request) -> 
 @router.post("/preferences/limit-ladder-monitor/run")
 def run_limit_ladder_fix(request: Request) -> dict:
     """立即手动修正一次真假板(拉取五档盘口 + 更新缓存)。需 Pro+。"""
-    from app.tickflow.capabilities import Cap
-    capset = request.app.state.capabilities
-    capset.require(Cap.DEPTH5_BATCH)  # 无能力抛 CapabilityDenied(403)
+    _require_depth_route(request)
 
     depth_svc = getattr(request.app.state, "depth_service", None)
     if not depth_svc:
@@ -2168,8 +2252,7 @@ class DepthPollingIntervalIn(BaseModel):
 @router.put("/preferences/depth-polling-interval")
 def update_depth_polling_interval(req: DepthPollingIntervalIn, request: Request) -> dict:
     """保存五档盘口盘中轮询间隔(秒)。需 Pro+。"""
-    from app.tickflow.capabilities import Cap
-    request.app.state.capabilities.require(Cap.DEPTH5_BATCH)
+    _require_depth_route(request)
 
     from app.services import preferences
     interval = preferences.set_depth_polling_interval(req.interval)
@@ -2184,8 +2267,7 @@ class DepthFinalizeTimeIn(BaseModel):
 @router.put("/preferences/depth-finalize-time")
 def update_depth_finalize_time(req: DepthFinalizeTimeIn, request: Request) -> dict:
     """保存盘后 sealed 定版时间(范围15:01~18:00)并立即 reschedule。需 Pro+。"""
-    from app.tickflow.capabilities import Cap
-    request.app.state.capabilities.require(Cap.DEPTH5_BATCH)
+    _require_depth_route(request)
 
     from app.services import preferences
     sched = preferences.set_depth_finalize_time(req.hour, req.minute)

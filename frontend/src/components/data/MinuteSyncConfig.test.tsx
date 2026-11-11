@@ -11,6 +11,7 @@ import { MinuteSyncConfig } from './MinuteSyncConfig'
 vi.mock('@/lib/api', () => ({ api: {
   preferences: vi.fn(), updateMinuteSync: vi.fn(), syncMinute: vi.fn(),
   clearMinute: vi.fn(), minuteGaps: vi.fn(), syncMinuteSingle: vi.fn(), repairMinuteGaps: vi.fn(),
+  minuteRefreshStatus: vi.fn(), minuteRefreshRun: vi.fn(),
 } }))
 vi.mock('@/components/Toast', () => ({ toast: vi.fn() }))
 
@@ -141,8 +142,8 @@ it('分页限制单页记录, 刷新后记录减少仍能显示有效页', async
 
 it('手动获取仍使用分段天数并通知任务, 清空必须经过二次确认', async () => {
   await render()
-  await click('单次获取 20 天')
-  expect(api.syncMinute).toHaveBeenCalledWith(20, true)
+  await click('向前补 20 天')
+  expect(api.syncMinute).toHaveBeenCalledWith(expect.objectContaining({ days: 20, extend: true, mode: 'history_backfill' }))
   expect(onJobStart).toHaveBeenCalledWith('minute-job')
   await click('清空分钟K数据')
   expect(api.clearMinute).not.toHaveBeenCalled()
@@ -153,7 +154,7 @@ it('手动获取仍使用分段天数并通知任务, 清空必须经过二次�
 
 it('无分钟能力时禁用拉取和补齐, 仍能查看本地体检结果', async () => {
   await render(false)
-  expect([...host.querySelectorAll('button')].find(b => b.textContent?.includes('单次获取'))?.disabled).toBe(true)
+  expect([...host.querySelectorAll('button')].find(b => b.textContent?.includes('向前补'))?.disabled).toBe(true)
   await click('数据体检')
   const repairs = [...host.querySelectorAll('button')].filter(b => b.textContent?.includes('尝试补齐'))
   expect(repairs.length).toBeGreaterThan(0)

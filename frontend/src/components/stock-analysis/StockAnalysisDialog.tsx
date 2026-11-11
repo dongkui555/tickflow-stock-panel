@@ -3,15 +3,17 @@ import { motion, AnimatePresence } from 'framer-motion'
 import {
   X, Sparkles, Loader2, AlertTriangle, Copy, Check, RefreshCw,
   Settings2, Send, Wand2, Minimize2, History, LineChart,
+  Users, Circle, CheckCircle2, XCircle,
 } from 'lucide-react'
 import { cn } from '@/lib/cn'
 import { copyText } from '@/lib/clipboard'
 import { toast } from '@/components/Toast'
 import { MarkdownRenderer } from '@/components/financials/MarkdownRenderer'
 import {
-  type ActiveTask, type HistoryReport,
+  type ActiveTask, type HistoryReport, type AgentProgress,
   minimizeDialog, closeDialog, startAnalysis,
 } from '@/lib/stockAnalysisStore'
+import type { StockAnalysisMode } from '@/lib/api'
 import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
 
 /**
@@ -40,6 +42,15 @@ function getMeta(task: ActiveTask | HistoryReport | null) {
   if ('meta' in task) return task.meta
   return { summary: task.summary, close: task.close, levels: task.levels }
 }
+function getAnalysisMode(task: ActiveTask | HistoryReport | null): StockAnalysisMode {
+  if (!task) return 'multi_agent'
+  if ('analysisMode' in task) return task.analysisMode
+  return task.analysis_mode ?? 'multi_agent'
+}
+function getAgents(task: ActiveTask | HistoryReport | null): AgentProgress[] {
+  if (!task || !('agents' in task)) return []
+  return task.agents ?? []
+}
 
 export function StockAnalysisDialog({ task, mode, minimized }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -49,6 +60,8 @@ export function StockAnalysisDialog({ task, mode, minimized }: Props) {
   const phase = getPhase(task)
   const content = getContent(task)
   const meta = getMeta(task)
+  const analysisMode = getAnalysisMode(task)
+  const agents = getAgents(task)
   const isHistory = mode === 'history'
   const isWorking = phase === 'loading' || phase === 'streaming'
   const open = !!task && !minimized
@@ -66,8 +79,8 @@ export function StockAnalysisDialog({ task, mode, minimized }: Props) {
   const handleStartNew = useCallback(async () => {
     if (!task) return
     const name = 'name' in task ? task.name : ''
-    await startAnalysis(task.symbol, name, focus.trim())
-  }, [task, focus])
+    await startAnalysis(task.symbol, name, focus.trim(), analysisMode)
+  }, [task, focus, analysisMode])
 
   const handleCopy = async () => {
     if (!content) return
@@ -110,7 +123,7 @@ export function StockAnalysisDialog({ task, mode, minimized }: Props) {
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-semibold text-foreground truncate">
-                    {isHistory ? '历史分析报告' : 'AI 个股分析'}
+                    {isHistory ? '历史分析报告' : analysisMode === 'multi_agent' ? '6 Agent 个股分析' : 'AI 快速分析'}
                   </span>
                   {task && <span className="text-xs text-secondary truncate">{task.name}</span>}
                   {task && <span className="text-[10px] font-mono text-muted shrink-0">{task.symbol}</span>}
@@ -157,16 +170,28 @@ export function StockAnalysisDialog({ task, mode, minimized }: Props) {
 
           {/* 内容区 */}
           <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 min-h-[280px]">
+            {!isHistory && analysisMode === 'multi_agent' && agents.length > 0 && (
+              <AgentProgressPanel agents={agents} />
+            )}
+
             {phase === 'loading' && !content && (
               <div className="flex flex-col items-center justify-center py-16 gap-3">
                 <div className="relative">
                   <div className="h-10 w-10 rounded-full bg-gradient-to-br from-sky-500/20 to-blue-500/15 border border-sky-400/30 flex items-center justify-center">
-                    <LineChart className="h-4.5 w-4.5 text-sky-300 animate-pulse" />
+                    {analysisMode === 'multi_agent'
+                      ? <Users className="h-4.5 w-4.5 text-sky-300 animate-pulse" />
+                      : <LineChart className="h-4.5 w-4.5 text-sky-300 animate-pulse" />}
                   </div>
                   <Loader2 className="absolute -inset-1 h-12 w-12 text-sky-400/40 animate-spin" style={{ animationDuration: '3s' }} />
                 </div>
-                <div className="text-xs text-secondary">AI 正在分析行情与关键价位…</div>
-                <div className="text-[10px] text-muted">读取日 K / 技术指标 / 压力支撑 / 财务,生成四维分析</div>
+                <div className="text-xs text-secondary">
+                  {analysisMode === 'multi_agent' ? '6 位分析师正在交叉验证…' : 'AI 正在分析行情与关键价位…'}
+                </div>
+                <div className="text-[10px] text-muted">
+                  {analysisMode === 'multi_agent'
+                    ? '技术 / 资金 / 基本面 / 新闻情绪 / 风控 / 短线交易'
+                    : '读取日 K / 技术指标 / 压力支撑 / 财务,生成四维分析'}
+                </div>
               </div>
             )}
 
@@ -242,13 +267,44 @@ export function StockAnalysisDialog({ task, mode, minimized }: Props) {
             <p className="mt-1.5 text-[10px] text-muted/50 leading-relaxed">
               {isHistory
                 ? '历史报告为静态记录;修改关注重点后将作为新任务重新生成。报告仅供参考,不构成投资建议。'
-                : '报告由项目已配置的 AI 模型基于本地行情与财务数据生成;消息面维度暂依据价量异动推断。报告仅供参考,不构成投资建议。'}
+                : analysisMode === 'multi_agent'
+                  ? '报告由 6 位分析师与总评审基于本地行情、资金、财务、新闻和海外上下文生成。报告仅供参考,不构成投资建议。'
+                  : '报告由项目已配置的 AI 模型基于本地行情与财务数据生成;消息面维度暂依据价量异动推断。报告仅供参考,不构成投资建议。'}
             </p>
           </div>
         </motion.div>
       </motion.div>
     </AnimatePresence>
   )
+}
+
+function AgentProgressPanel({ agents }: { agents: AgentProgress[] }) {
+  return (
+    <div className="mb-4 rounded-card border border-sky-400/15 bg-sky-400/[0.04] p-3">
+      <div className="mb-2 flex items-center gap-2">
+        <Users className="h-3.5 w-3.5 text-sky-300" />
+        <span className="text-xs font-medium text-foreground">分析师进度</span>
+      </div>
+      <div className="grid gap-1.5 sm:grid-cols-2">
+        {agents.map(agent => (
+          <div key={agent.key} className="flex min-w-0 items-center gap-2 rounded-md border border-border/35 bg-base/35 px-2.5 py-2">
+            <AgentStatusIcon status={agent.status} />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[11px] font-medium text-secondary">{agent.name}</div>
+              {agent.message && <div className="mt-0.5 truncate text-[10px] text-muted">{agent.message}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function AgentStatusIcon({ status }: { status: AgentProgress['status'] }) {
+  if (status === 'running') return <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-sky-300" />
+  if (status === 'done') return <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+  if (status === 'error') return <XCircle className="h-3.5 w-3.5 shrink-0 text-danger" />
+  return <Circle className="h-3.5 w-3.5 shrink-0 text-muted/60" />
 }
 
 function fmtRelative(iso: string): string {

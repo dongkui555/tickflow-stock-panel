@@ -431,25 +431,47 @@ class _MinuteRepo:
         return self.rows.filter(pl.col("symbol").is_in(symbols))
 
 
+def _complete_minute_fixture(rows: pl.DataFrame, price: float) -> pl.DataFrame:
+    # Test-only flat bars make the session complete without adding a crossing.
+    first = rows["datetime"][0]
+    times = [first.replace(hour=9, minute=31) + timedelta(minutes=i) for i in range(120)]
+    times += [first.replace(hour=13, minute=1) + timedelta(minutes=i) for i in range(120)]
+    flat = pl.DataFrame({"symbol": [rows["symbol"][0]] * 240, "datetime": times,
+                         "open": price, "high": price, "low": price, "close": price,
+                         "volume": 1.0, "amount": price * 100.0})
+    rows = rows.with_columns((pl.col("amount") * 100.0).alias("amount"))
+    entry_day = flat.with_columns(
+        pl.col("datetime").dt.offset_by("-1d"),
+        *[pl.lit(10.0).alias(c) for c in ("open", "high", "low", "close")],
+        pl.lit(1000.0).alias("amount"),
+    )
+    fallback_day = flat.with_columns(
+        pl.col("datetime").dt.offset_by("1d"),
+        *[pl.lit(8.8).alias(c) for c in ("open", "high", "low", "close")],
+        pl.lit(880.0).alias("amount"),
+    )
+    return pl.concat([rows, flat.join(rows.select("datetime"), on="datetime", how="anti"), entry_day, fallback_day]).sort("datetime")
+
+
 def _minute_trigger_panel() -> tuple[pl.DataFrame, pl.Series, pl.Series]:
     panel = _panel(
-        ["A"],
+        ["000001.SZ"],
         days=4,
         overrides={
-            ("A", 2): {"open": 10.1, "high": 10.3, "low": 8.9, "close": 9.0},
-            ("A", 3): {"open": 8.8, "high": 9.0, "low": 8.7, "close": 8.9},
+            ("000001.SZ", 2): {"open": 10.1, "high": 10.3, "low": 8.9, "close": 9.0},
+            ("000001.SZ", 3): {"open": 8.8, "high": 9.0, "low": 8.7, "close": 8.9},
         },
     ).with_columns([
         pl.Series("ma20", [10.0, 10.0, 9.95, 9.9]),
         pl.Series("signal_ma20_breakdown", [False, False, True, False]),
     ])
-    return panel, _mask(panel, {("A", 0)}), _mask(panel, {("A", 2)})
+    return panel, _mask(panel, {("000001.SZ", 0)}), _mask(panel, {("000001.SZ", 2)})
 
 
 def test_minute_signal_exit_fills_at_next_minute_open():
     panel, entries, exits = _minute_trigger_panel()
     minute = pl.DataFrame({
-        "symbol": ["A", "A", "A"],
+        "symbol": ["000001.SZ"] * 3,
         "datetime": [
             datetime(2024, 1, 3, 9, 31),
             datetime(2024, 1, 3, 9, 32),
@@ -463,6 +485,7 @@ def test_minute_signal_exit_fills_at_next_minute_open():
         "amount": [1020.0, 990.0, 970.0],
     })
 
+    minute = _complete_minute_fixture(minute, 9.7)
     result = BacktestEngine(repo=_MinuteRepo(minute)).simulate_portfolio(
         panel,
         entries,
@@ -488,7 +511,7 @@ def test_minute_signal_exit_fills_at_next_minute_open():
 def test_minute_signal_exit_without_next_bar_falls_back_to_next_open():
     panel, entries, exits = _minute_trigger_panel()
     minute = pl.DataFrame({
-        "symbol": ["A"],
+        "symbol": ["000001.SZ"],
         "datetime": [datetime(2024, 1, 3, 15, 0)],
         "open": [9.9],
         "high": [10.0],
@@ -498,6 +521,7 @@ def test_minute_signal_exit_without_next_bar_falls_back_to_next_open():
         "amount": [900.0],
     })
 
+    minute = _complete_minute_fixture(minute, 10.2)
     result = BacktestEngine(repo=_MinuteRepo(minute)).simulate_portfolio(
         panel,
         entries,

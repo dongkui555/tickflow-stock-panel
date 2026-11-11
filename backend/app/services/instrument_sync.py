@@ -24,18 +24,40 @@ _EXCHANGES = ["SH", "SZ", "BJ"]
 
 def _flatten_instruments(items: list[dict], *, current_limits: bool = True) -> list[dict]:
     """把 SDK 返回的 Instrument 列表 flatten 成扁平行。"""
+    from app.services.security_identity import IdentityError, normalize_exchange, parse_identity
+
     rows = []
     for item in items:
+        raw_asset_type = str(item.get("asset_type") or item.get("type") or "stock").strip().lower()
+        asset_type = "stock" if raw_asset_type in {"equity", "share", "shares"} else raw_asset_type
+        raw_symbol = item.get("symbol") or item.get("code")
+        exchange = normalize_exchange(item.get("exchange"))
+        try:
+            identity = parse_identity(
+                raw_symbol,
+                asset_type=asset_type,
+                expected_exchange=exchange,
+                require_explicit=True,
+            )
+            symbol = identity.symbol
+            identity_reason = ""
+        except IdentityError as exc:
+            symbol = None
+            identity_reason = str(exc)
         row = {
-            "symbol": item.get("symbol"),
+            "symbol": symbol,
             "name": item.get("name"),
             "code": item.get("code"),
-            "exchange": item.get("exchange"),
+            "exchange": exchange,
+            "asset_type": asset_type,
+            "identity_reason": identity_reason,
             "region": item.get("region"),
             "type": item.get("type"),
         }
         ext = item.get("ext") or {}
         row["listing_date"] = ext.get("listing_date")
+        row["delist_date"] = ext.get("delist_date")
+        row["list_status"] = ext.get("list_status")
         row["total_shares"] = ext.get("total_shares")
         row["float_shares"] = ext.get("float_shares")
         row["tick_size"] = ext.get("tick_size")
@@ -78,6 +100,9 @@ def sync_instruments(data_dir: Path) -> int:
 
     返回写入的行数。
     """
+    from app.services.identity_schema import require_writes_allowed
+
+    require_writes_allowed(data_dir)
     all_rows = _fetch_instruments_via_provider()
     if all_rows is None:
         # 未命中非 tickflow provider → 走 tickflow 直连
@@ -95,18 +120,123 @@ def sync_instruments(data_dir: Path) -> int:
                 logger.warning("get_instruments(%s) failed: %s", ex, e)
 
     if not all_rows:
+        # A failed live-universe request must not delete the last lifecycle
+        # snapshot. Try an explicit lifecycle refresh only when available.
+        sync_security_lifecycle(data_dir)
+        from app.services.security_lifecycle import refresh_observed_security_dimension
+        refresh_observed_security_dimension(data_dir)
         return 0
 
     df = pl.DataFrame(all_rows)
     df = _preserve_instrument_fields(df, data_dir)
     df = df.with_columns(pl.lit(cn_today()).alias("as_of"))
 
+    unresolved = df.filter(pl.col("symbol").is_null()) if "symbol" in df.columns else pl.DataFrame()
+    if not unresolved.is_empty():
+        quarantine_path = data_dir / "identity_quarantine" / "instruments.parquet"
+        quarantine_path.parent.mkdir(parents=True, exist_ok=True)
+        unresolved.write_parquet(quarantine_path)
+        logger.error(
+            "instrument identity quarantine: %d rows -> %s",
+            unresolved.height,
+            quarantine_path,
+        )
+        df = df.filter(pl.col("symbol").is_not_null())
+    if df.is_empty():
+        sync_security_lifecycle(data_dir)
+        from app.services.security_lifecycle import refresh_observed_security_dimension
+        refresh_observed_security_dimension(data_dir)
+        return 0
+
     out = data_dir / "instruments" / "instruments.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_parquet(df, out)
 
     logger.info("instruments synced: %d rows → %s", df.height, out)
+    # The live dimension intentionally contains only listed securities.  Keep
+    # a separate L/D/P lifecycle snapshot for historical gap validation so a
+    # delisted or code-changed security is never treated as an API failure.
+    lifecycle_rows = _fetch_lifecycle_via_provider()
+    if lifecycle_rows:
+        _write_lifecycle(data_dir, lifecycle_rows)
+    from app.services.security_lifecycle import refresh_observed_security_dimension
+    refresh_observed_security_dimension(data_dir)
     return df.height
+
+
+def _fetch_lifecycle_via_provider() -> list[dict]:
+    from app.services import preferences
+    provider_name = preferences.get_daily_data_provider()
+    if provider_name == "tickflow":
+        return []
+    from app.data_providers import custom as custom_sources
+
+    if not custom_sources.is_custom_provider(provider_name):
+        return []
+    provider = custom_sources.get_provider(provider_name)
+    fetch = getattr(provider, "get_instrument_lifecycle", None)
+    if not callable(fetch):
+        return []
+    try:
+        return list(fetch() or [])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("provider %s lifecycle snapshot 失败: %s", provider_name, exc)
+        return []
+
+
+def _write_lifecycle(data_dir: Path, rows: list[dict]) -> int:
+    """Atomically persist L/D/P data without erasing a partial snapshot.
+
+    A gateway may return D/P while L is temporarily unavailable (or the
+    reverse).  Treat each status as an independently published slice and merge
+    it with the previous snapshot; an incomplete response must not remove the
+    live dimension needed for BJ historical validation.
+    """
+    if not rows:
+        return 0
+    from app.services.identity_schema import require_writes_allowed
+
+    require_writes_allowed(data_dir)
+    flat = []
+    for item in rows:
+        ext = item.get("ext") or {}
+        flat.append({
+            "symbol": item.get("symbol"), "name": item.get("name"),
+            "code": item.get("code"), "exchange": item.get("exchange"),
+            "type": item.get("type") or "stock",
+            "listing_date": ext.get("listing_date"),
+            "delist_date": ext.get("delist_date"),
+            "list_status": ext.get("list_status"),
+            "market": ext.get("market"), "industry": ext.get("industry"),
+        })
+    frame = pl.DataFrame(flat, infer_schema_length=None).with_columns(pl.lit(cn_today()).alias("as_of"))
+    out = data_dir / "instruments_lifecycle" / "instruments_lifecycle.parquet"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        try:
+            old = pl.read_parquet(out)
+            frame = pl.concat([old, frame], how="diagonal_relaxed")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取旧生命周期快照失败, 将仅写入本次有效响应: %s", type(exc).__name__)
+    if "list_status" in frame.columns:
+        frame = frame.with_columns(
+            pl.col("list_status").cast(pl.String).str.to_uppercase().alias("list_status")
+        )
+        frame = frame.unique(subset=["code", "list_status"], keep="last", maintain_order=True)
+    tmp = out.with_suffix(".tmp.parquet")
+    frame.write_parquet(tmp)
+    tmp.replace(out)
+    logger.info("instrument lifecycle synced: %d rows → %s", frame.height, out)
+    return frame.height
+
+
+def sync_security_lifecycle(data_dir: Path) -> int:
+    """Public explicit lifecycle sync entrypoint for maintenance/admin jobs."""
+    rows = _fetch_lifecycle_via_provider()
+    count = _write_lifecycle(data_dir, rows)
+    from app.services.security_lifecycle import refresh_observed_security_dimension
+    refresh_observed_security_dimension(data_dir)
+    return count
 
 
 # 股本与静态交易规则字段: 部分行情源的标的维表只有代码/名称/市场/类型。

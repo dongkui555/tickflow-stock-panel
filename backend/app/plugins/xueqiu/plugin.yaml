@@ -1,0 +1,11 @@
+# 雪球网页行情接口：实时快照可匿名使用，历史日K建议配置 xq_a_token。
+name: xueqiu
+display_name: "雪球（实时快照/日K备源）"
+runtime: none
+entry: app.plugins.xueqiu.provider:XueqiuProvider
+check: app.plugins.xueqiu.provider:availability
+datasets: [realtime, daily]
+api_key_env: XUEQIU_TOKEN
+description: "轻量实时快照可作末级行情备源；历史日K需配置 XUEQIU_TOKEN 或 XUEQIU_COOKIE。未提供分钟、资金流、集合竞价或 L2。"
+install_hint: "可直接启用实时快照；历史日K请在 .env 配置 XUEQIU_TOKEN=xq_a_token，或配置 XUEQIU_COOKIE。"
+homepage: "https://xueqiu.com"

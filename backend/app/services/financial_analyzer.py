@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
-from typing import AsyncIterator
+from datetime import date, datetime
+from typing import Any, AsyncIterator
 
 import polars as pl
 
@@ -20,6 +22,23 @@ logger = logging.getLogger(__name__)
 
 # 最多注入的报告期数(最新 N 期),避免上下文爆炸 / token 浪费
 _MAX_PERIODS = 4
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except Exception:  # noqa: BLE001
+            pass
+    return value
 
 
 def _load_stock_financials(data_dir: Path, symbol: str) -> dict[str, list[dict]]:
@@ -47,11 +66,7 @@ def _load_stock_financials(data_dir: Path, symbol: str) -> dict[str, list[dict]]
             for k, v in rec.items():
                 if k == "symbol":
                     continue  # 不需要重复回传 symbol
-                if isinstance(v, float):
-                    import math
-                    clean[k] = None if not math.isfinite(v) else v
-                else:
-                    clean[k] = v
+                clean[k] = _json_safe(v)
             rows.append(clean)
         result[table] = rows
     return result

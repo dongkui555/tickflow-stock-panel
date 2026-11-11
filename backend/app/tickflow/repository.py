@@ -13,15 +13,19 @@
 from __future__ import annotations
 
 import logging
+import re
+import sys
 import os
 import threading
 import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
-from datetime import date, datetime
+import datetime as _datetime
+from datetime import date, datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import duckdb
 import polars as pl
@@ -37,7 +41,7 @@ from app.enriched_generation import (
     get_enriched_generation_snapshot,
 )
 from app.market_time import CN_TZ, cn_today
-from app.parquet import scan_enriched_parquet
+from app.parquet import read_parquet_safe, scan_enriched_parquet
 from app.polars_guard import guarded_collect
 from app.services.minute_adjust import apply_minute_adjustment, minute_basis_is_raw
 from app.startup_diagnostics import startup_phase
@@ -79,10 +83,60 @@ def replace_with_retry(src: Path, dst: Path, *, attempts: int = 10, delay_s: flo
 
 
 def enriched_dirname(asset_type: str) -> str:
-    """asset_type → enriched parquet 目录名。ETF 走独立目录, 其余(stock)用日K enriched。"""
-    return {"stock": "kline_daily_enriched", "etf": "kline_etf_enriched", "index": "kline_index_enriched"}[asset_type]
+    """asset_type → enriched parquet 目录名。"""
+    if asset_type == "etf":
+        return "kline_etf_enriched"
+    if asset_type == "index":
+        return "kline_index_enriched"
+    return "kline_daily_enriched"
 
 
+def _compact_symbol_for_name(value: object) -> str:
+    text = str(value or "").strip().upper()
+    if not text or text in {"NAN", "NONE", "NULL"}:
+        return ""
+    if "." in text:
+        text = text.split(".", 1)[0]
+    for prefix in ("SH", "SZ", "BJ"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits[-6:].zfill(6) if digits else text
+
+
+def _infer_exchange_for_name(code: str) -> str:
+    if code.startswith("6"):
+        return "SH"
+    if code.startswith(("0", "3")):
+        return "SZ"
+    if code.startswith(("4", "8", "92")):
+        return "BJ"
+    return ""
+
+
+def _instrument_name_aliases(symbol: object, code: object = None, exchange: object = None) -> list[str]:
+    raw_symbol = str(symbol or "").strip().upper()
+    raw_code = str(code or "").strip().upper()
+    raw_exchange = str(exchange or "").strip().upper().lstrip(".")
+    if raw_exchange not in {"SH", "SZ", "BJ"} and "." in raw_exchange:
+        raw_exchange = raw_exchange.rsplit(".", 1)[-1]
+
+    candidates = (raw_symbol, raw_code)
+    for raw in candidates:
+        match = re.fullmatch(r"(\d{6})\.(SH|SZ|BJ)", raw)
+        if match:
+            return [f"{match.group(1)}.{match.group(2)}", match.group(1)]
+    if re.fullmatch(r"\d{6}", raw_code) and raw_exchange in {"SH", "SZ", "BJ"}:
+        return [f"{raw_code}.{raw_exchange}", raw_code]
+    if re.fullmatch(r"\d{6}", raw_symbol):
+        return [raw_symbol]
+    return []
+
+
+def _symbol_key_expr(column: str = "symbol") -> pl.Expr:
+    text = pl.col(column).cast(pl.Utf8, strict=False).str.to_uppercase()
+    return text.str.extract(r"(\d{6})", 1).fill_null(text).alias("_symbol_key")
 def daily_dirname(asset_type: str) -> str:
     return {"stock": "kline_daily", "etf": "kline_etf_daily", "index": "kline_index_daily"}[asset_type]
 
@@ -367,6 +421,7 @@ class KlineRepository:
         self._enriched_history_cache: pl.DataFrame | None = None  # ~100万行
         self._enriched_history_start: date | None = None
         self._enriched_history_generation: str | None = None
+        self._enriched_history_spill: TemporaryDirectory | None = None
         self._enriched_history_snapshot: tuple[pl.DataFrame, EnrichedGenerationSnapshot] | None = None
         self._index_instruments_cache: pl.DataFrame | None = None
         self._etf_enriched_cache: pl.DataFrame | None = None
@@ -377,6 +432,7 @@ class KlineRepository:
         # symbol 集合 memo (随对应 instruments 缓存失效): 供每请求资产分流用
         self._index_symbol_set_cache: set[str] | None = None
         self._etf_symbol_set_cache: set[str] | None = None
+        self._name_map_cache: dict[str, str] | None = None
         self._index_enriched_cache: pl.DataFrame | None = None
         self._index_enriched_cache_date: date | None = None
 
@@ -574,6 +630,7 @@ class KlineRepository:
         self._enriched_history_cache = None
         self._enriched_history_start = None
         self._enriched_history_generation = None
+        self._enriched_history_spill = None
         self._enriched_history_snapshot = None
         self._live_agg_cache = None
         self._live_agg_cache_date = None
@@ -677,21 +734,36 @@ class KlineRepository:
 
                 from app.indicators.pipeline import compute_enriched_history_window
                 start_full = latest - timedelta(days=300)
-                read_cols = [c for c in ["symbol", "date", "open", "high", "low", "close",
-                                         "volume", "amount", "quote_ts", "raw_close", "raw_high", "raw_low"]
-                             if c in df_latest.columns]
+                # The compatible scanner inserts nulls for columns missing from older partitions.
+                read_cols = ["symbol", "date", "open", "high", "low", "close",
+                             "volume", "amount", "quote_ts", "raw_close", "raw_high", "raw_low"]
                 lf = (
                     scan_enriched_parquet(self._enriched_glob)
-                    .filter(pl.col("date") >= start_full)
+                    .filter((pl.col("date") >= start_full) & (pl.col("date") <= latest))
                     .sort(["symbol", "date"])
                 )
 
                 step = time.perf_counter()
                 logger.info("enriched refresh step start: collect history from %s", start_full)
+                # Keep the small latest/live caches available, but evict the old
+                # wide history before computing its replacement. Two histories
+                # plus indicator temporaries exceed the container's RAM budget.
+                self._enriched_history_cache = None
+                self._enriched_history_start = None
+                self._enriched_history_generation = None
+                self._enriched_history_snapshot = None
+                self._enriched_history_spill = None
                 df_hist = guarded_collect(lf.select(read_cols), priority="background")
                 logger.info("enriched refresh step done: collect history rows=%d (%.2fs)", len(df_hist), time.perf_counter() - step)
                 if not df_hist.is_empty():
                     instruments = self._instruments_cache if self._instruments_cache is not None else pl.DataFrame()
+                    spill_root = self.store.data_dir / ".cache" / "enriched_history"
+                    spill_root.mkdir(parents=True, exist_ok=True)
+                    # The cache owns its mapped files until replaced or cleared.
+                    # Windows may retain mappings held by concurrent readers;
+                    # cleanup must never make a successful refresh fail.
+                    spill = TemporaryDirectory(prefix="snapshot-", dir=spill_root,
+                                               ignore_cleanup_errors=True)
 
                     # 分批计算并关联元数据, 保留完整历史, 限制宽表临时副本。
                     step = time.perf_counter()
@@ -706,6 +778,7 @@ class KlineRepository:
                             else None
                         ),
                         include_instrument_metadata=True,
+                        spill_directory=Path(spill.name),
                     )
                     del df_hist
                     logger.info("enriched refresh step done: compute window rows=%d (%.2fs)",
@@ -717,6 +790,7 @@ class KlineRepository:
                             "enriched data changed while refreshing its history cache"
                         )
                     self._enriched_history_cache = df_full
+                    self._enriched_history_spill = spill
                     self._enriched_history_start = df_full["date"].min()
                     self._enriched_history_generation = refresh_generation
                     self._enriched_history_snapshot = (df_full, refresh_snapshot)
@@ -738,10 +812,26 @@ class KlineRepository:
                             latest, df_today, df_full,
                         )
                         if len(repaired_today) > len(df_today):
-                            df_full = pl.concat(
-                                [df_full.filter(pl.col("date") != latest), repaired_today],
-                                how="diagonal_relaxed",
-                            ).sort(["symbol", "date"])
+                            recovered = repaired_today.join(
+                                df_today.select("symbol", "date"),
+                                on=["symbol", "date"], how="anti",
+                            ).sort("symbol", "date")
+                            # History is already sorted and ends at latest. Insert
+                            # new latest rows after their symbol using shared slices;
+                            # filtering/sorting the full wide cache doubles its RAM.
+                            positions = df_full["symbol"].search_sorted(
+                                recovered["symbol"], side="right",
+                            ).to_list()
+                            parts = []
+                            offset = 0
+                            for row, position in enumerate(positions):
+                                if position > offset:
+                                    parts.append(df_full.slice(offset, position - offset))
+                                parts.append(recovered.slice(row, 1))
+                                offset = position
+                            if offset < len(df_full):
+                                parts.append(df_full.slice(offset))
+                            df_full = pl.concat(parts, how="diagonal_relaxed", rechunk=False)
                             self._enriched_history_cache = df_full
                             self._enriched_history_snapshot = (df_full, refresh_snapshot)
                             self._enriched_cache = repaired_today
@@ -790,19 +880,17 @@ class KlineRepository:
             from app.indicators.pipeline import compute_enriched_today, filter_halt_days
 
             daily = filter_halt_days(pl.read_parquet(daily_path))
-            missing = daily.join(
-                df_today.select("symbol").unique(),
-                on="symbol",
+            missing = daily.with_columns(_symbol_key_expr()).join(
+                df_today.select(_symbol_key_expr()).unique(),
+                on="_symbol_key",
                 how="anti",
-            )
+            ).drop("_symbol_key")
             if missing.is_empty():
                 return df_today
 
-            missing_symbols = missing.select("symbol").unique()
-            previous = history.filter(pl.col("date") < latest).join(
-                missing_symbols,
-                on="symbol",
-                how="semi",
+            previous = history.filter(
+                (pl.col("date") < latest)
+                & pl.col("symbol").is_in(missing["symbol"].unique().to_list()),
             )
             if not previous.is_empty():
                 previous = _last_available_rows(previous, latest)
@@ -811,6 +899,7 @@ class KlineRepository:
                 previous,
                 missing,
                 self.get_instruments(),
+                historical_shares=self.get_historical_shares(),
             )
             if recovered.is_empty():
                 return df_today
@@ -818,7 +907,7 @@ class KlineRepository:
             result = pl.concat(
                 [df_today, recovered],
                 how="diagonal_relaxed",
-            ).unique(subset=["symbol", "date"], keep="last").sort("symbol")
+            ).unique(subset=["symbol", "date"], keep="last", maintain_order=True).sort("symbol")
             logger.info(
                 "enriched latest cache restored from daily: date=%s, rows=%d",
                 latest,
@@ -1244,7 +1333,9 @@ class KlineRepository:
         except Exception as e:  # noqa: BLE001
             logger.debug("etf instruments legacy fallback skipped: %s", e)
         if parts:
-            df_all = pl.concat(parts, how="diagonal_relaxed").unique(subset=["symbol"], keep="last").sort("symbol")
+            df_all = pl.concat(parts, how="diagonal_relaxed").unique(
+                subset=["symbol"], keep="last", maintain_order=True,
+            ).sort("symbol")
             self._etf_instruments_cache = df_all
             self._etf_symbol_set_cache = None
             self._name_map_cache = None
@@ -1372,12 +1463,9 @@ class KlineRepository:
         """从预计算 enriched 历史缓存返回完整区间；缓存不覆盖时返回 None。"""
         self._assert_daily_usable(symbols=symbols, end=end)
         if self._enriched_history_cache is None:
-            if self._enriched_warming:
-                # 后台预热中: 返回 None (缓存不覆盖), 调用方各自走慢路径;
-                # 否则请求线程会与预热线程并发重复 300 天全量重算
-                # (同 get_enriched_latest 的守卫语义)。
-                return None
-            self._refresh_enriched()
+            # A range cache read must not allocate the full 300-day feature
+            # history in a request thread. Explicit background warming remains.
+            return None
         cache = self._enriched_history_cache
         data_dir = getattr(getattr(self, "store", None), "data_dir", None)
         if data_dir is not None:
@@ -1410,6 +1498,20 @@ class KlineRepository:
         df = df.filter((pl.col("date") >= start) & (pl.col("date") <= end))
         if symbols is not None:
             df = df.filter(pl.col("symbol").is_in(symbols))
+        if (not df.is_empty() and "_prev_consec" not in df.columns
+                and "consecutive_limit_ups" in cache.columns
+                and (columns is None or "_prev_consec" in columns)):
+            from app.services.market_phase import with_prev_consecutive
+
+            # Preserve predecessor context across the requested left boundary.
+            # Sort only three columns, not the full wide feature history.
+            context = cache.select("symbol", "date", "consecutive_limit_ups").filter(
+                (pl.col("date") <= end) & pl.col("symbol").is_in(df["symbol"].unique().to_list()))
+            previous = with_prev_consecutive(context).filter(pl.col("date") >= start)
+            df = df.join(previous.select("symbol", "date", "_prev_consec"),
+                         on=["symbol", "date"], how="left")
+            if columns:
+                existing.append("_prev_consec")
         if columns:
             # 保持旧接口空结果的完整 schema, 非空时沿用请求列校验。
             df = cache.clear() if df.is_empty() else df.select(existing)
@@ -1555,7 +1657,9 @@ class KlineRepository:
         if self._name_map_cache is not None:
             if symbols is None:
                 return dict(self._name_map_cache)
-            wanted = set(symbols)
+            wanted: set[str] = set()
+            for symbol in symbols:
+                wanted.update(_instrument_name_aliases(symbol))
             return {s: n for s, n in self._name_map_cache.items() if s in wanted}
         # 只构建并缓存全量映射; symbols 过滤只作用于返回值。
         # 若把过滤后的结果写入缓存, 后续不同 symbols 的查询会命中残缺缓存,
@@ -1564,12 +1668,23 @@ class KlineRepository:
         for df in (self.get_instruments(), self.get_etf_instruments(), self.get_instruments_asset("index")):
             if df.is_empty() or "symbol" not in df.columns or "name" not in df.columns:
                 continue
-            for symbol, name in df.select(["symbol", "name"]).iter_rows():
-                name_map.setdefault(symbol, name)
+            cols = [c for c in ("symbol", "name", "code", "exchange") if c in df.columns]
+            for row in df.select(cols).iter_rows(named=True):
+                name = str(row.get("name") or "").strip()
+                if not name:
+                    continue
+                for alias in _instrument_name_aliases(
+                    row.get("symbol"),
+                    row.get("code"),
+                    row.get("exchange"),
+                ):
+                    name_map.setdefault(alias, name)
         self._name_map_cache = name_map
         if symbols is None:
             return dict(name_map)
-        wanted = set(symbols)
+        wanted = set()
+        for symbol in symbols:
+            wanted.update(_instrument_name_aliases(symbol))
         return {s: n for s, n in name_map.items() if s in wanted}
 
     def enriched_latest_date(self) -> date | None:
@@ -1621,11 +1736,9 @@ class KlineRepository:
             hist_min = self._enriched_history_start
             hist_max = hist["date"].max()
             if hist_min is not None and hist_min <= start and hist_max >= start:
-                df = hist.filter(
-                    (pl.col("symbol") == symbol)
-                    & (pl.col("date") >= start)
-                    & (pl.col("date") <= end)
-                )
+                df = self._filter_cached(hist, symbol, None)
+                if not df.is_empty():
+                    df = df.filter((pl.col("date") >= start) & (pl.col("date") <= end))
         if df.is_empty():
             # 扫描14列 parquet
             df = self._scan_daily_symbol(symbol, warmup_start, end, None)
@@ -1644,6 +1757,7 @@ class KlineRepository:
 
         # 裁剪到请求范围
         if not df.is_empty():
+            df = self._repair_corrupt_adjusted_prices(df)
             df = df.filter((pl.col("date") >= start) & (pl.col("date") <= end))
 
         if columns and not df.is_empty():
@@ -1784,7 +1898,7 @@ class KlineRepository:
         标记未开启 (存量未迁移) 原样返回, 行为与旧版逐字节一致; 投影异常也按原样
         返回 (fail-open, 与日K缺因子语义一致), 不让复权层破坏数据可用性。
         """
-        if df.is_empty() or not minute_basis_is_raw(self.store.data_dir):
+        if df.is_empty() or not hasattr(self, "store") or not minute_basis_is_raw(self.store.data_dir):
             return df
         try:
             return apply_minute_adjustment(df, self.store.data_dir, asset_type)
@@ -1804,24 +1918,8 @@ class KlineRepository:
         trade_date: date,
         asset_type: str = "stock",
     ) -> pl.DataFrame:
-        """分钟K查询 — 优先直读当日分区文件 (免全树 footer IO), 分区缺失回退全树扫描。
-
-        该查询在自选分时热路径上被每 tick、每客户端调用, 全树 glob 扫描成本随
-        本地分钟历史线性增长; 单日数据按约定完整落在 date= 分区内, 谓词不变。
-        """
-        try:
-            part = self._minute_partition_path(asset_type, trade_date)
-            source = part if part is not None else self._minute_glob_for(asset_type)
-            df = guarded_collect(
-                pl.scan_parquet(source).filter(
-                    (pl.col("symbol") == symbol)
-                    & (pl.col("datetime").dt.date() == trade_date)
-                ).sort("datetime")
-            )
-            return self._maybe_adjust_minute(df, asset_type)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("分钟K查询失败: %s", e)
-            return pl.DataFrame()
+        """单日分钟查询: 只读目标分区, 兼容裸代码和交易所后缀。"""
+        return self.get_minute_by_dates([symbol], [trade_date], asset_type)
 
     def get_minute_batch(
         self,
@@ -1834,21 +1932,7 @@ class KlineRepository:
         用于自选列表分时图: 一次 predicate pushdown 读多只股票当日分钟K,
         避免逐只查询的 N 次 I/O; 单日直读避免全树扫描 (同 get_minute)。
         """
-        if not symbols:
-            return pl.DataFrame()
-        try:
-            part = self._minute_partition_path(asset_type, trade_date)
-            source = part if part is not None else self._minute_glob_for(asset_type)
-            df = guarded_collect(
-                pl.scan_parquet(source).filter(
-                    pl.col("symbol").is_in(symbols)
-                    & (pl.col("datetime").dt.date() == trade_date)
-                ).sort(["symbol", "datetime"])
-            )
-            return self._maybe_adjust_minute(df, asset_type)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("批量分钟K查询失败: %s", e)
-            return pl.DataFrame()
+        return self.get_minute_by_dates(symbols, [trade_date], asset_type)
 
     def get_minute_range(
         self,
@@ -1862,26 +1946,10 @@ class KlineRepository:
         一次 scan_parquet + predicate pushdown 读多只股票在 [start, end] 内的所有分钟K。
         返回列: symbol, datetime, open, high, low, close, volume, amount。
         """
-        if not symbols:
+        if not symbols or start > end:
             return pl.DataFrame()
-        try:
-            lf = pl.scan_parquet(self._minute_glob_for(asset_type))
-            available = set(lf.collect_schema().names())
-            select_cols = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"] if c in available]
-            df = guarded_collect(
-                lf.select(select_cols)
-                .filter(
-                    pl.col("symbol").is_in(symbols)
-                    & (pl.col("datetime").dt.date() >= start)
-                    & (pl.col("datetime").dt.date() <= end)
-                )
-                .sort(["symbol", "datetime"]),
-                streaming=True,
-            )
-            return self._maybe_adjust_minute(df, asset_type)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("分钟K范围查询失败: %s", e)
-            return pl.DataFrame()
+        dates = [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
+        return self.get_minute_by_dates(symbols, dates, asset_type)
 
     def get_minute_by_dates(
         self,
@@ -1891,8 +1959,7 @@ class KlineRepository:
     ) -> pl.DataFrame:
         """按日期列表精确读取分钟K分区文件 (分钟K精确回测用)。
 
-        与 get_minute_range 的区别: 后者扫描 [start, end] 区间全部日期的 parquet
-        (触发日稀疏时会读大量无关日期 → 爆内存); 本方法只读 dates 里列出的日期
+        get_minute_range、单日及批量查询复用本方法。只读 dates 里列出的日期
         对应的分区文件 (date=YYYY-MM-DD/part.parquet), 内存与回测区间长度解耦,
         只随触发日数量增长。
 
@@ -1901,29 +1968,60 @@ class KlineRepository:
         """
         if not symbols or not dates:
             return pl.DataFrame()
-        base = self._etf_minute_glob.rsplit("/", 2)[0] if asset_type == "etf" else self._minute_glob.rsplit("/", 2)[0]
+        base = Path(self._minute_glob_for(asset_type)).parent.parent
         # 收集存在的分区文件路径, 避免对不存在的文件 scan 报错
         parts: list[str] = []
-        for d in dates:
-            p = f"{base}/date={d.isoformat()}/part.parquet"
-            if Path(p).exists():
-                parts.append(p)
+        for d in sorted(set(dates)):
+            p = base / f"date={d.isoformat()}" / "part.parquet"
+            if p.exists():
+                parts.append(str(p))
         if not parts:
             return pl.DataFrame()
         try:
             lf = pl.scan_parquet(parts)
             available = set(lf.collect_schema().names())
             select_cols = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"] if c in available]
+            requested = {str(s).split('.')[0]: s for s in symbols}
             df = guarded_collect(
                 lf.select(select_cols)
-                .filter(pl.col("symbol").is_in(symbols))
-                .sort(["symbol", "datetime"]),
-                streaming=True,
+                .with_columns(pl.col("symbol").str.extract(r"(\d{6})", 1).alias("_query_code"))
+                .filter(pl.col("_query_code").is_in(list(requested)) & pl.col("datetime").dt.date().is_in(dates))
+                .with_columns(pl.col("_query_code").replace_strict(requested).alias("symbol"))
+                .drop("_query_code")
+                .sort(["symbol", "datetime"])
+                , streaming=True
             )
             return self._maybe_adjust_minute(df, asset_type)
         except Exception as e:  # noqa: BLE001
             logger.warning("分钟K按日期查询失败: %s", e)
             return pl.DataFrame()
+
+    def get_minute_quality(self, symbols: list[str], dates: list[date], asset_type: str = "stock"):
+        """Closed-minute research view; live queries keep the unfiltered route."""
+        from app.services.minute_quality import filter_minute_sessions
+        from app.services.minute_repair import daily_reference, keyed
+
+        frame = self.get_minute_by_dates(symbols, dates, asset_type)
+        if asset_type != "stock":
+            return filter_minute_sessions(frame)
+        daily_parts = []
+        for day in dates:
+            path = self.store.data_dir / "kline_daily" / f"date={day}" / "part.parquet"
+            if path.exists():
+                daily_parts.append(pl.read_parquet(path).with_columns(pl.lit(day).alias("date")))
+        daily = pl.concat(daily_parts, how="diagonal_relaxed") if daily_parts else pl.DataFrame()
+        valid, issues = filter_minute_sessions(frame, daily, data_dir=self.store.data_dir)
+        wanted = set(keyed(pl.DataFrame({"symbol": symbols}))["_code"].drop_nulls())
+        present = set()
+        if not frame.is_empty():
+            present = set(keyed(frame).select("_code", pl.col("datetime").dt.date()).unique().iter_rows())
+        for day in dates:
+            refs = daily_reference(daily.filter(pl.col("date") == day), data_dir=self.store.data_dir) if not daily.is_empty() else {}
+            for code in wanted:
+                if (code, day) not in present and (code in refs or not refs):
+                    issues.append({"date": str(day), "symbol": code,
+                                   "reason": "missing_session" if code in refs else "daily_reference_missing"})
+        return valid, issues
 
     # ================================================================
     # Polars 查询内部方法
@@ -1939,6 +2037,7 @@ class KlineRepository:
         )
         if df.is_empty() or df.height < 2:
             return df
+        df = self._repair_corrupt_adjusted_prices(df)
         # 兜底过滤历史脏数据中的停牌日 (close 可能被填充为前收盘价)
         df = filter_halt_days(df)
         if df.is_empty() or df.height < 2:
@@ -1956,6 +2055,153 @@ class KlineRepository:
             logger.warning("on-demand compute failed: %s", e)
         return df
 
+    def _repair_corrupt_adjusted_prices(self, df: pl.DataFrame) -> pl.DataFrame:
+        """修复已落库的异常复权价。
+
+        早期同步可能把 Tushare/Fuyao 累计复权因子当作事件因子继续连乘,
+        导致 close/raw_close 极小。读取时优先用 raw_* 字段恢复展示与热路径计算,
+        避免坏价继续进入图表、资金榜和荐股排序。
+        """
+        if df.is_empty() or "close" not in df.columns or "raw_close" not in df.columns:
+            return df
+        try:
+            columns = set(df.columns)
+            numeric_cols = [
+                c for c in (
+                    "open", "high", "low", "close",
+                    "raw_close", "raw_high", "raw_low",
+                    "prev_close", "change_pct",
+                )
+                if c in columns
+            ]
+            if numeric_cols:
+                df = df.with_columns([
+                    pl.col(c).cast(pl.Float64, strict=False).alias(c)
+                    for c in numeric_cols
+                ])
+
+            df = df.with_columns(
+                pl.when((pl.col("raw_close") > 0) & (pl.col("close") > 0))
+                .then(pl.col("close") / pl.col("raw_close"))
+                .otherwise(pl.lit(None, dtype=pl.Float64))
+                .alias("_price_repair_ratio")
+            )
+            median_ratio = (
+                pl.col("_price_repair_ratio").median().over("symbol")
+                if "symbol" in columns
+                else pl.col("_price_repair_ratio").median()
+            )
+            ratio_outlier = pl.when(median_ratio > 0).then(
+                (pl.col("_price_repair_ratio") < median_ratio * 0.30)
+                | (pl.col("_price_repair_ratio") > median_ratio * 3.50)
+            ).otherwise(False)
+            bad_expr = (
+                (pl.col("raw_close").is_not_null())
+                & (pl.col("raw_close") > 0)
+                & (
+                    pl.col("close").is_null()
+                    | (pl.col("close") <= 0)
+                    | (pl.col("_price_repair_ratio") < 0.02)
+                    | (pl.col("_price_repair_ratio") > 50.0)
+                    | ratio_outlier
+                )
+            ).fill_null(False)
+            df = df.with_columns(
+                bad_expr.alias("_price_repair_bad"),
+                pl.when((pl.col("close").is_not_null()) & (pl.col("close") > 0))
+                .then(pl.col("raw_close") / pl.col("close"))
+                .otherwise(1.0)
+                .alias("_price_repair_scale"),
+            )
+            if not bool(df.select(pl.col("_price_repair_bad").any()).item()):
+                return df.drop([
+                    c for c in ("_price_repair_ratio", "_price_repair_bad", "_price_repair_scale")
+                    if c in df.columns
+                ])
+
+            price_exprs: list[pl.Expr] = []
+            if "open" in columns:
+                price_exprs.append(
+                    pl.when(pl.col("_price_repair_bad") & (pl.col("open") > 0))
+                    .then(pl.col("open") * pl.col("_price_repair_scale"))
+                    .when(pl.col("_price_repair_bad"))
+                    .then(pl.col("raw_close"))
+                    .otherwise(pl.col("open"))
+                    .alias("open")
+                )
+            if "high" in columns:
+                if "raw_high" in columns:
+                    repaired_high = (
+                        pl.when(pl.col("_price_repair_bad") & (pl.col("raw_high") > 0))
+                        .then(pl.col("raw_high"))
+                        .when(pl.col("_price_repair_bad") & (pl.col("high") > 0))
+                        .then(pl.col("high") * pl.col("_price_repair_scale"))
+                        .when(pl.col("_price_repair_bad"))
+                        .then(pl.col("raw_close"))
+                    )
+                else:
+                    repaired_high = (
+                        pl.when(pl.col("_price_repair_bad") & (pl.col("high") > 0))
+                        .then(pl.col("high") * pl.col("_price_repair_scale"))
+                        .when(pl.col("_price_repair_bad"))
+                        .then(pl.col("raw_close"))
+                    )
+                price_exprs.append(repaired_high.otherwise(pl.col("high")).alias("high"))
+            if "low" in columns:
+                if "raw_low" in columns:
+                    repaired_low = (
+                        pl.when(pl.col("_price_repair_bad") & (pl.col("raw_low") > 0))
+                        .then(pl.col("raw_low"))
+                        .when(pl.col("_price_repair_bad") & (pl.col("low") > 0))
+                        .then(pl.col("low") * pl.col("_price_repair_scale"))
+                        .when(pl.col("_price_repair_bad"))
+                        .then(pl.col("raw_close"))
+                    )
+                else:
+                    repaired_low = (
+                        pl.when(pl.col("_price_repair_bad") & (pl.col("low") > 0))
+                        .then(pl.col("low") * pl.col("_price_repair_scale"))
+                        .when(pl.col("_price_repair_bad"))
+                        .then(pl.col("raw_close"))
+                    )
+                price_exprs.append(repaired_low.otherwise(pl.col("low")).alias("low"))
+            price_exprs.append(
+                pl.when(pl.col("_price_repair_bad"))
+                .then(pl.col("raw_close"))
+                .otherwise(pl.col("close"))
+                .alias("close")
+            )
+            df = df.with_columns(price_exprs)
+
+            if "change_pct" in columns and "date" in columns:
+                sort_cols = ["symbol", "date"] if "symbol" in columns else ["date"]
+                df = df.sort(sort_cols)
+                prev_candidates: list[pl.Expr] = []
+                if "prev_close" in columns:
+                    prev_candidates.append(
+                        pl.when(pl.col("prev_close") > 0)
+                        .then(pl.col("prev_close"))
+                        .otherwise(pl.lit(None, dtype=pl.Float64))
+                    )
+                if "symbol" in columns:
+                    prev_candidates.append(pl.col("close").shift(1).over("symbol"))
+                else:
+                    prev_candidates.append(pl.col("close").shift(1))
+                df = df.with_columns(pl.coalesce(prev_candidates).alias("_price_repair_prev_close"))
+                df = df.with_columns(
+                    pl.when(pl.col("_price_repair_prev_close") > 0)
+                    .then(pl.col("close") / pl.col("_price_repair_prev_close") - 1.0)
+                    .otherwise(pl.col("change_pct"))
+                    .alias("change_pct")
+                )
+            return df.drop([
+                c for c in ("_price_repair_ratio", "_price_repair_bad", "_price_repair_scale", "_price_repair_prev_close")
+                if c in df.columns
+            ])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("异常复权价读取修复跳过: %s", e)
+            return df
+
     def _compute_index_enriched_range(self, df: pl.DataFrame) -> pl.DataFrame:
         """指数只计算通用技术指标和通用信号，跳过涨跌停/股本/市值逻辑。"""
         from app.indicators.pipeline import compute_indicators, compute_signals
@@ -1969,14 +2215,33 @@ class KlineRepository:
         return df
 
     def _filter_cached(self, cached: pl.DataFrame, symbol: str, columns: list[str] | None) -> pl.DataFrame:
-        df = cached.filter(pl.col("symbol") == symbol)
+        aliases = _instrument_name_aliases(symbol)
+        df = cached.filter(pl.col("symbol").cast(pl.Utf8, strict=False).str.to_uppercase().is_in(aliases))
+        if not df.is_empty() and "symbol" in df.columns:
+            df = df.with_columns(
+                (pl.col("symbol").cast(pl.Utf8, strict=False).str.to_uppercase() == str(symbol).strip().upper())
+                .cast(pl.Int8)
+                .alias("_symbol_exact_rank")
+            )
+            if "date" in df.columns:
+                df = df.sort(["date", "_symbol_exact_rank"]).unique(subset=["date"], keep="last").sort("date")
+            df = df.with_columns(pl.lit(symbol).alias("symbol")).drop("_symbol_exact_rank")
         if columns and not df.is_empty():
             existing = [c for c in columns if c in df.columns]
             df = df.select(existing)
         return df
 
     def _filter_cached_batch(self, cached: pl.DataFrame, symbols: list[str], columns: list[str] | None) -> pl.DataFrame:
-        df = cached.filter(pl.col("symbol").is_in(symbols))
+        wanted = [_compact_symbol_for_name(s) for s in symbols]
+        wanted = [s for s in wanted if s]
+        df = cached.with_columns(_symbol_key_expr()).filter(pl.col("_symbol_key").is_in(wanted))
+        if not df.is_empty():
+            df = (
+                df.with_columns(pl.col("_symbol_key").alias("symbol"))
+                .sort(["symbol", "date"])
+                .unique(subset=["symbol", "date"], keep="last")
+                .drop("_symbol_key")
+            )
         if columns and not df.is_empty():
             existing = [c for c in columns if c in df.columns]
             df = df.select(existing)
@@ -1984,34 +2249,75 @@ class KlineRepository:
 
     def _scan_daily_symbol(self, symbol: str, start: date, end: date, columns: list[str] | None) -> pl.DataFrame:
         try:
+            aliases = _instrument_name_aliases(symbol)
             lf = scan_enriched_parquet(self._enriched_glob,
                                  cast_options=pl.ScanCastOptions(integer_cast="allow-float")).filter(
-                (pl.col("symbol") == symbol)
+                (pl.col("symbol").cast(pl.Utf8, strict=False).str.to_uppercase().is_in(aliases))
                 & (pl.col("date") >= start)
                 & (pl.col("date") <= end)
             ).sort("date")
+            requested_cols = columns
             if columns:
                 schema_names = lf.collect_schema().names()
-                existing = [c for c in columns if c in schema_names]
+                read_columns = list(columns)
+                read_columns.extend(["symbol", "date"])
+                if any(c in columns for c in ("open", "high", "low", "close", "change_pct")):
+                    read_columns.extend(["raw_close", "raw_high", "raw_low", "prev_close"])
+                existing = [c for c in dict.fromkeys(read_columns) if c in schema_names]
                 lf = lf.select(existing)
-            return guarded_collect(lf)
+            df = guarded_collect(lf)
+            if not df.is_empty() and "symbol" in df.columns:
+                df = df.with_columns(
+                    (pl.col("symbol").cast(pl.Utf8, strict=False).str.to_uppercase() == str(symbol).strip().upper())
+                    .cast(pl.Int8)
+                    .alias("_symbol_exact_rank")
+                )
+                if "date" in df.columns:
+                    df = df.sort(["date", "_symbol_exact_rank"]).unique(subset=["date"], keep="last").sort("date")
+                df = df.with_columns(pl.lit(symbol).alias("symbol")).drop("_symbol_exact_rank")
+            df = self._repair_corrupt_adjusted_prices(df)
+            if requested_cols and not df.is_empty():
+                existing = [c for c in requested_cols if c in df.columns]
+                df = df.select(existing)
+            return df
         except Exception as e:  # noqa: BLE001
             logger.warning("日K查询失败: %s", e)
             return pl.DataFrame()
 
     def _scan_daily_batch(self, symbols: list[str], start: date, end: date, columns: list[str] | None) -> pl.DataFrame:
         try:
+            wanted = [_compact_symbol_for_name(s) for s in symbols]
+            wanted = [s for s in wanted if s]
             lf = scan_enriched_parquet(self._enriched_glob,
-                                 cast_options=pl.ScanCastOptions(integer_cast="allow-float")).filter(
-                (pl.col("symbol").is_in(symbols))
+                                 cast_options=pl.ScanCastOptions(integer_cast="allow-float")).with_columns(
+                _symbol_key_expr()
+            ).filter(
+                (pl.col("_symbol_key").is_in(wanted))
                 & (pl.col("date") >= start)
                 & (pl.col("date") <= end)
-            ).sort(["symbol", "date"])
+            ).sort(["_symbol_key", "date"])
+            requested_cols = columns
             if columns:
                 schema_names = lf.collect_schema().names()
-                existing = [c for c in columns if c in schema_names]
+                read_columns = list(columns)
+                read_columns.extend(["_symbol_key", "symbol", "date"])
+                if any(c in columns for c in ("open", "high", "low", "close", "change_pct")):
+                    read_columns.extend(["raw_close", "raw_high", "raw_low", "prev_close"])
+                existing = [c for c in dict.fromkeys(read_columns) if c in schema_names]
                 lf = lf.select(existing)
-            return guarded_collect(lf)
+            df = guarded_collect(lf)
+            if not df.is_empty() and "_symbol_key" in df.columns:
+                df = (
+                    df.with_columns(pl.col("_symbol_key").alias("symbol"))
+                    .sort(["symbol", "date"])
+                    .unique(subset=["symbol", "date"], keep="last")
+                    .drop("_symbol_key")
+                )
+            df = self._repair_corrupt_adjusted_prices(df)
+            if requested_cols and not df.is_empty():
+                existing = [c for c in requested_cols if c in df.columns]
+                df = df.select(existing)
+            return df
         except Exception as e:  # noqa: BLE001
             logger.warning("日K批量查询失败: %s", e)
             return pl.DataFrame()
@@ -2020,10 +2326,18 @@ class KlineRepository:
         try:
             lf = scan_enriched_parquet(self._index_enriched_glob,
                                  cast_options=pl.ScanCastOptions(integer_cast="allow-float")).filter(
-                (pl.col("symbol") == symbol)
+                pl.col("symbol").cast(pl.Utf8, strict=False).str.to_uppercase()
+                .is_in(_instrument_name_aliases(symbol))
                 & (pl.col("date") >= start)
                 & (pl.col("date") <= end)
-            ).sort("date")
+            )
+            # Older index enriched partitions contain bare codes. Keep their
+            # history available, preferring an explicitly qualified row on ties.
+            lf = (lf.with_columns(
+                (pl.col("symbol").cast(pl.Utf8, strict=False).str.to_uppercase()
+                 == str(symbol).strip().upper()).cast(pl.Int8).alias("_index_exact_rank"))
+                .sort(["date", "_index_exact_rank"]).unique(subset=["date"], keep="last")
+                .with_columns(pl.lit(symbol).alias("symbol")).drop("_index_exact_rank").sort("date"))
             if columns:
                 schema_names = lf.collect_schema().names()
                 existing = [c for c in columns if c in schema_names]
@@ -2165,34 +2479,97 @@ class KlineRepository:
         out.sort()
         return out
 
-    def latest_daily_date(self) -> date | None:
-        """本地日K数据的最新日期。"""
-        try:
-            res = self.execute_one(
-                "SELECT max(date) FROM kline_daily",
-            )
-            if res and res[0]:
-                d = res[0]
-                return d if isinstance(d, date) else date.fromisoformat(str(d))
-        except Exception:
-            return None
-        return None
+    def _stock_full_market_min_symbols(self) -> int | None:
+        """Return a coverage floor for stock full-market partitions.
 
-    def latest_enriched_date(self, asset_type: str = "stock") -> date | None:
-        """Return the newest partition available to matrix-native consumers."""
-        dirname = enriched_dirname(asset_type)
+        Local TDX and other symbol-scoped realtime sources may only return a
+        watchlist-sized snapshot. When such a sparse snapshot is accidentally
+        written into the stock daily/enriched tree, treating it as the newest
+        full-market date makes screeners, StockFormer and dashboards read
+        "latest" but incomplete data.
+        """
+        try:
+            instruments = self._instruments_cache
+            if instruments is None:
+                instruments = self.get_instruments()
+            if instruments is None or instruments.is_empty() or "symbol" not in instruments.columns:
+                return None
+            symbol_count = int(instruments.get_column("symbol").n_unique())
+        except Exception:  # noqa: BLE001
+            return None
+        if symbol_count < 1000:
+            return None
+        return max(500, int(symbol_count * 0.35))
+
+    def _partition_symbol_count(self, dirname: str, day: date) -> int | None:
+        partition = self.store.data_dir / dirname / f"date={day.isoformat()}"
+        if not partition.exists():
+            return None
+        frames: list[pl.DataFrame] = []
+        for path in sorted(partition.glob("*.parquet")):
+            df = read_parquet_safe(path, columns=["symbol"])
+            if df is None or df.is_empty() or "symbol" not in df.columns:
+                continue
+            frames.append(df.select("symbol"))
+        if not frames:
+            return 0
+        return int(pl.concat(frames, how="vertical").get_column("symbol").n_unique())
+
+    def _latest_partition_date(
+        self,
+        dirname: str,
+        *,
+        require_stock_full_market: bool = False,
+    ) -> date | None:
         root = self.store.data_dir / dirname
-        latest: date | None = None
         if not root.exists():
             return None
+        dates: list[date] = []
         for partition in root.glob("date=*"):
             try:
                 value = date.fromisoformat(partition.name.removeprefix("date="))
             except ValueError:
                 continue
-            if latest is None or value > latest:
-                latest = value
-        return latest
+            dates.append(value)
+        dates.sort(reverse=True)
+        if not dates:
+            return None
+
+        min_symbols = self._stock_full_market_min_symbols() if require_stock_full_market else None
+        if min_symbols is None:
+            return dates[0]
+
+        for value in dates:
+            symbol_count = self._partition_symbol_count(dirname, value)
+            if symbol_count is None:
+                continue
+            if symbol_count >= min_symbols:
+                return value
+            logger.warning(
+                "skip sparse stock partition: table=%s date=%s symbols=%d min_required=%d",
+                dirname,
+                value,
+                symbol_count,
+                min_symbols,
+            )
+        logger.warning(
+            "no stock full-market partition passed coverage check: table=%s min_required=%d",
+            dirname,
+            min_symbols,
+        )
+        return None
+
+    def latest_daily_date(self) -> date | None:
+        """本地日K数据的最新日期。"""
+        return self._latest_partition_date("kline_daily", require_stock_full_market=True)
+
+    def latest_enriched_date(self, asset_type: str = "stock") -> date | None:
+        """Return the newest partition available to matrix-native consumers."""
+        dirname = enriched_dirname(asset_type)
+        return self._latest_partition_date(
+            dirname,
+            require_stock_full_market=(asset_type == "stock"),
+        )
 
     def get_matrix_data_generation(self, asset_type: str = "stock") -> str:
         """Return the stable generation for managed enriched readers."""
@@ -2223,25 +2600,54 @@ class KlineRepository:
             return []
 
     def _latest_enriched_date_duckdb(self) -> date | None:
-        try:
-            res = self.execute_one(
-                "SELECT max(date) FROM kline_enriched",
-            )
-            if res and res[0]:
-                d = res[0]
-                return d if isinstance(d, date) else date.fromisoformat(str(d))
-        except Exception:  # noqa: BLE001
-            return None
-        return None
+        return self._latest_partition_date("kline_daily_enriched", require_stock_full_market=True)
 
     # ================================================================
     # 写入 (Pipeline / Sync)
     # ================================================================
 
+    def _validate_asset_identity(self, asset_type: str, df: pl.DataFrame) -> pl.DataFrame:
+        """Reject unknown or cross-market rows before they reach parquet.
+
+        The stored symbol may remain a legacy bare code for compatibility, but
+        every write is checked against the asset-specific dimension and its
+        exchange. This prevents a stock/index/ETF code collision from being
+        silently merged by the old ``symbol + date`` upsert key.
+        """
+        if df.is_empty() or "symbol" not in df.columns:
+            return df
+        from app.services.security_identity import (
+            IdentityBatchError,
+            build_instrument_lookup,
+            validate_frame_identity,
+        )
+
+        instruments = self.get_instruments_asset(asset_type)
+        lookup = build_instrument_lookup((instruments,))
+        if not lookup:
+            raise IdentityBatchError([{
+                "raw": "<batch>",
+                "reason": f"{asset_type}_dimension_unavailable",
+            }])
+        validated = validate_frame_identity(
+            df,
+            asset_type=asset_type,
+            lookup=lookup,
+            require_lookup=True,
+        )
+        if asset_type == "etf":
+            # Enriched calculations may return compact codes. ETF writes
+            # must use the dimension's qualified identity so recomputed
+            # history updates the existing row instead of adding an alias.
+            aliases = {**lookup, **{symbol: symbol for symbol in lookup.values()}}
+            validated = validated.with_columns(pl.col("symbol").replace_strict(aliases))
+        return validated
+
     def append_daily(self, df: pl.DataFrame) -> None:
         """按日分区写入日K数据 (merge-upsert)。"""
         if df.is_empty():
             return
+        df = self._validate_asset_identity("stock", df)
         self._write_daily_partition(df, "kline_daily")
 
     def append_enriched(self, df: pl.DataFrame) -> None:
@@ -2249,6 +2655,7 @@ class KlineRepository:
         if df.is_empty():
             return
         from app.indicators.pipeline import ENRICHED_STORAGE_COLS
+        df = self._validate_asset_identity("stock", df)
         storage_cols = [c for c in ENRICHED_STORAGE_COLS if c in df.columns]
         df_storage = df.select(storage_cols)
         self._write_daily_partition(df_storage, "kline_daily_enriched")
@@ -2257,6 +2664,7 @@ class KlineRepository:
         """按日分区写入指数日K数据 (merge-upsert)。"""
         if df.is_empty():
             return
+        df = self._validate_asset_identity("index", df)
         self._write_daily_partition(df, "kline_index_daily")
 
     def append_index_enriched(self, df: pl.DataFrame) -> None:
@@ -2264,6 +2672,7 @@ class KlineRepository:
         if df.is_empty():
             return
         from app.indicators.pipeline import ENRICHED_STORAGE_COLS
+        df = self._validate_asset_identity("index", df)
         storage_cols = [c for c in ENRICHED_STORAGE_COLS if c in df.columns]
         df_storage = df.select(storage_cols)
         self._write_daily_partition(df_storage, "kline_index_enriched")
@@ -2272,6 +2681,7 @@ class KlineRepository:
         """按日分区写入 ETF 日K数据 (merge-upsert)。"""
         if df.is_empty():
             return
+        df = self._validate_asset_identity("etf", df)
         self._write_daily_partition(df, "kline_etf_daily")
 
     def append_etf_enriched(self, df: pl.DataFrame) -> None:
@@ -2279,6 +2689,7 @@ class KlineRepository:
         if df.is_empty():
             return
         from app.indicators.pipeline import ENRICHED_STORAGE_COLS
+        df = self._validate_asset_identity("etf", df)
         storage_cols = [c for c in ENRICHED_STORAGE_COLS if c in df.columns]
         df_storage = df.select(storage_cols)
         self._write_daily_partition(df_storage, "kline_etf_enriched")
@@ -2472,7 +2883,7 @@ class KlineRepository:
             fingerprints = {p: self._partition_fingerprint(p) for p in paths}
             existing = (pl.concat([pl.read_parquet(p) for p in paths], how="diagonal_relaxed")
                         if paths else pl.DataFrame())
-            keep = existing.filter(~pl.col("symbol").is_in(symbols)) if not existing.is_empty() else existing
+            keep = existing.filter(~_symbol_key_expr().is_in(symbols)) if not existing.is_empty() else existing
             incoming = frame.filter(pl.col("date") == day) if not frame.is_empty() else frame
             merged = pl.concat([keep, incoming], how="diagonal_relaxed").sort(["symbol", "date"])
             if merged.equals(existing) and len(paths) <= 1:
@@ -2506,6 +2917,43 @@ class KlineRepository:
             self.append_index_enriched(df)
         elif asset_type == "etf":
             self.append_etf_enriched(df)
+
+    def append_moneyflow(self, df: pl.DataFrame) -> None:
+        """按日分区写入主力/大单资金流数据。"""
+        self._write_partitioned_by_date(
+            df,
+            "moneyflow",
+            unique_subset=["symbol", "date"],
+            sort_cols=["symbol", "date"],
+        )
+
+    def append_auction_open(self, df: pl.DataFrame) -> None:
+        """按日分区写入开盘集合竞价数据。"""
+        # Auction providers do not share one symbol representation: QMT may
+        # return ``920701.BJ`` while Tushare commonly returns ``920701``.
+        # Normalize before the partition upsert so the same security/date is
+        # not stored twice under qualified and compact aliases.
+        if not df.is_empty() and "symbol" in df.columns:
+            df = df.with_columns(
+                pl.col("symbol")
+                .map_elements(_compact_symbol_for_name, return_dtype=pl.Utf8)
+                .alias("symbol")
+            ).filter(pl.col("symbol") != "")
+        self._write_partitioned_by_date(
+            df,
+            "auction_open",
+            unique_subset=["symbol", "date"],
+            sort_cols=["symbol", "date"],
+        )
+
+    def append_news(self, df: pl.DataFrame) -> None:
+        """按日分区写入国内/海外新闻归档。"""
+        self._write_partitioned_by_date(
+            df,
+            "news",
+            unique_subset=["id"],
+            sort_cols=["date", "published_at", "source"],
+        )
 
     def save_index_instruments(self, df: pl.DataFrame) -> None:
         """保存指数标的维表。"""
@@ -2583,8 +3031,7 @@ class KlineRepository:
             finally:
                 cursor.close()
 
-    @staticmethod
-    def _atomic_write_parquet(df: pl.DataFrame, out: Path) -> None:
+    def _atomic_write_parquet(self, df: pl.DataFrame, out: Path | None = None) -> None:
         """先写临时文件再原子替换, 避免进程中断留下损坏的 parquet。
 
         直接 write_parquet(out) 在进程被 kill (dev.sh 清端口用 kill -9)
@@ -2592,6 +3039,19 @@ class KlineRepository:
         临时文件后缀 .tmp 不匹配 *.parquet glob, 不会被扫描误读。
         Windows 下目标正被并发读取时由 replace_with_retry 短退避穿过。
         """
+        # Keep compatibility with the historical unbound helper call
+        # ``KlineRepository._atomic_write_parquet(frame, path)`` used by
+        # downstream integrations and older tests.
+        repo = self
+        if isinstance(self, pl.DataFrame):
+            df, out, repo = self, df, None
+        if out is None:
+            raise TypeError("_atomic_write_parquet requires a destination path")
+
+        from app.services.identity_schema import require_writes_allowed
+
+        if repo is not None:
+            require_writes_allowed(repo.store.data_dir)
         tmp = out.with_name(out.name + ".tmp")
         df.write_parquet(tmp)
         replace_with_retry(tmp, out)
@@ -2643,11 +3103,28 @@ class KlineRepository:
         重试耗尽退回锁内直读直写 (正确性优先, 牺牲隔离性)。
         """
         def _merge(existing: pl.DataFrame) -> pl.DataFrame:
-            if existing.is_empty():
-                return incoming.sort(["symbol", "date"])
-            return pl.concat([existing, incoming], how="diagonal_relaxed").unique(
+            if out.parent.parent.name in {"kline_etf_daily", "kline_etf_enriched"} and not existing.is_empty():
+                from app.services.security_identity import build_instrument_lookup
+
+                lookup = build_instrument_lookup((self.get_etf_instruments(),))
+                known = _symbol_key_expr().is_in(list(lookup))
+                legacy = existing.filter(~known)
+                validated = self._validate_asset_identity("etf", existing.filter(known))
+                # The current vendor dimension can omit a historical ETF.
+                # Preserve those old rows verbatim; new rows have already
+                # passed strict identity validation before entering this merge.
+                existing = pl.concat([validated, legacy], how="diagonal_relaxed")
+                if not legacy.is_empty():
+                    logger.warning("ETF merge preserved %d legacy rows outside current dimension: %s",
+                                   legacy.height, out)
+            merged = incoming if existing.is_empty() else pl.concat([existing, incoming], how="diagonal_relaxed").unique(
                 subset=["symbol", "date"], keep="last"
-            ).sort(["symbol", "date"])
+            )
+            if out.parent.parent.name == "kline_daily":
+                from app.services.daily_aliases import deduplicate_verified_aliases
+
+                merged, _ = deduplicate_verified_aliases(merged)
+            return merged.sort(["symbol", "date"])
 
         for _ in range(retries):
             existing = pl.read_parquet(out) if out.exists() else pl.DataFrame()
@@ -2689,6 +3166,62 @@ class KlineRepository:
                 publication.abandon()
                 raise
 
+    def _write_partitioned_by_date(
+        self,
+        df: pl.DataFrame,
+        table: str,
+        *,
+        unique_subset: list[str],
+        sort_cols: list[str] | None = None,
+    ) -> None:
+        """按 date 分区写入通用增强数据表，支持 merge-upsert。"""
+        if df.is_empty():
+            return
+        if "date" not in df.columns and "trade_date" in df.columns:
+            df = df.with_columns(pl.col("trade_date").alias("date"))
+        if "date" not in df.columns:
+            logger.warning("跳过写入 %s：缺少 date/trade_date 字段", table)
+            return
+        if df.schema.get("date") != pl.Date:
+            date_text = pl.col("date").cast(pl.Utf8)
+            df = df.with_columns(
+                pl.when(date_text.str.contains(r"^\d{8}$"))
+                .then(date_text.str.strptime(pl.Date, "%Y%m%d", strict=False))
+                .otherwise(date_text.str.strptime(pl.Date, strict=False))
+                .alias("date")
+            )
+        df = df.filter(pl.col("date").is_not_null())
+        if df.is_empty():
+            return
+
+        base = self.store.data_dir / table
+        with self._write_lock:
+            for date_df in df.partition_by("date"):
+                dt = date_df["date"][0]
+                ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+                out = base / f"date={ds}" / "part.parquet"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                if out.exists():
+                    existing = pl.read_parquet(out)
+                    if table == "auction_open" and "symbol" in existing.columns:
+                        existing = existing.with_columns(
+                            pl.col("symbol")
+                            .map_elements(_compact_symbol_for_name, return_dtype=pl.Utf8)
+                            .alias("symbol")
+                        ).filter(pl.col("symbol") != "")
+                    date_df = pl.concat([existing, date_df], how="diagonal_relaxed")
+                subset = [col for col in unique_subset if col in date_df.columns]
+                if subset:
+                    date_df = date_df.unique(
+                        subset=subset,
+                        keep="last",
+                        maintain_order=True,
+                    )
+                order = [col for col in (sort_cols or ["date", *subset]) if col in date_df.columns]
+                if order:
+                    date_df = date_df.sort(order)
+                self._atomic_write_parquet(date_df, out)
+
     def merge_live_daily_asset(self, asset_type: str, df: pl.DataFrame) -> None:
         """按 symbol 合并当天指定资产日K分区。用于少量自选实时，不覆盖全市场。"""
         if df.is_empty() or "date" not in df.columns:
@@ -2725,6 +3258,59 @@ class KlineRepository:
         )
         return df.join(metadata, on="symbol", how="left")
 
+    def merge_live_enriched_memory_asset(self, asset_type: str, df: pl.DataFrame) -> None:
+        """仅按 symbol 合并当天 enriched 内存缓存，不写 parquet。
+
+        用于数据同步/修复任务运行期间的实时行情刷新: 页面与监控可以读到新价,
+        但不会和重任务抢同一个分区文件。
+        """
+        if df.is_empty() or "date" not in df.columns:
+            return
+        dt = df["date"][0]
+        cache_df = self._with_instrument_metadata(asset_type, df)
+
+        if asset_type == "stock":
+            existing_cache = self._enriched_cache if self._enriched_cache_date == dt else pl.DataFrame()
+        elif asset_type == "etf":
+            existing_cache = self._etf_enriched_cache if self._etf_enriched_cache_date == dt else pl.DataFrame()
+        elif asset_type == "index":
+            existing_cache = self._index_enriched_cache if self._index_enriched_cache_date == dt else pl.DataFrame()
+        else:
+            return
+
+        merged_cache = cache_df
+        if existing_cache is not None and not existing_cache.is_empty():
+            merged_cache = pl.concat([existing_cache, cache_df], how="diagonal_relaxed").unique(
+                subset=["symbol", "date"], keep="last", maintain_order=True
+            )
+        merged_cache = merged_cache.sort(["symbol"])
+
+        if asset_type == "stock":
+            self._enriched_cache = merged_cache
+            self._enriched_cache_date = dt
+        elif asset_type == "etf":
+            self._etf_enriched_cache = merged_cache
+            self._etf_enriched_cache_date = dt
+        elif asset_type == "index":
+            self._index_enriched_cache = merged_cache
+            self._index_enriched_cache_date = dt
+
+    def flush_live_enriched_memory_asset(self, asset_type: str, df: pl.DataFrame) -> None:
+        """仅覆写当天 enriched 内存缓存，不写 parquet。"""
+        if df.is_empty() or "date" not in df.columns:
+            return
+        dt = df["date"][0]
+        cache_df = self._with_instrument_metadata(asset_type, df).sort(["symbol"])
+        if asset_type == "stock":
+            self._enriched_cache = cache_df
+            self._enriched_cache_date = dt
+        elif asset_type == "etf":
+            self._etf_enriched_cache = cache_df
+            self._etf_enriched_cache_date = dt
+        elif asset_type == "index":
+            self._index_enriched_cache = cache_df
+            self._index_enriched_cache_date = dt
+
     def merge_live_enriched_asset(self, asset_type: str, df: pl.DataFrame) -> None:
         """按 symbol 合并当天 enriched 分区和内存缓存。用于少量自选实时。"""
         if df.is_empty() or "date" not in df.columns:
@@ -2746,7 +3332,7 @@ class KlineRepository:
         merged_cache = cache_df
         if existing_cache is not None and not existing_cache.is_empty():
             merged_cache = pl.concat([existing_cache, cache_df], how="diagonal_relaxed").unique(
-                subset=["symbol", "date"], keep="last"
+                subset=["symbol", "date"], keep="last", maintain_order=True
             )
         merged_cache = merged_cache.sort(["symbol"])
 

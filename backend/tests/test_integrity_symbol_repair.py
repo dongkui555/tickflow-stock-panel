@@ -105,7 +105,7 @@ def _offline_env(tmp_path, monkeypatch):
     knobs = {"fail": [], "fix": [], "fix_day": TODAY, "keep": []}
 
     def _fake_batch(symbols, repo, capset, start_date=None, end_date=None,
-                    on_chunk_done=None, failed_out=None):
+                    on_chunk_done=None, failed_out=None, replace_existing=False):
         calls.append({"symbols": list(symbols)})
         if failed_out is not None and knobs["fail"]:
             failed_out.extend(knobs["fail"])

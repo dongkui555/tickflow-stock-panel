@@ -95,7 +95,8 @@ def test_fallback_window_counts_trading_days(tmp_path, monkeypatch, asset_type):
 
     live = repo.flushed[asset_type].sort("symbol")
     full = compute_enriched(bars).filter(pl.col("date") == TODAY).sort("symbol")
-    assert live["symbol"].to_list() == full["symbol"].to_list()
+    assert live["symbol"].to_list() == sorted(bars["symbol"].unique().to_list())
+    assert live["symbol"].str.split(".").list.first().to_list() == full["symbol"].to_list()
     for column in WINDOW_COLUMNS:
         assert full[column].null_count() == 0
         assert live[column].to_list() == pytest.approx(full[column].to_list(), rel=1e-12), column

@@ -1,7 +1,8 @@
 """能力注册表与能力路由矩阵 — 数据集维度的单一权威定义。
 
 能力 (capability) = 一个标准化数据集 (CONTRIBUTING「数据源插件化要求」):
-daily / adj_factor / realtime / minute / depth5 / financial (注册表顺序即设置页卡片顺序)。注册表集中声明每个
+daily / adj_factor / realtime / minute / depth5 / financial / moneyflow / auction / news
+(注册表顺序即设置页卡片顺序)。注册表集中声明每个
 能力的展示元数据、路由偏好字段与 TickFlow 档位要求, 前端设置页不再各自硬编码。
 depth5 与其他数据集一样可由插件声明并独立路由; 五档不可用时连板梯队封单/
 看板封单通过 usable 给出缺数据提示。
@@ -47,7 +48,7 @@ CAPABILITY_REGISTRY: list[dict] = [
     {
         "id": "realtime",
         "label": "实时行情",
-        "desc": "全市场实时快照",
+        "desc": "全市场或重点标的实时快照",
         "field": "realtime_data_provider",
         "default": "tickflow",
         "tf_tier": "starter",
@@ -67,6 +68,7 @@ CAPABILITY_REGISTRY: list[dict] = [
         "field": "depth5_data_provider",
         "default": "tickflow",
         "tf_tier": "pro",
+        # 内置插件可声明 depth5，并实现 get_depth5(symbols)。
     },
     {
         "id": "financial",
@@ -75,6 +77,36 @@ CAPABILITY_REGISTRY: list[dict] = [
         "field": "financial_data_provider",
         "default": "tickflow",
         "tf_tier": "expert",
+    },
+    {
+        "id": "moneyflow",
+        "label": "主力资金",
+        "desc": "主力/大单资金流向",
+        "field": "daily_data_provider",
+        "default": "tickflow",
+        "tf_tier": "expert",
+        "tickflow_supported": False,
+        # 增强数据跟随日线主数据源复用; Tushare 可批量落库 moneyflow。
+    },
+    {
+        "id": "auction",
+        "label": "集合竞价",
+        "desc": "开盘竞价量价",
+        "field": "daily_data_provider",
+        "default": "tickflow",
+        "tf_tier": "expert",
+        "tickflow_supported": False,
+        # 增强数据跟随日线主数据源复用; Tushare 可批量落库 stk_auction_o。
+    },
+    {
+        "id": "news",
+        "label": "新闻舆情",
+        "desc": "国内/海外新闻同步",
+        "field": "daily_data_provider",
+        "default": "tickflow",
+        "tf_tier": "expert",
+        "tickflow_supported": False,
+        # 国内历史新闻跟随 Tushare news; 海外历史新闻由 news_sync 的海外源补充。
     },
     {
         "id": "full_minute",
@@ -155,6 +187,7 @@ def build_capability_matrix(current: dict[str, str], tickflow_tier: str = "none"
     不进候选, 但偏好仍指向 tickflow 时以 tf_available=False 标记,
     供前端提示「档位不足」。未知档按 none 处理。
     """
+    from app.config import settings
     tier_base = _tier_base(tickflow_tier)
     tier_rank = _TIER_RANK.get(tier_base, -1)
     sources = _declared_sources()
@@ -163,7 +196,8 @@ def build_capability_matrix(current: dict[str, str], tickflow_tier: str = "none"
     for cap in CAPABILITY_REGISTRY:
         # field=None → 不可路由能力 (仅 TickFlow 提供, 无路由偏好), 生效源恒为默认
         effective = current.get(cap["field"], cap["default"]) if cap["field"] else cap["default"]
-        tf_available = tier_rank >= _TIER_RANK[cap["tf_tier"]]
+        tf_supported = bool(cap.get("tickflow_supported", True))
+        tf_available = tf_supported and tier_rank >= _TIER_RANK[cap["tf_tier"]]
         candidates: list[dict] = []
         pending: list[dict] = []
         if tf_available:
@@ -188,8 +222,10 @@ def build_capability_matrix(current: dict[str, str], tickflow_tier: str = "none"
             "field": cap["field"],
             "default": cap["default"],
             "tf_tier": cap["tf_tier"],
+            "tf_supported": tf_supported,
             "tf_available": tf_available,
             "usable": usable,
+            "backup_available": settings.public_market_fallback_enabled and cap["id"] in ("realtime", "depth5"),
             "current": effective,
             "current_display": _display_of(sources, effective),
             "effective": effective,

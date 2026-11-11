@@ -1219,8 +1219,13 @@ def _build_market_data_matrix_cache_from_dataset(
         try:
             os.replace(temporary, cache_path)
         except OSError:
-            if (cache_path / "manifest.json").exists():
+            # Windows 不允许把目录替换到已存在的目录。进程中断或并发
+            # 预热可能留下完整目标/残缺目标，分别处理，避免每次启动告警。
+            if (cache_path / "manifest.json").is_file():
                 shutil.rmtree(temporary, ignore_errors=True)
+            elif cache_path.is_dir():
+                shutil.rmtree(cache_path, ignore_errors=True)
+                os.replace(temporary, cache_path)
             else:
                 raise
     except BaseException:

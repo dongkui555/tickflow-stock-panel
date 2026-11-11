@@ -172,7 +172,7 @@ def test_in_process_backtests_share_capacity(capacity, monkeypatch, kind):
     ("/api/kline/repair_daily", {"start_date": "2026-01-01"},
      "app.services.repair_daily", "run_repair_daily", {}),
     ("/api/kline/rebuild_enriched", {}, "app.indicators.pipeline", "run_pipeline", 3),
-    ("/api/kline/sync_minute", {"days": 1},
+    ("/api/kline/sync_minute", {"days": 7, "scope": "manual", "symbols": ["600519.SH"]},
      "app.services.kline_sync", "sync_and_persist_minute", 3),
     ("/api/kline/repair_minute_gaps", {"symbols": ["600000.SH"]},
      "app.services.kline_sync", "sync_and_persist_minute", 3),
@@ -190,6 +190,9 @@ def test_api_jobs_wait_before_computing(
 
     def compute(*args, **kwargs):
         assert limiter.in_use == 2
+        if endpoint == "/api/kline/sync_minute":
+            assert args[0] == ["600519.SH"]
+            assert kwargs["days"] == 7
         entered.set()
         assert finish.wait(3)
         return result
@@ -198,6 +201,12 @@ def test_api_jobs_wait_before_computing(
     monkeypatch.setattr(pipeline, "job_store", store)
     monkeypatch.setattr("app.tickflow.pools.get_pool", lambda *args: [])
     monkeypatch.setattr(daily_pipeline, "_refresh_single_view", lambda *args: None)
+    def resolve_scope(*args, **kwargs):
+        assert limiter.in_use == 2
+        assert kwargs["scope"] == "manual"
+        return kwargs["symbols"], "测试范围"
+
+    monkeypatch.setattr("app.services.kline_sync.resolve_minute_sync_universe", resolve_scope)
     app = FastAPI()
     app.include_router(pipeline.router)
     app.include_router(kline.router)

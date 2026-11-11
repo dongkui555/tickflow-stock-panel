@@ -21,6 +21,7 @@ from pathlib import Path
 import polars as pl
 
 from app.market_time import cn_today
+from app.parquet import scan_parquet_compat
 from app.services.fs_utils import atomic_write_parquet
 
 logger = logging.getLogger(__name__)
@@ -105,9 +106,10 @@ def _compute_subscores(metrics: dict) -> dict:
     resilience = 100 - _score(metrics.get("strong_down_pct", 0), 2, 18)
 
     # 趋势维度
+    breadth = metrics.get("above_ma20_pct")
     trend = (
         _score(metrics.get("index_pct", 0) * 100, -2.5, 2.5) * 0.50  # 指数涨幅(对称)
-        + _score((metrics.get("above_ma20_pct", 0.5) or 0.5) * 100, 22, 76) * 0.50  # MA20上方 p15/p85
+        + _score((0.5 if breadth is None else breadth) * 100, 22, 76) * 0.50  # MA20上方 p15/p85
     )
 
     score = (
@@ -182,6 +184,10 @@ def _aggregate_daily(df: pl.DataFrame, index_pct_map: dict | None = None) -> pl.
 
     # 基础聚合 — 全部用 group_by 一次性向量化算出, 避免逐日 filter 扫全表(OOM/超时元凶)。
     has_ma20 = "close" in avail and "ma20" in avail
+    valid_ma20 = (
+        pl.col("ma20").is_finite() & (pl.col("ma20") > 0)
+        & pl.col("close").is_finite() & (pl.col("close") > 0)
+    ) if has_ma20 else pl.lit(False)
     grouped = df.group_by("date").agg(
         *[
             pl.col("change_pct").gt(0).sum().alias("up_count")
@@ -231,9 +237,9 @@ def _aggregate_daily(df: pl.DataFrame, index_pct_map: dict | None = None) -> pl.
         # 仅统计 ma20 有效(非空且>0)的行中, close>ma20 的占比。
         *(
             [
-                pl.when(pl.col("ma20").is_not_null() & (pl.col("ma20") > 0) & (pl.col("close") > pl.col("ma20")))
+                pl.when(valid_ma20 & (pl.col("close") > pl.col("ma20")))
                   .then(1).otherwise(None).sum().alias("_above_cnt"),
-                pl.when(pl.col("ma20").is_not_null() & (pl.col("ma20") > 0))
+                pl.when(valid_ma20)
                   .then(1).otherwise(None).sum().alias("_valid_cnt"),
             ]
             if has_ma20 else []
@@ -258,10 +264,10 @@ def _aggregate_daily(df: pl.DataFrame, index_pct_map: dict | None = None) -> pl.
         total = r.get("total_count", 0) or 0
         limit_up = r.get("limit_up", 0) or 0
         broken = r.get("broken_limit", 0) or 0
-        # MA20 上方占比: 来自向量化聚合 (None→0)
+        # No valid observations is unknown breadth, not a measured zero.
         valid_cnt = r.get("_valid_cnt") or 0
         above_cnt = r.get("_above_cnt") or 0
-        ma20_above = (above_cnt / valid_cnt) if valid_cnt > 0 else 0.0
+        ma20_above = (above_cnt / valid_cnt) if valid_cnt > 0 else None
         # 涨跌幅分布(占比, 0-100)
         up_pct = (up / total * 100) if total > 0 else 0.0
         down_pct = (down / total * 100) if total > 0 else 0.0
@@ -307,7 +313,8 @@ def _aggregate_daily(df: pl.DataFrame, index_pct_map: dict | None = None) -> pl.
             "down_count": down,
             "up_ratio": round(metrics["up_ratio"], 4),
             "index_pct": round(metrics["index_pct"], 4),
-            "above_ma20_pct": round(ma20_above, 4),
+            "above_ma20_pct": round(ma20_above, 4) if ma20_above is not None else None,
+            "ma20_valid_count": valid_cnt,
             "total_amount": metrics["total_amount"],
             "avg_turnover": metrics["avg_turnover"],
             # 新增列(供未来策略按强势股占比等过滤)
@@ -341,14 +348,34 @@ def _compute_batch(repo, enriched_dir, instruments, historical_shares,
     warmup 前缀保证每批边界的滚动窗口指标(ma20)正确, 不依赖相邻批次。
     返回目标区间(不含 warmup)的含指标列 DataFrame。
     """
-    from datetime import timedelta
     from app.indicators.pipeline import compute_indicators, compute_limit_signals
-    warmup_start = batch_start - timedelta(days=warmup_days)
-    df = pl.scan_parquet(enriched_dir / "**" / "*.parquet").filter(
-        (pl.col("date") >= warmup_start) & (pl.col("date") <= batch_end)
-    ).collect()
+    # Explicit partitions avoid scanning every historical parquet on each small update.
+    folders = sorted(p for p in enriched_dir.glob("date=????-??-??")
+                     if p.name[5:] <= str(batch_end))
+    prefix = [p for p in folders if p.name[5:] < str(batch_start)][-warmup_days:]
+    targets = [p for p in folders if p.name[5:] >= str(batch_start)]
+    files = [f for p in prefix + targets for f in p.glob("*.parquet")]
+    if not files:
+        return pl.DataFrame()
+    df = scan_parquet_compat(files).collect()
     if df.is_empty():
         return pl.DataFrame()
+    # A fixed number of market partitions can contain fewer than 19 prior
+    # observations for a stock with gaps. Match compute_indicators' last-20
+    # observations contract without letting the batch boundary change its MA.
+    target_symbols = df.filter(pl.col("date") >= batch_start)["symbol"].unique()
+    warmed = df.filter(pl.col("date") < batch_start).group_by("symbol").len().filter(
+        pl.col("len") >= 19)["symbol"]
+    sparse = sorted(set(target_symbols.to_list()) - set(warmed.to_list()))
+    history_files = [f for p in folders if p.name[5:] < str(batch_start) for f in p.glob("*.parquet")]
+    if sparse and len(history_files) > len([f for p in prefix for f in p.glob("*.parquet")]):
+        extra = (scan_parquet_compat(history_files).filter(pl.col("symbol").is_in(sparse))
+                 .sort(["symbol", "date"]).group_by("symbol", maintain_order=True)
+                 .tail(max(20, warmup_days)).collect())
+        df = pl.concat([
+            df.filter(~(pl.col("symbol").is_in(sparse) & (pl.col("date") < batch_start))),
+            extra,
+        ], how="diagonal_relaxed")
     # 新评分模型只需 change_pct(赚钱/抗跌维) + ma20(趋势维); 不再需要 vol_ratio_5d
     # (compute_limit_signals 文档虽提及但函数体未实际使用, 已验证可安全省去 → 省内存)
     df = compute_indicators(df, needed={"change_pct", "ma20"})
@@ -368,7 +395,11 @@ def _compute_batch(repo, enriched_dir, instruments, historical_shares,
 
 def _filter_excluded_symbols(df: pl.DataFrame, excluded_symbols: list[str]) -> pl.DataFrame:
     if excluded_symbols and "symbol" in df.columns:
-        return df.filter(~pl.col("symbol").str.to_uppercase().is_in(excluded_symbols))
+        from app.indicators.pipeline import _factor_symbol_key_expr, _symbol_key_value
+
+        keys = [_symbol_key_value(s) for s in excluded_symbols]
+        return (df.with_columns(_factor_symbol_key_expr("symbol", "_risk_code"))
+                .filter(~pl.col("_risk_code").is_in(keys)).drop("_risk_code"))
     return df
 
 
@@ -469,6 +500,14 @@ def run_regime_batch(repo, start: date, end: date) -> pl.DataFrame:
     if start > end:
         return pl.DataFrame()
 
+    # Aggregate each bounded batch immediately, not hundreds of days of wide stock rows.
+    dates = sorted(d for d in enriched_date_set(repo) if start <= d <= end)
+    if len(dates) > 10:
+        parts = [run_regime_batch(repo, dates[i], dates[min(i + 9, len(dates) - 1)])
+                 for i in range(0, len(dates), 10)]
+        return pl.concat([p for p in parts if not p.is_empty()], how="diagonal_relaxed") if any(
+            not p.is_empty() for p in parts) else pl.DataFrame()
+
     # 指数涨幅(主力指数)
     index_pct_map = _load_index_pct(repo, start, end)
 
@@ -490,7 +529,11 @@ def run_regime_batch(repo, start: date, end: date) -> pl.DataFrame:
     # enriched 多日数据(优先缓存)。慢路径在每批内部完成过滤和日级聚合,
     # 避免把所有批次的个股明细同时保留到最终 group_by。
     df = repo.get_enriched_range(start, end)
-    if df is None or df.is_empty():
+    incomplete = df is not None and not df.is_empty() and (
+        not {"change_pct", "ma20"}.issubset(df.columns)
+        or not df.select((pl.col("ma20").is_finite() & (pl.col("ma20") > 0)).any()).item()
+    )
+    if df is None or df.is_empty() or incomplete:
         logger.info("regime batch: enriched cache miss [%s~%s], fallback to scan", start, end)
         result = _scan_enriched_fallback(
             repo,
@@ -625,6 +668,31 @@ def get_regime_coverage(data_dir: Path) -> dict:
     }
 
 
+def _source_state(data_dir):
+    import json
+    path = data_dir / REGIME_DIR / "sources.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    p = regime_path(data_dir)
+    return {"legacy_mtime_ns": p.stat().st_mtime_ns if p.exists() else 0, "dates": {}}
+
+
+def _source_stamp(data_dir, day):
+    files = list((data_dir / "kline_daily_enriched" / f"date={day}").glob("*.parquet"))
+    files += list((data_dir / "kline_index_daily" / f"date={day}").glob("*.parquet"))
+    return {str(p.relative_to(data_dir)): [p.stat().st_mtime_ns, p.stat().st_size] for p in files}
+
+
+def _save_source_state(data_dir, state):
+    import json
+    import os
+    path = data_dir / REGIME_DIR / "sources.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(state), encoding="utf-8")
+    os.replace(temp, path)
+
+
 def detect_stale_dates(data_dir: Path, repo) -> list[date]:
     """检测 regime 已有但需要重算的天(enriched 被覆写)。
 
@@ -634,7 +702,7 @@ def detect_stale_dates(data_dir: Path, repo) -> list[date]:
     regime_p = regime_path(data_dir)
     if not regime_p.exists():
         return []
-    regime_mtime = regime_p.stat().st_mtime
+    state = _source_state(data_dir)
     enriched_dir = repo.store.data_dir / "kline_daily_enriched"
     if not enriched_dir.exists():
         return []
@@ -652,7 +720,10 @@ def detect_stale_dates(data_dir: Path, repo) -> list[date]:
         if d not in existing_dates:
             continue
         try:
-            if part.stat().st_mtime > regime_mtime:
+            stamp = _source_stamp(data_dir, d)
+            old = state["dates"].get(str(d))
+            if (stamp != old if old is not None else any(
+                    v[0] > state["legacy_mtime_ns"] for v in stamp.values())):
                 stale.append(d)
         except OSError:
             continue
@@ -676,7 +747,8 @@ def latest_phase_transition(data_dir: Path) -> tuple[str, str, str] | None:
     return prev_phase, cur_phase, str(tail["date"][-1])
 
 
-def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = None) -> pl.DataFrame:
+def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = None,
+                               target_dates=None, on_progress=None) -> pl.DataFrame:
     """增量计算 regime(供 daily_pipeline / 启动补算调用)。
 
     双检测: 1) 缺口(enriched 有但 regime 没有) 2) stale(enriched 被覆写)。
@@ -691,20 +763,44 @@ def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = Non
     missing = sorted(d for d in enriched_dates if d not in existing_dates and d <= today)
 
     # stale: enriched 覆写过
-    stale = detect_stale_dates(data_dir, repo)
+    stale = detect_stale_dates(data_dir, repo) if target_dates is None else []
 
-    to_compute = sorted(set(missing) | set(stale))
+    requested = set(missing) | set(stale) if target_dates is None else set(target_dates)
+    to_compute = sorted(d for d in requested & enriched_dates if d <= today)
     if not to_compute:
         logger.debug("regime incremental: nothing to compute")
         return pl.DataFrame()
 
     logger.info("regime incremental: compute %d days (missing=%d, stale=%d)",
                 len(to_compute), len(missing), len(stale))
-    new_rows = run_regime_batch(repo, start=to_compute[0], end=to_compute[-1])
-    if not new_rows.is_empty():
-        upsert_regime_history(data_dir, new_rows)
-        refresh_phase_labels(data_dir)
-    return new_rows
+    # Split at unaffected sessions too: min/max of sparse dates must not expand the scope.
+    positions = {d: i for i, d in enumerate(sorted(enriched_dates))}
+    batches = []
+    for d in to_compute:
+        if not batches or len(batches[-1]) == 10 or positions[d] != positions[batches[-1][-1]] + 1:
+            batches.append([])
+        batches[-1].append(d)
+    state = _source_state(data_dir)
+    _save_source_state(data_dir, state)  # Freeze legacy watermark before writing recent rows.
+    parts = []
+    done = 0
+    for batch in batches:
+        if on_progress:
+            on_progress(done, len(to_compute), f"{batch[0]} ~ {batch[-1]}")
+        stamps = {str(d): _source_stamp(data_dir, d) for d in batch}
+        new_rows = run_regime_batch(repo, start=batch[0], end=batch[-1])
+        if not new_rows.is_empty():
+            new_rows = new_rows.filter(pl.col("date").is_in(batch))
+            upsert_regime_history(data_dir, new_rows)
+            for d in new_rows["date"].to_list():
+                state["dates"][str(d)] = stamps[str(d)]
+            _save_source_state(data_dir, state)
+            parts.append(new_rows)
+        done += len(batch)
+        if on_progress:
+            on_progress(done, len(to_compute), f"{batch[0]} ~ {batch[-1]}")
+    refresh_phase_labels(data_dir)
+    return pl.concat(parts, how="diagonal_relaxed") if parts else pl.DataFrame()
 
 
 def enriched_date_set(repo) -> set[date]:

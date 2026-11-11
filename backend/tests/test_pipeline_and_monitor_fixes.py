@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import polars as pl
 import pytest
 
@@ -49,6 +51,61 @@ def test_create_new_after_terminal(monkeypatch, tmp_path):
     jid2, new2 = store.create()
     assert jid2 != jid1
     assert new2 is True
+
+
+def test_reap_stale_keeps_long_running_job_with_recent_progress(tmp_path):
+    """总时长很长但仍有进度时, 不应被误判为卡死。"""
+    store = JobStore(store_dir=tmp_path / "jobs")
+    jid, _ = store.create(timeout_s=10)
+    store.start(jid)
+    with store._lock:
+        job = store._active_jobs[jid]
+        job["started_at"] = (datetime.utcnow() - timedelta(hours=2)).isoformat(timespec="seconds") + "Z"
+        job["last_progress_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    store.reap_stale()
+
+    assert store.get(jid)["status"] == "running"
+
+
+def test_reap_stale_fails_job_when_progress_is_old(tmp_path):
+    """只有长时间没有进度更新时才回收任务。"""
+    store = JobStore(store_dir=tmp_path / "jobs")
+    jid, _ = store.create(timeout_s=1)
+    store.start(jid)
+    with store._lock:
+        job = store._active_jobs[jid]
+        old = (datetime.utcnow() - timedelta(seconds=30)).isoformat(timespec="seconds") + "Z"
+        job["started_at"] = old
+        job["last_progress_at"] = old
+
+    store.reap_stale()
+
+    job = store.get(jid)
+    assert job["status"] == "failed"
+    assert "进度停滞" in job["error"]
+
+
+def test_reap_stale_does_not_release_active_run_slot(tmp_path):
+    """疑似卡死的底层线程可能仍活着, 回收 job 不应放开并发执行槽。"""
+    pipeline_jobs.release_run_slot()
+    assert pipeline_jobs.try_acquire_run_slot() is True
+    try:
+        store = JobStore(store_dir=tmp_path / "jobs")
+        jid, _ = store.create(timeout_s=1)
+        store.start(jid)
+        with store._lock:
+            job = store._active_jobs[jid]
+            old = (datetime.utcnow() - timedelta(seconds=30)).isoformat(timespec="seconds") + "Z"
+            job["started_at"] = old
+            job["last_progress_at"] = old
+
+        store.reap_stale()
+
+        assert store.get(jid)["status"] == "failed"
+        assert pipeline_jobs.try_acquire_run_slot() is False
+    finally:
+        pipeline_jobs.release_run_slot()
 
 
 def test_run_slot_is_exclusive():

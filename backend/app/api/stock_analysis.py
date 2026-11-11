@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from app.indicators.levels import compute_levels, summarize_levels
 from app.market_time import cn_today
 from app.services import stock_reports
+from app.services.provider_fallback import load_daily_from_active_provider
 from app.services.ndjson_heartbeat import with_heartbeat
 from app.services.stock_analyzer import analyze_stock_stream
 
@@ -126,6 +127,8 @@ def get_levels(
     # 按资产类型分流: ETF/指数走独立 enriched 存储, 股票保持原路径
     df = repo.get_daily_asset(repo.resolve_asset_type(symbol), symbol, start, end)
     if df.is_empty():
+        df = load_daily_from_active_provider(symbol, days=days)
+    if df.is_empty():
         return {"levels": {"sr": [], "pivot": [], "extreme": [],
                            "boll": [], "keltner_s": [], "keltner_m": [], "keltner_l": [],
                            "atr_stop": [], "gap": [], "fib": [], "round": []},
@@ -151,6 +154,7 @@ class AnalyzeRequest(BaseModel):
     """AI 个股分析请求。"""
     symbol: str
     focus: str = ""  # 可选:用户追加的分析关注点
+    mode: str = "multi_agent"  # quick | multi_agent
 
 
 @router.post("/analyze")
@@ -167,7 +171,7 @@ async def analyze_stock(request: Request, req: AnalyzeRequest):
     data_dir = repo.store.data_dir
 
     async def stream_gen():
-        async for chunk in with_heartbeat(analyze_stock_stream(repo, data_dir, req.symbol, req.focus)):
+        async for chunk in with_heartbeat(analyze_stock_stream(repo, data_dir, req.symbol, req.focus, req.mode)):
             yield chunk + "\n"
 
     return StreamingResponse(
@@ -186,6 +190,7 @@ class SaveReportRequest(BaseModel):
     symbol: str
     name: str = ""
     focus: str = ""
+    analysis_mode: str = "multi_agent"
     content: str
     summary: str = ""
     close: float | None = None
@@ -205,6 +210,7 @@ def save_report(request: Request, req: SaveReportRequest):
         "symbol": req.symbol,
         "name": req.name,
         "focus": req.focus,
+        "analysis_mode": req.analysis_mode,
         "content": req.content,
         "summary": req.summary,
         "close": req.close,

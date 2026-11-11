@@ -37,18 +37,23 @@ def test_registry_covers_all_routing_fields():
     """注册表是能力的单一权威: 可路由能力与偏好键一一对应、无重复;
     full_minute 为不可路由能力 (field=None, 仅 TickFlow Expert 提供)。"""
     routable = [c["field"] for c in CAPABILITY_REGISTRY if c["field"] is not None]
-    assert sorted(routable) == sorted(DEFAULT_CURRENT)
-    assert len(set(routable)) == len(routable)
+    assert set(DEFAULT_CURRENT).issubset(set(routable))
     assert {c["id"] for c in CAPABILITY_REGISTRY} == {
         "realtime", "daily", "minute", "full_minute", "depth5", "adj_factor", "financial",
+        "moneyflow", "auction", "news",
     }
     full_minute = next(c for c in CAPABILITY_REGISTRY if c["id"] == "full_minute")
     assert full_minute["field"] == "full_minute_data_provider"
     assert full_minute["tf_tier"] == "expert"
+    follow_daily = {c["id"] for c in CAPABILITY_REGISTRY if c["field"] == "daily_data_provider"}
+    assert {"daily", "moneyflow", "auction", "news"}.issubset(follow_daily)
     for cap in CAPABILITY_REGISTRY:
         assert cap["default"] == "tickflow"
         assert cap["tf_tier"] in ("none", "starter", "pro", "expert")
         assert "follow" not in cap
+    for cap in CAPABILITY_REGISTRY:
+        if cap["id"] in {"moneyflow", "auction", "news"}:
+            assert cap["tickflow_supported"] is False
 
 
 def test_matrix_without_third_party_sources(monkeypatch):
@@ -56,13 +61,19 @@ def test_matrix_without_third_party_sources(monkeypatch):
     _fake_sources(monkeypatch, [])
     matrix = build_capability_matrix(dict(DEFAULT_CURRENT), tickflow_tier="expert")
     assert matrix["tickflow_tier"] == "expert"
-    assert len(matrix["capabilities"]) == 7
+    assert len(matrix["capabilities"]) == 10
     for cap in matrix["capabilities"]:
         names = [c["name"] for c in cap["candidates"]]
-        assert names == ["tickflow"]
-        assert cap["candidates"][0]["kind"] == "builtin"
-        assert cap["tf_available"] is True
-        assert cap["usable"] is True
+        if cap["id"] in {"moneyflow", "auction", "news"}:
+            assert names == []
+            assert cap["tf_supported"] is False
+            assert cap["tf_available"] is False
+            assert cap["usable"] is False
+        else:
+            assert names == ["tickflow"]
+            assert cap["candidates"][0]["kind"] == "builtin"
+            assert cap["tf_available"] is True
+            assert cap["usable"] is True
         assert cap["pending"] == []
         assert cap["current"] == cap["effective"] == "tickflow"
 
@@ -96,7 +107,7 @@ def test_tickflow_candidates_filtered_by_tier(monkeypatch):
     caps = _by_id(build_capability_matrix(dict(DEFAULT_CURRENT), tickflow_tier="free"))
     assert caps["daily"]["tf_available"] is True
     assert [c["name"] for c in caps["daily"]["candidates"]] == ["tickflow"]
-    for cap_id in ("realtime", "minute", "depth5", "adj_factor", "financial"):
+    for cap_id in ("realtime", "minute", "depth5", "adj_factor", "financial", "moneyflow", "auction", "news"):
         assert caps[cap_id]["tf_available"] is False
         assert [c["name"] for c in caps[cap_id]["candidates"]] == []
     # starter 解锁实时与除权, 分钟/五档/财务仍锁
@@ -176,6 +187,36 @@ def test_unknown_or_empty_tier_fails_closed(monkeypatch):
         assert caps["realtime"]["tf_available"] is False
         assert caps["realtime"]["candidates"] == []
         assert caps["minute"]["tf_available"] is False
+
+
+def test_enhanced_datasets_follow_daily_provider(monkeypatch):
+    """资金/竞价/新闻增强数据复用日线源: 日线切到 Tushare 后三类能力同步可用。"""
+    _fake_sources(
+        monkeypatch,
+        [
+            {
+                "name": "tushare",
+                "display_name": "Tushare",
+                "datasets": ["daily", "moneyflow", "auction", "news"],
+                "available": True,
+                "status": "ok",
+            },
+        ],
+    )
+    caps = _by_id(
+        build_capability_matrix(
+            dict(DEFAULT_CURRENT, daily_data_provider="tushare"),
+            tickflow_tier="free",
+        ),
+    )
+    for cap_id in ("moneyflow", "auction", "news"):
+        cap = caps[cap_id]
+        assert cap["field"] == "daily_data_provider"
+        assert cap["current"] == cap["effective"] == "tushare"
+        assert cap["tf_supported"] is False
+        assert cap["tf_available"] is False
+        assert [c["name"] for c in cap["candidates"]] == ["tushare"]
+        assert cap["usable"] is True
 
 
 def test_adj_factor_routes_independently(monkeypatch):

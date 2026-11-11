@@ -32,10 +32,10 @@ def apply_historical_float_shares(
 ) -> pl.DataFrame:
     """为行情行解析有效流通股本。
 
-    当日保留 rows.float_shares；历史日期使用公告日不晚于交易日的最新股本，
-    找不到历史记录时继续使用 rows.float_shares。
+    当日优先保留 rows.float_shares；缺失时同样使用公告日不晚于交易日的
+    最新股本。找不到历史记录时继续使用 rows.float_shares。
     """
-    required = {"symbol", "date", "float_shares"}
+    required = {"symbol", "date"}
     if (
         rows.is_empty()
         or not required <= set(rows.columns)
@@ -44,6 +44,8 @@ def apply_historical_float_shares(
         or not {"symbol", "period_end", "float_shares"} <= set(shares.columns)
     ):
         return rows
+    if "float_shares" not in rows.columns:
+        rows = rows.with_columns(pl.lit(None, dtype=pl.Float64).alias("float_shares"))
 
     def as_date_expr(column: str) -> pl.Expr:
         dtype = shares.schema[column]
@@ -92,7 +94,11 @@ def apply_historical_float_shares(
             check_sortedness=False,
         )
         .with_columns(
-            pl.when(pl.col("_share_trade_date") == pl.lit(today))
+            pl.when(
+                (pl.col("_share_trade_date") == pl.lit(today))
+                & pl.col("float_shares").is_not_null()
+                & (pl.col("float_shares") > 0)
+            )
             .then(pl.col("float_shares"))
             .otherwise(
                 pl.coalesce("_historical_float_shares", "float_shares")

@@ -113,6 +113,7 @@ export function Indices() {
   const syncDaily = useMutation({
     mutationFn: () => api.syncIndexDaily(365),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: QK.maintenanceQueue })
       qc.invalidateQueries({ queryKey: QK.indexQuotes })
       qc.invalidateQueries({ queryKey: ['index-daily'] })
     },
@@ -193,6 +194,14 @@ export function Indices() {
         </div>
       </div>
 
+      {syncDaily.data?.index_sync && (
+        <p className="mb-3 text-xs text-secondary" role="status">
+          已完成 {syncDaily.data.index_sync.completed_count}/{syncDaily.data.index_sync.total_count} 只，
+          未完成 {syncDaily.data.index_sync.remaining_count} 只。
+          {syncDaily.data.status === 'queued' ? '缺口已加入增量队列。' : '所选区间已完整。'}
+        </p>
+      )}
+      {syncDaily.isError && <p className="mb-3 text-xs text-danger" role="alert">{syncDaily.error.message}</p>}
       <div className="grid grid-cols-[15rem_1fr] gap-4">
         <aside className="rounded-card border border-border bg-surface p-3">
           <div className="mb-2 px-1 text-[11px] uppercase tracking-wider text-muted">核心指数</div>

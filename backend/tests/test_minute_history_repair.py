@@ -34,6 +34,9 @@ def session(symbol=SYM, day=DAY):
 
 @pytest.fixture
 def market(tmp_path, monkeypatch):
+    path = tmp_path / "instruments" / "instruments.parquet"
+    path.parent.mkdir()
+    pl.DataFrame({"symbol": [SYM, "000001.SZ"], "code": [SYM[:6], "000001"]}).write_parquet(path)
     repo = KlineRepository(DataStore(tmp_path))
     caps = CapabilitySet()
     caps.grant(Cap.KLINE_MINUTE_BATCH)
@@ -118,7 +121,9 @@ def test_legacy_migration_keeps_published_bars_and_unreadable_source(market):
     kline_sync._migrate_symbol_to_date_partition(repo)
     kline_sync._migrate_symbol_to_date_partition(repo)
     df = pl.read_parquet(folder / f"date={DAY}" / "part.parquet")
-    assert df.filter(pl.col("symbol") != SYM).equals(other)
+    other_stored = df.filter(pl.col("symbol") != SYM)
+    assert other_stored.select(other.columns).equals(other)
+    assert other_stored["exchange"].to_list() == ["SZ"]
     prices = df.filter(pl.col("symbol") == SYM)["close"].to_list()
     assert prices == [5.0] * 120 + [9.0] * 120
     assert not old.exists()

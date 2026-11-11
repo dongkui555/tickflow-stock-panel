@@ -148,6 +148,37 @@ def test_timeseries_exact_date_alignment(data_dir):
     assert by_key[("000001.SZ", "2026-01-07")] is None
 
 
+def test_timeseries_uses_configured_ts_code_identity(data_dir):
+    cfg = _mk_config(data_dir, cid="tushare", mode="timeseries", fields=[
+        ExtField(name="ts_code", dtype="string"),
+        ExtField(name="hot", dtype="float"),
+    ])
+    cfg.symbol_map = {"type": "mapped", "col": "ts_code"}
+    ExtConfigStore(data_dir).upsert(cfg)
+    raw_dir = data_dir / "ext_data" / cfg.id / "timeseries" / "date=2026-01-05"
+    raw_dir.mkdir(parents=True)
+    pl.DataFrame({"ts_code": ["600000.SH"], "hot": [0.8]}).write_parquet(raw_dir / "part.parquet")
+
+    frame = _frame([("600000.SH", "2026-01-05", 10.0)])
+    out = ext_factors.attach_ext_columns(frame, include_snapshot=False, data_dir=data_dir)
+    assert out["ext_tushare_hot"].to_list() == [0.8]
+
+
+def test_market_level_extension_is_skipped_without_warning(data_dir):
+    cfg = ExtConfig(
+        id="market", label="市场", mode="timeseries", market_level=True,
+        fields=[ExtField(name="trade_date", dtype="string"), ExtField(name="breadth", dtype="float")],
+    )
+    ExtConfigStore(data_dir).upsert(cfg)
+    raw_dir = data_dir / "ext_data" / cfg.id / "timeseries" / "date=2026-01-05"
+    raw_dir.mkdir(parents=True)
+    pl.DataFrame({"trade_date": ["2026-01-05"], "breadth": [0.6]}).write_parquet(raw_dir / "part.parquet")
+
+    frame = _frame([("600000.SH", "2026-01-05", 10.0)])
+    out = ext_factors.attach_ext_columns(frame, include_snapshot=False, data_dir=data_dir)
+    assert out.columns == frame.columns
+
+
 def test_timeseries_no_lookahead_across_dates(data_dir):
     """历史帧只能看到各日期自己的值: d2 的高值不得泄露到 d1 行。"""
     cfg = _mk_config(data_dir, mode="timeseries")

@@ -216,6 +216,8 @@ def test_unknown_verdict_retries_after_short_ttl(monkeypatch):
     monkeypatch.setattr(trading_day, "_probe_fuyao", _counting_probe)
     monkeypatch.setattr(trading_day, "_probe_tickflow", lambda now: None)  # 隔离真实网络
     assert is_trading_day(monday) is None
+    assert is_trading_day(monday) is None
+    assert calls["n"] == 1  # unknown 也要短 TTL 缓存, 避免无权限时每轮打探针
     # 手动把缓存时间拨回 10 分钟前 (超过 unknown TTL 300s) → 重探
     with trading_day._CACHE_LOCK:
         trading_day._CACHE.probed_at -= 600

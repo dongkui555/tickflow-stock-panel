@@ -1,0 +1,8 @@
+name: qmt
+display_name: "国信 QMT（内部策略实时桥）"
+runtime: python
+entry: app.plugins.qmt.provider:QmtProvider
+check: app.plugins.qmt.bridge:availability
+datasets: [minute, realtime, depth5, auction]
+description: "由 iQuant 内部 ContextInfo 策略推送实时行情并本地聚合分钟K、当日日K和开盘竞价；Tushare/Promax 仍负责权威历史数据。"
+install_hint: "运行 tools/qmt_bridge/start_qmt_bridge.ps1 后，在 iQuant 策略开发中导入并以1分钟模拟模式运行 iquant_context_collector.py。逐笔委托、撤单和逐笔成交仍需沪深L2权限。"

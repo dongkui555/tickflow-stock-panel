@@ -126,7 +126,7 @@ def test_index_live_write_without_monitor_rules(monkeypatch) -> None:
     monkeypatch.setattr(
         qs,
         "_flush_live_enriched",
-        lambda df, extra=None, asset_type="stock", merge=False: flush_calls.append(
+        lambda df, extra=None, asset_type="stock", merge=False, memory_only=False: flush_calls.append(
             (asset_type, merge, df["symbol"].to_list())
         ),
     )

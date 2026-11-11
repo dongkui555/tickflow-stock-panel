@@ -45,8 +45,11 @@ def app_env(tmp_path, monkeypatch):
 
     app = FastAPI()
     app.include_router(data.router)
+    path = tmp_path / "instruments" / "instruments.parquet"
+    path.parent.mkdir()
+    pl.DataFrame({"symbol": ["600001.SH"], "code": ["600001"]}).write_parquet(path)
     app.state.repo = KlineRepository(DataStore(tmp_path))
-    monkeypatch.setattr(app.state.repo, "get_instruments_asset", lambda asset: pl.DataFrame({"symbol": ["600001.SH"]}))
+    monkeypatch.setattr(app.state.repo, "get_instruments_asset", lambda asset: pl.DataFrame({"symbol": ["600001.SH"], "code": ["600001"]}))
     app.state.capabilities = SimpleNamespace(has=lambda cap: True)
     app.state.quote_service = SimpleNamespace(paused=pause)
     return app, store, tmp_path, paused

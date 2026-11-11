@@ -38,8 +38,10 @@ export const QK = {
   soundPacks:     ['sound-packs'] as const,
   dataSources:    ['data-sources'] as const,
   capabilityMatrix: ['capability-matrix'] as const,
+  backupRoutes:  ['backup-routes'] as const,
   quoteStatus:    ['quote-status'] as const,
   quoteInterval:  ['quote-interval'] as const,
+  wecomBotStatus: ['wecom-bot-status'] as const,
   overviewMarket: (asOf?: string) => ['overview-market', asOf ?? 'latest'] as const,
   indexQuotes:    ['index-quotes'] as const,
 
@@ -53,6 +55,11 @@ export const QK = {
   abnormalOverview:     (minCloseness: number, limit: number) => ['abnormal-overview', minCloseness, limit] as const,
   // 盘中异动信号聚合 (异动监控「盘中」tab)
   abnormalIntraday:     (limit: number) => ['abnormal-intraday', limit] as const,
+  // 两套资金监控: 日级 moneyflow 确认 + 盘中分钟K估算
+  fundMonitorDaily:     (window: number, limit: number, minScore: number, signal: string) =>
+                           ['fund-monitor', 'daily', window, limit, minScore, signal] as const,
+  fundMonitorIntraday:  (limit: number, minScore: number, signal: string) =>
+                           ['fund-monitor', 'intraday', limit, minScore, signal] as const,
   // 不用 watchlist- 前缀: 日K历史盘中几乎不变, 若被 SSE quotes_updated 高频失效
   // (expert 1s) 会导致全自选日K每秒重拉, staleTime 形同虚设。
   // 刷新点: staleTime 过期 + Watchlist 增删自选/改蜡烛天数时的手动失效;
@@ -66,6 +73,29 @@ export const QK = {
   // (见 lib/minuteBatchIncremental.ts)。
   minuteBatch:          () => ['minute-batch'] as const,
   instrumentSearch:     (q: string, assetTypes?: string) => ['instrument-search', q, assetTypes ?? 'stock'] as const,
+
+  // StockFormer
+  stockformerModels:    ['stockformer-models'] as const,
+  stockformerDailyShadow: ['stockformer-daily-shadow'] as const,
+  stockformerFrozenPairShadow: ['stockformer-frozen-pair-shadow'] as const,
+  stockformerDecisionPairShadow: ['stockformer-decision-pair-shadow'] as const,
+  stockformerRepairedPairShadow: ['stockformer-repaired-pair-shadow'] as const,
+  stockformerMultiperiod: ['stockformer-multiperiod'] as const,
+  stockformerPredictions: (modelId?: string, asOf?: string, limit?: number) =>
+                           ['stockformer-predictions', modelId ?? 'latest', asOf ?? 'latest', limit ?? 100] as const,
+  stockformerMultifactor: (modelId?: string, asOf?: string, limit?: number) =>
+                           ['stockformer-multifactor', modelId ?? 'latest', asOf ?? 'latest', limit ?? 100] as const,
+  stockformerFactor:    (modelId?: string, horizon?: number) =>
+                           ['stockformer-factor', modelId ?? 'latest', horizon ?? 5] as const,
+  stockformerOos:       (modelId?: string, maxPositions?: number, holdingDays?: number) =>
+                           ['stockformer-oos', modelId ?? 'latest', maxPositions ?? 3, holdingDays ?? 5] as const,
+  globalRisk:           ['short-term-ai', 'global-risk'] as const,
+  predictionWorkflow:   ['short-term-ai', 'prediction-workflow'] as const,
+  shortTermAi:          (profile?: string, modelId?: string, asOf?: string, limit?: number) =>
+                           ['short-term-ai', profile ?? 'balanced', modelId ?? 'latest', asOf ?? 'latest', limit ?? 30] as const,
+  shortTermAISectorPredictions: (asOf?: string, days?: number, limit?: number, origin = 'published') =>
+                           ['short-term-ai', 'sector-predictions', asOf ?? 'latest', days ?? 8, limit ?? 30, origin] as const,
+  sectorResearch: (experiment = 'baseline') => ['short-term-ai', 'sector-research', experiment] as const,
 
   // Screener
   screener:             ['screener'] as const,
@@ -88,7 +118,7 @@ export const QK = {
   backtestStatus:       ['backtest-status'] as const,
   backtestCandidates:   ['backtest-candidates'] as const,
   factorColumns:        ['backtest-factor-columns'] as const,
-  factorLibrary:        (assetType: string) => ['factors-library', assetType] as const,
+  factorLibrary:        (assetType?: string) => ['factors-library', assetType ?? 'all'] as const,
   /** 统一定义目录 (信号+因子, P4) — 定义选择器数据源 */
   definitions:          ['definitions'] as const,
   resourceCatalog:      ['resource-catalog'] as const,
@@ -116,6 +146,7 @@ export const QK = {
   /** 分钟数据缺口体检 (发现本地分区中不完整的 标的×交易日) */
   minuteGaps:           ['minute-gaps'] as const,
   pipelineJobs:         ['pipeline-jobs'] as const,
+  maintenanceQueue:     ['maintenance-queue'] as const,
   pipelineJob:          (id: string) => ['pipeline-job', id] as const,
   extData:              ['ext-data'] as const,
   extDataRows:          (id: string, date?: string, limit?: number, columns?: string) => ['ext-data-rows', id, date, limit, columns] as const,
@@ -139,6 +170,8 @@ export const QK = {
                              ['kline-minute', symbol, date] as const,
   klineMinuteRange:     (symbol: string, days: number) =>
                              ['kline-minute-range', symbol, days] as const,
+  klineMinuteBars:      (symbol: string, period: number, days: number) =>
+                             ['kline-minute-bars', symbol, period, days] as const,
   indexDaily:           (symbol: string, start: string, end: string) =>
                              ['index-daily', symbol, start, end] as const,
   indexMinute:          (symbol: string, date: string) =>
@@ -174,6 +207,11 @@ export const QK = {
 
   // AI 大盘复盘
   reviewReports:        ['review-reports'] as const,
+
+  // AI Agents 增强
+  aiagentsHealth:        ['aiagents-health'] as const,
+  aiagentsHoldings:      ['aiagents-holdings'] as const,
+  aiagentsPaper:         ['aiagents-paper'] as const,
 
   // 概念涨幅轮动矩阵
   rpsRotation:          (days: number) => ['rps-rotation', days] as const,

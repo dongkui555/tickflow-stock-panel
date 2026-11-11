@@ -7,7 +7,8 @@ import { DatePicker } from '@/components/DatePicker'
 import { api, type AlertEvent, type DataStatus } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { DimensionMembersDialog, type DimensionMembersTarget } from '@/components/DimensionMembersDialog'
-import { useDataStatus, useCapabilities, useSettings, usePreferences } from '@/lib/useSharedQueries'
+import { useDataStatus, useCapabilityMatrix, useSettings, usePreferences } from '@/lib/useSharedQueries'
+import { routeCapUsable } from '@/lib/capability-labels'
 import { StockPreviewDialog } from '@/components/StockPreviewDialog'
 import type { NavItem } from '@/lib/listNav'
 import { SettingsModal } from '@/components/data/SettingsModal'
@@ -84,9 +85,9 @@ export function Dashboard() {
     placeholderData: (prev) => prev,
   })
   const data = overview.data
-  const caps = useCapabilities()
+  const matrix = useCapabilityMatrix()
   const settings = useSettings()
-  const hasDepth = !!caps.data?.capabilities?.['depth5.batch']
+  const hasDepth = !!routeCapUsable(matrix.data, 'depth5')
   const sealedReady = !!data?.limit?.sealed_ready
   const isSealedDegrade = !hasDepth || !sealedReady
   // 空态引导文案按当前数据源分流: TickFlow 源提"免费服务器", 其他源提"当前数据源",
@@ -201,7 +202,7 @@ export function Dashboard() {
   const currentDate = selectedDate ?? data.as_of ?? ''
   const quoteRunning = (!selectedDate || selectedDate === latestDate) && data.quote_status?.running
   // 实时模式: none / watchlist / full_market。
-  // watchlist 模式仅自选 ≤5 只实时, 看板呈现的大盘数据实为盘后快照, 需提示避免误读。
+  // watchlist 模式仅按标的池实时, 看板呈现的大盘数据实为盘后快照, 需提示避免误读。
   const quoteMode = data.quote_status?.mode as ('none' | 'watchlist' | 'full_market') | undefined
 
   // 网格组件渲染上下文: 数据切片 + 交互回调统一由页面层供给
@@ -318,13 +319,13 @@ export function Dashboard() {
         </div>
       </div>
 
-      {/* 自选实时模式提示: 大盘看板为盘后数据, 仅自选实时。避免用户误读为全市场实时。 */}
+      {/* 按标的实时模式提示: 大盘看板为盘后数据, 仅重点标的实时。避免用户误读为全市场实时。 */}
       {quoteMode === 'watchlist' && (
         <div className="mb-1.5 flex items-start gap-2 rounded-card border border-amber-500/30 bg-amber-500/8 px-3 py-1.5 text-[11px] leading-relaxed">
           <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
           <div className="min-w-0 flex-1 text-secondary">
             当前为「自选实时」模式,看板展示的大盘数据为<strong className="text-foreground">盘后快照</strong>(最新有数据日),并非盘中实时;
-            仅自选({data.quote_status?.watchlist_symbol_count ?? 0} 只)支持实时监控。
+            仅自选、持仓、监控规则和核心指数等重点标的支持实时监控。
             <span className="ml-1 text-accent">全市场实时依赖数据源支持</span>
           </div>
         </div>

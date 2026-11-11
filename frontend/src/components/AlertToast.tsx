@@ -11,6 +11,7 @@ import { playNotificationSound } from '@/lib/notificationSound'
 import { speakAlerts } from '@/lib/voiceBroadcast'
 import { usePreferences } from '@/lib/useSharedQueries'
 import { strategyEventMeta, strategyName } from '@/lib/strategyMonitorEvents'
+import { stockDisplay } from '@/lib/stockDisplay'
 
 /** 通知渠道分发 — 所有副作用渠道在此汇合, 新增渠道只改这里 */
 function dispatchSideEffects(alerts: AlertEvent[]) {
@@ -153,7 +154,7 @@ export function AlertToastContainer() {
               onClick={() => handleClick(item.id)}
               role="button"
               tabIndex={0}
-              aria-label={`查看监控通知${ev.name ? ` ${ev.name}` : ''}${ev.symbol ? ` ${ev.symbol}` : ''}`}
+              aria-label={`查看监控通知${stockDisplay(ev.symbol, ev.name) === '--' ? '' : ` ${stockDisplay(ev.symbol, ev.name)}`}`}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault()
@@ -170,8 +171,7 @@ export function AlertToastContainer() {
                 <span className={cn('shrink-0 rounded px-1 py-px text-[9px] font-medium', badge.cls)}>
                   {badge.label}
                 </span>
-                {ev.symbol && <span className="font-mono text-xs font-medium text-foreground shrink-0">{ev.symbol}</span>}
-                {ev.name && <span className="text-xs text-secondary truncate flex-1">{ev.name}</span>}
+                <span className="truncate text-xs font-medium text-foreground flex-1">{stockDisplay(ev.symbol, ev.name)}</span>
                 {ev.change_pct != null && (
                   <span className={cn('inline-flex items-center gap-0.5 text-[10px] font-mono font-medium shrink-0', pct >= 0 ? 'text-danger' : 'text-bear')}>
                     {pct >= 0 ? <TrendingUp className="h-2.5 w-2.5" /> : <TrendingDown className="h-2.5 w-2.5" />}

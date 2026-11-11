@@ -149,7 +149,7 @@ class MatcherConfig:
     position_policy_compute: Callable[..., object] | None = None
     position_policy_params: dict | None = None
     # 分钟K精确成交: 开启后, 信号触发日的成交价用当日分钟K优化
-    # (有参考线→穿越价, 无参考线→VWAP)。数据缺失时降级为日K口径。
+    # (有参考线→穿越价, 无参考线→VWAP)。目标成交日数据缺失时拒绝回测。
     minute_fill: bool = False
     # 回测资产类型: 分钟K按资产类型分开存储, 精确成交据此路由分钟分区 (不凭代码格式猜测)。
     asset_type: str = "stock"
@@ -1073,23 +1073,25 @@ class BacktestEngine:
             return matrix.timestamp_labels[signal_time][:10] if signal_time >= 0 else fallback
 
         def _refill(time_id: int, asset_id: int, side: str, daily_price: float) -> float:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return daily_price
-            rows = minute_cache.get((matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10]))
-            if rows is None:
-                return daily_price
+            rows = self._minute_session_for_fill(
+                minute_cache, matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10], config.asset_type,
+            )
             reference = float(matrix.reference_price[time_id, asset_id])
             precise = self._resolve_minute_fill(
                 rows, reference if _valid_price(reference) else None, side,
             )
-            return precise if precise is not None else daily_price
+            if precise is None or not _valid_price(precise):
+                raise ValueError("分钟精确成交不可用：invalid_fill_price")
+            return precise
 
         def _minute_trigger_price(time_id: int, asset_id: int) -> float | None:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return None
-            rows = minute_cache.get((matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10]))
-            if rows is None:
-                return None
+            rows = self._minute_session_for_fill(
+                minute_cache, matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10], config.asset_type,
+            )
             reference = float(matrix.reference_price[time_id, asset_id])
             return self._resolve_minute_exit_trigger(
                 rows,
@@ -1230,6 +1232,10 @@ class BacktestEngine:
                 pos["blocked_exit_days"] += 1
                 _count(blocked)
                 return False
+            if config.minute_fill and override is not None:
+                self._minute_session_for_fill(
+                    minute_cache, matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10], config.asset_type,
+                )
             exit_price = float(override) if override is not None else _refill(
                 time_id, asset_id, "sell", float(exit_prices[time_id, asset_id])
             )
@@ -1468,13 +1474,11 @@ class BacktestEngine:
                         minute_cache[_key] = _marr
 
         def _refill_price(idx: int, side: str, daily_price: float) -> float:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return daily_price
             _sym = str(panel_symbols[idx])
             _d = self._date_str(panel_dates[idx])
-            _marr = minute_cache.get((_sym, _d))
-            if _marr is None:
-                return daily_price
+            _marr = self._minute_session_for_fill(minute_cache, _sym, _d, config.asset_type)
             _ref = None
             for _col, _win in (("ma5", 5), ("ma10", 10), ("ma20", 20)):
                 if _col in panel.columns:
@@ -1497,7 +1501,9 @@ class BacktestEngine:
                     except (TypeError, ValueError):
                         pass
             _precise = self._resolve_minute_fill(_marr, _ref, side)
-            return _precise if _precise is not None else daily_price
+            if _precise is None or not np.isfinite(_precise) or _precise <= 0:
+                raise ValueError("分钟精确成交不可用：invalid_fill_price")
+            return _precise
 
         has_volume = "volume" in panel.columns
         volumes = panel["volume"].fill_null(0).to_numpy() if has_volume else np.ones(n, dtype=float)
@@ -1676,6 +1682,10 @@ class BacktestEngine:
                 return False
 
             if exit_price_override is not None:
+                if config.minute_fill:
+                    self._minute_session_for_fill(
+                        minute_cache, str(panel_symbols[idx]), self._date_str(panel_dates[idx]), config.asset_type,
+                    )
                 exit_price = float(exit_price_override)
             else:
                 exit_price = _refill_price(idx, "sell", float(exit_prices[idx]))
@@ -1906,6 +1916,16 @@ class BacktestEngine:
     # 分钟K cache 存储的数值列及固定顺序 (_resolve_minute_fill 按此顺序整数索引)。
     _MINUTE_NUMERIC_COLS = ["open", "high", "low", "close", "volume", "amount"]
 
+    def _minute_session_for_fill(self, cache: dict, symbol: str, day: str, asset_type: str):
+        """Load unplanned execution dates, including holding/risk/deferred exits."""
+        key = (symbol, day)
+        if key not in cache:
+            cache.update(self._load_minute_for_fills(self.repo, [symbol], {day}, asset_type))
+        rows = cache.get(key)
+        if rows is None or len(rows) == 0:
+            raise ValueError(f"分钟精确成交不可用：{symbol} {day} missing_session")
+        return rows
+
     @staticmethod
     def _load_minute_for_fills(
         repo,
@@ -1938,12 +1958,18 @@ class BacktestEngine:
         for i in range(0, len(date_objs), BATCH):
             batch = date_objs[i:i + BATCH]
             try:
-                df = repo.get_minute_by_dates(symbols, batch, asset_type=asset_type)
+                from app.services.minute_quality import filter_minute_sessions
+
+                reader = getattr(repo, "get_minute_quality", None)
+                if callable(reader):
+                    df, issues = reader(symbols, batch, asset_type=asset_type)
+                else:
+                    df, issues = filter_minute_sessions(repo.get_minute_by_dates(symbols, batch, asset_type=asset_type))
             except Exception as e:  # noqa: BLE001
-                logger.warning("minute fill data load failed (batch %d-%d): %s", i, i + len(batch), e)
-                continue
-            if df.is_empty():
-                continue
+                raise ValueError("分钟精确成交校验失败，不能静默回退为日线成交") from e
+            if issues or df.is_empty():
+                sample = issues[0] if issues else {"date": str(batch[0]), "reason": "missing_session"}
+                raise ValueError(f"分钟精确成交不可用：{sample.get('symbol', '')} {sample['date']} {sample['reason']}；请补齐数据或关闭分钟精确成交")
             if evidence is not None:
                 evidence.record_frame(f"minute_fill/{asset_type}/{batch[0]}/{batch[-1]}", df)
             # 按 (symbol, 日期) 分组, 每组转紧凑 float64 数组存入 cache
@@ -1957,6 +1983,7 @@ class BacktestEngine:
                 d_str = sub["_d_str"][0]
                 cols = [c for c in numeric_cols if c in sub.columns]
                 cache[(sym, d_str)] = sub.select(
+                    # Keep stored lots; the VWAP resolver converts lots to shares once.
                     [pl.col(c).cast(pl.Float64) for c in cols]
                 ).to_numpy()
         return cache
@@ -2078,27 +2105,27 @@ class BacktestEngine:
             return total
 
         def _refill_price(time_id: int, asset_id: int, side: str, daily_price: float) -> float:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return daily_price
-            key = (matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10])
-            minute_rows = minute_cache.get(key)
-            if minute_rows is None:
-                return daily_price
+            minute_rows = self._minute_session_for_fill(
+                minute_cache, matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10], config.asset_type,
+            )
             reference = float(matrix.reference_price[time_id, asset_id])
             precise = self._resolve_minute_fill(
                 minute_rows,
                 reference if _valid_price(reference) else None,
                 side,
             )
-            return precise if precise is not None else daily_price
+            if precise is None or not _valid_price(precise):
+                raise ValueError("分钟精确成交不可用：invalid_fill_price")
+            return precise
 
         def _minute_trigger_price(time_id: int, asset_id: int) -> float | None:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return None
-            key = (matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10])
-            minute_rows = minute_cache.get(key)
-            if minute_rows is None:
-                return None
+            minute_rows = self._minute_session_for_fill(
+                minute_cache, matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10], config.asset_type,
+            )
             reference = float(matrix.reference_price[time_id, asset_id])
             return self._resolve_minute_exit_trigger(
                 minute_rows,
@@ -2189,6 +2216,10 @@ class BacktestEngine:
         ) -> None:
             nonlocal cash
             pos = positions.pop(asset_id)
+            if config.minute_fill and override is not None:
+                self._minute_session_for_fill(
+                    minute_cache, matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10], config.asset_type,
+                )
             exit_price = float(override) if override is not None else _refill_price(
                 time_id, asset_id, "sell", float(exit_prices[time_id, asset_id])
             )
@@ -2676,14 +2707,12 @@ class BacktestEngine:
                         minute_cache[key] = marr
 
         def _refill_price(idx: int, side: str, daily_price: float) -> float:
-            """分钟K精确成交价; 无数据则降级为 daily_price。"""
-            if not config.minute_fill or not minute_cache:
+            """Minute fills require the actual execution session."""
+            if not config.minute_fill:
                 return daily_price
             sym = str(panel_symbols[idx])
             d_str = self._date_str(panel_dates[idx])
-            marr = minute_cache.get((sym, d_str))
-            if marr is None:
-                return daily_price
+            marr = self._minute_session_for_fill(minute_cache, sym, d_str, config.asset_type)
             # 参考线: 从 panel 取 ma5/ma10/ma20 作为近似 (均线类信号)。
             # 当日已知纪律 (#388, 与 matrix 路径同口径): enriched maN 含当根收盘,
             # 盘中成交不可能知道当日收盘 → 代数剔除; close 缺失/非法时退回原均线。
@@ -2704,7 +2733,9 @@ class BacktestEngine:
                     except (TypeError, ValueError):
                         pass
             precise = self._resolve_minute_fill(marr, ref, side)
-            return precise if precise is not None else daily_price
+            if precise is None or not np.isfinite(precise) or precise <= 0:
+                raise ValueError("分钟精确成交不可用：invalid_fill_price")
+            return precise
 
         equity_curve: list[dict] = []
         drawdown_curve: list[dict] = []
@@ -2822,6 +2853,10 @@ class BacktestEngine:
             nonlocal cash
             pos = positions.pop(sym)
             if exit_price_override is not None:
+                if config.minute_fill:
+                    self._minute_session_for_fill(
+                        minute_cache, sym, self._date_str(panel_dates[idx]), config.asset_type,
+                    )
                 exit_price = float(exit_price_override)
             else:
                 exit_price = _refill_price(idx, "sell", float(exit_prices[idx]))

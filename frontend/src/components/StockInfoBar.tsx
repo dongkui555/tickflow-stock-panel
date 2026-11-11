@@ -6,6 +6,7 @@ import { fmtPrice, fmtBigNum, fmtVolume, fmtAssetPrice } from '@/lib/format'
 import { ListColumnCustomizer } from '@/components/ListColumnCustomizer'
 import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
 import { INFO_GROUPS, type ColumnConfig } from '@/lib/stock-info-fields'
+import { StockIdentity } from '@/lib/stockDisplay'
 import { storage } from '@/lib/storage'
 import { buildStockExternalUrl, loadStockExternalTemplate } from '@/lib/stock-external-link'
 
@@ -255,8 +256,7 @@ export function StockInfoBar({
     <div className="px-2 pb-3 font-mono text-[12px] select-none space-y-1">
       {/* Row 1: code, name, price, change, change% */}
       <div className="flex items-baseline gap-x-3 flex-wrap">
-        {showIdentity && <span className="text-foreground font-bold text-sm tracking-wide">{symbol}</span>}
-        {showIdentity && <span className="text-secondary font-medium">{displayName}</span>}
+        {showIdentity && <StockIdentity symbol={symbol} name={displayName} compact />}
         <span style={{ color: clr }} className={`${showIdentity ? 'text-lg' : 'text-2xl tracking-tight'} font-bold tabular-nums`}>
           {fmtAssetPrice(close, assetType)}
         </span>

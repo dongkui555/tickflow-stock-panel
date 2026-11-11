@@ -35,6 +35,7 @@ def test_bootstrap_recovers_compose_interpolated_password_from_raw_env(
     tmp_path: Path,
 ) -> None:
     auth, auth_path, env_path = isolated_auth_store
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
     password = "pw${special}-secret"
     env_path.write_text(
         f"AUTH_PASSWORD={password}\nDATA_DIR={tmp_path}\n",

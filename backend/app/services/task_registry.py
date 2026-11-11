@@ -31,7 +31,7 @@ ORPHAN_RUNNING_SECONDS = 24 * 3600
 _FILENAME = "task_registry.json"
 
 _cache: dict[str, Any] | None = None
-_cache_sig: tuple[int, int] | None = None
+_cache_sig: tuple[Path, int, int, int] | None = None
 # 串行化读-改-写 (upsert/delete/孤儿清理): 两个前端 fire-and-forget 上报并发时
 # 后写者会覆盖先写者 (丢终态翻转或丢整条); 文件写入本身原子, 锁只保护 RMW 段。
 _MUTATION_LOCK = threading.Lock()
@@ -43,10 +43,10 @@ def _path(data_dir: Path) -> Path:
     return p
 
 
-def _signature(p: Path) -> tuple[int, int] | None:
+def _signature(p: Path) -> tuple[Path, int, int, int] | None:
     try:
         st = p.stat()
-        return (st.st_mtime_ns, st.st_size)
+        return (p, st.st_ino, st.st_mtime_ns, st.st_size)
     except OSError:
         return None
 

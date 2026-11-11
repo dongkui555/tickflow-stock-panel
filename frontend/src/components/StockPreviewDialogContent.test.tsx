@@ -17,6 +17,10 @@ vi.mock('./StockMultiDayIntradayChart', () => ({
   StockMultiDayIntradayChart: ({ symbol, days }: { symbol: string; days: number }) =>
     <span>分钟线 {symbol} {days}日</span>,
 }))
+vi.mock('./StockDailyKChart', () => ({
+  StockDailyKChart: ({ symbol, minutePeriod }: { symbol: string; minutePeriod: number }) =>
+    <span>{minutePeriod}分钟 K {symbol}</span>,
+}))
 vi.mock('./monitor/RuleEditor', () => ({ RuleEditor: () => null }))
 
 const first = { symbol: '600000.SH', name: '浦发银行' }
@@ -85,7 +89,7 @@ function panel() {
 it('没有扩展时，日 K 和分时正常切换，保留各自区间并刷新对应行情', async () => {
   await setup()
   const invalidate = vi.spyOn(client, 'invalidateQueries')
-  expect(tabs()).toEqual(['日 K', '分时'])
+  expect(tabs()).toEqual(['日 K', '分时', '分钟 K'])
   expect(button('日 K').getAttribute('aria-selected')).toBe('true')
   click('1年')
   const daily = panel().textContent
@@ -102,6 +106,8 @@ it('没有扩展时，日 K 和分时正常切换，保留各自区间并刷新�
   expect(panel().textContent).toBe(daily)
   click('分时')
   expect(button('5日').getAttribute('aria-pressed')).toBe('true')
+  click('分钟 K')
+  expect(panel().textContent).toContain('5分钟 K 600000.SH')
 })
 
 it('扩展按 order 和 id 追加，只有选中面板挂载，切股和重开遵循详情视图生命周期', async () => {
@@ -114,7 +120,7 @@ it('扩展按 order 和 id 追加，只有选中面板挂载，切股和重开�
     { name: 'stock-preview.tabs', id: 'first', label: '概览', order: 1, component: Other },
     { name: 'stock-preview.footer', id: 'status', component: ({ view }) => <footer>{view}</footer> },
   ])
-  expect(tabs()).toEqual(['日 K', '分时', '概览', '研究', '附录'])
+  expect(tabs()).toEqual(['日 K', '分时', '分钟 K', '概览', '研究', '附录'])
   expect(Research).not.toHaveBeenCalled()
   expect(host.querySelector('footer')?.textContent).toBe('daily')
   click('研究')

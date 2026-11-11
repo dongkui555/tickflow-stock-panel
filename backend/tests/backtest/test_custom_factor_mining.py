@@ -76,7 +76,7 @@ def test_custom_factor_resolves_virtual_and_nested_custom_inputs(lang):
     raw = _panel(30)
     actual = FactorBacktestService._compute_missing_factors(raw, {"uf_parent"})
     expected = raw.with_columns(
-        ((pl.col("close") / pl.col("close").rolling_mean(20).over("symbol") - 1) * 2).alias(
+        ((pl.col("close") / pl.col("close").rolling_mean(20).over("symbol").round(12) - 1) * 2).alias(
             "expected"
         )
     )["expected"]

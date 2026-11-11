@@ -439,6 +439,7 @@ function IntradayView({ onPreview }: {
         ))}
         <span className="ml-1 text-[10px] text-muted">
           数据截至 {data?.cache_date ?? '—'}
+          {data ? ` · ${realtimeScopeLabel(data.realtime_scope, data.realtime_symbols)}` : ''}
           {q.isFetching && ' · 更新中…'}
         </span>
         <div className="ml-auto flex items-center gap-2">
@@ -761,7 +762,7 @@ function DeviationView({ onPreview }: {
               <span className="text-[11px] font-medium text-warning">已暂停计算 · 展示上次结果</span>
               <span className="text-[11px] text-secondary">
                 上次计算 {fmtCalcTime(lastResult.asof)} · 数据截至 {lastResult.cache_date ?? '—'}
-                {lastResult.includes_today ? ' (含今日收盘)' : ''}
+                {deviationOverlayLabel(lastResult)}
               </span>
               <button
                 type="button"
@@ -782,7 +783,7 @@ function DeviationView({ onPreview }: {
             {enabled && (
               <span className="text-[10px] text-muted">
                 数据截至 {data?.cache_date ?? '—'}
-                {data?.includes_today ? ' (含今日收盘)' : ' · 已叠加今日实时涨跌'}
+                {deviationOverlayLabel(data)}
                 {data ? ` · 基准指数今日 ${(data.bench_rt_pct * 100).toFixed(2)}%` : ''}
               </span>
             )}
@@ -997,6 +998,24 @@ function fmtCalcTime(asofSec: number): string {
   const d = new Date(asofSec * 1000)
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+function realtimeScopeLabel(scope?: string, count?: number): string {
+  if (scope === 'full_market') return '全市场实时'
+  if (scope === 'partial') return `局部实时${count ? ` ${count}只` : ''}`
+  if (scope === 'daily') return '今日日线快照'
+  if (scope === 'stale') return '历史快照'
+  return '实时不可用'
+}
+
+function deviationOverlayLabel(data?: Pick<AbnormalOverview, 'includes_today' | 'realtime_scope' | 'realtime_symbols'> | null): string {
+  if (!data) return ''
+  if (data.includes_today) return ' (含今日收盘)'
+  if (data.realtime_scope === 'full_market') return ' · 已叠加全市场实时涨跌'
+  if (data.realtime_scope === 'partial') {
+    return ` · 已叠加局部实时${data.realtime_symbols ? ` ${data.realtime_symbols}只` : ''}`
+  }
+  return ' · 未叠加实时个股'
 }
 
 function fmtThreshold(v: number | undefined): string {

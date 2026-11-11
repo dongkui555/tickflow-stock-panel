@@ -4,6 +4,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -356,14 +357,58 @@ def test_shutdown_sets_cancel_uses_bounded_join_and_keeps_history(
     run_id = created["run_id"]
     assert runner_started.wait(1)
 
-    started = time.monotonic()
-    manager.shutdown()
-    elapsed = time.monotonic() - started
-    assert elapsed < 0.2
-    assert manager.store.get(run_id)["status"] == "cancelling"  # type: ignore[index]
+    thread = manager._threads[run_id]
+    original_join = thread.join
+    join_timeouts: list[float] = []
 
-    release_runner.set()
+    def bounded_join(timeout: float | None = None) -> None:
+        # The join budget excludes the durable cancelling manifest/event writes.
+        # Assert the supplied bound rather than timing filesystem I/O and scheduling.
+        assert timeout is not None and 0 < timeout <= 0.02
+        join_timeouts.append(timeout)
+        original_join(timeout=timeout)
+
+    monkeypatch.setattr(thread, "join", bounded_join)
+    try:
+        manager.shutdown()
+        assert len(join_timeouts) == 1
+        assert thread.is_alive()
+        assert manager._cancel_events[run_id].is_set()
+        assert manager.store.get(run_id)["status"] == "cancelling"  # type: ignore[index]
+    finally:
+        release_runner.set()
+        original_join(timeout=2)
+
     _wait_for_status(manager, run_id, "cancelled")
+    _wait_for_event_types(manager, run_id, ["queued", "running", "cancelling", "cancelled"])
     assert manager.store.get(run_id) is not None
     with pytest.raises(RuntimeError, match="shut down"):
         manager.start({"factor_names": ["new"]}, "data-v1")
+
+
+def test_shutdown_shares_join_budget_across_workers(tmp_path, monkeypatch) -> None:
+    manager = MiningJobManager(tmp_path)
+    now = [10.0]
+    cancelled: list[str] = []
+    waits: list[tuple[str, float]] = []
+
+    class BusyThread:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def join(self, timeout: float | None = None) -> None:
+            assert timeout is not None and timeout > 0
+            waits.append((self.name, timeout))
+            now[0] += min(0.6, timeout)
+
+    monkeypatch.setattr(mining_manager_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(mining_manager_module, "_SHUTDOWN_JOIN_SECONDS", 1.0)
+    monkeypatch.setattr(manager, "cancel", cancelled.append)
+    manager._threads = {name: BusyThread(name) for name in ("first", "second", "third")}
+
+    manager.shutdown()
+
+    assert cancelled == ["first", "second", "third"]
+    assert [name for name, _ in waits] == ["first", "second"]
+    assert [timeout for _, timeout in waits] == pytest.approx([1.0, 0.4])
+    assert now[0] == pytest.approx(11.0)

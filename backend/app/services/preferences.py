@@ -112,7 +112,7 @@ def get_watchlist_groups_in_nav() -> bool:
 
 
 def get_realtime_quote_interval() -> float:
-    return load().get("realtime_quote_interval", 6.0)
+    return load().get("realtime_quote_interval", 12.0)
 
 
 def set_realtime_quote_interval(interval: float) -> float:
@@ -152,10 +152,10 @@ _INTRADAY_REFRESH_INTERVAL_MAX = 60
 
 
 def get_minute_intraday_refresh_interval() -> int:
-    """分时图实时刷新轮询间隔 (秒)。默认 6s, 范围 [3, 60]。"""
+    """分时图实时刷新轮询间隔 (秒)。默认 15s, 范围 [3, 60]。"""
     return max(_INTRADAY_REFRESH_INTERVAL_MIN,
                min(_INTRADAY_REFRESH_INTERVAL_MAX,
-                   int(load().get("minute_intraday_refresh_interval", 6))))
+                   int(load().get("minute_intraday_refresh_interval", 15))))
 
 
 # 监控中心个股通知 ext 字段默认配置 (与 ext_presets 内置预设对齐)
@@ -212,6 +212,46 @@ def get_minute_sync_days() -> int:
     return max(1, min(30, load().get("minute_sync_days", 5)))
 
 
+def get_minute_sync_scope() -> str:
+    scope = str(load().get("minute_sync_scope", "combined") or "combined").lower()
+    allowed = {
+        "combined",
+        "watchlist",
+        "realtime_watchlist",
+        "holdings",
+        "stockformer_top",
+        "manual",
+        "all",
+    }
+    return scope if scope in allowed else "combined"
+
+
+def get_minute_sync_top_n() -> int:
+    return max(1, min(1000, int(load().get("minute_sync_top_n", 100))))
+
+
+def get_minute_sync_symbols() -> list[str]:
+    raw = load().get("minute_sync_symbols", [])
+    if isinstance(raw, str):
+        parts = raw.replace("，", ",").replace("\n", ",").split(",")
+    elif isinstance(raw, list):
+        parts = raw
+    else:
+        parts = []
+    out: list[str] = []
+    for item in parts:
+        symbol = str(item or "").strip().upper()
+        if not symbol:
+            continue
+        if "." in symbol:
+            symbol = symbol.split(".", 1)[0]
+        if symbol.isdigit():
+            symbol = symbol.zfill(6)
+        if symbol and symbol not in out:
+            out.append(symbol)
+    return out
+
+
 def get_minute_sync_segment_days() -> int:
     """分钟 K 拉取的单段大小(交易日)。默认 20,范围 [5, 30]。
 
@@ -236,10 +276,10 @@ def get_minute_refresh_enabled() -> bool:
 
 
 def get_minute_refresh_interval() -> int:
-    """盘中分钟增量刷新间隔(秒)。默认 6,范围 [3, 120]。"""
+    """盘中分钟增量刷新间隔(秒)。默认 60,范围 [3, 120]。"""
     return max(
         _MINUTE_REFRESH_INTERVAL_MIN,
-        min(_MINUTE_REFRESH_INTERVAL_MAX, int(load().get("minute_refresh_interval", 6))),
+        min(_MINUTE_REFRESH_INTERVAL_MAX, int(load().get("minute_refresh_interval", 60))),
     )
 
 
@@ -395,6 +435,7 @@ def get_minute_data_provider() -> str:
 
 
 def get_full_minute_data_provider() -> str:
+    """Return the provider for full-market intraday minute ingestion."""
     provider = str(load().get("full_minute_data_provider", "tickflow") or "tickflow").lower()
     return _validated_provider(provider, "full_minute_data_provider")
 
@@ -627,32 +668,45 @@ def set_pipeline_index_symbols(symbols: str) -> str:
     return get_pipeline_index_symbols()
 
 
-def get_pipeline_schedule() -> dict:
-    """返回盘后管道调度时间 {"hour": 15, "minute": 35}。
+def _schedule_time(raw, default_hour: int, default_minute: int) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        h = int(raw.get("hour", default_hour))
+    except Exception:
+        h = default_hour
+    try:
+        m = int(raw.get("minute", default_minute))
+    except Exception:
+        m = default_minute
+    return {"hour": max(0, min(23, h)), "minute": max(0, min(59, m))}
 
-    默认 15:35 而非 15:30 整: 盘后固定价交易 15:30 才彻底结束, 且供应商
-    聚合含盘后量的官方日K需要时间 —— 整点即拉可能写入不含盘后成交的
-    日线, 也与 quote 定版重试窗口终点 (15:30) 精确重合。留 5 分钟缓冲。
-    """
+
+def get_pipeline_schedule() -> dict:
+    """返回盘后管道调度时间 {"hour": 15, "minute": 35}。"""
     d = load().get("pipeline_schedule", {"hour": 15, "minute": 35})
-    return {"hour": d.get("hour", 15), "minute": d.get("minute", 35)}
+    return _schedule_time(d, 15, 35)
 
 
 def set_pipeline_schedule(hour: int, minute: int) -> dict:
     h = max(0, min(23, hour))
     m = max(0, min(59, minute))
-    # 盘后管道不早于 15:35: 15:30 盘后固定价才终止 (量/额此前仍会变),
-    # 且供应商官方日线定稿需要缓冲 —— 更早启动可能固化不含盘后量的当日分区
+    # 盘后不早于 15:35
     if h * 60 + m < 15 * 60 + 35:
         h, m = 15, 35
-    save({"pipeline_schedule": {"hour": h, "minute": m}})
+    current_full = get_full_sync_schedule()
+    current_full["after_close"] = {"hour": h, "minute": m}
+    save({
+        "pipeline_schedule": {"hour": h, "minute": m},
+        "full_sync_schedule": current_full,
+    })
     return {"hour": h, "minute": m}
 
 
 def get_instruments_schedule() -> dict:
-    """返回盘前标的维表调度时间 {"hour": 9, "minute": 10}。"""
-    d = load().get("instruments_schedule", {"hour": 9, "minute": 10})
-    return {"hour": d.get("hour", 9), "minute": d.get("minute", 10)}
+    """返回盘前标的维表调度时间 {"hour": 8, "minute": 5}。"""
+    d = load().get("instruments_schedule", {"hour": 8, "minute": 5})
+    return _schedule_time(d, 8, 5)
 
 
 def set_instruments_schedule(hour: int, minute: int) -> dict:
@@ -663,6 +717,41 @@ def set_instruments_schedule(hour: int, minute: int) -> dict:
         h, m = 9, 15
     save({"instruments_schedule": {"hour": h, "minute": m}})
     return {"hour": h, "minute": m}
+
+
+def get_full_sync_schedule() -> dict:
+    """返回盘前、午盘、盘后和晚间自动增量调度。
+
+    字段名沿用 full_sync_schedule 以兼容旧版本配置；实际调度只做最新缺口补齐。
+    """
+    raw = load().get("full_sync_schedule", {}) or {}
+    legacy_after = get_pipeline_schedule()
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "premarket": _schedule_time(raw.get("premarket"), 8, 10),
+        "midday": _schedule_time(raw.get("midday"), 11, 45),
+        "after_close": _schedule_time(raw.get("after_close"), legacy_after["hour"], legacy_after["minute"]),
+        "evening": _schedule_time(raw.get("evening"), 19, 0),
+    }
+
+
+def set_full_sync_schedule(schedule: dict) -> dict:
+    """保存自动增量调度，兼容只更新部分字段。"""
+    current = get_full_sync_schedule()
+    if "enabled" in schedule:
+        current["enabled"] = bool(schedule.get("enabled"))
+    for key in ("premarket", "midday", "after_close", "evening"):
+        if key not in schedule:
+            continue
+        defaults = current[key]
+        current[key] = _schedule_time(schedule.get(key), defaults["hour"], defaults["minute"])
+    # 保持旧盘后字段同步，设置页老接口仍可读写。
+    after = current["after_close"]
+    save({
+        "full_sync_schedule": current,
+        "pipeline_schedule": {"hour": after["hour"], "minute": after["minute"]},
+    })
+    return current
 
 
 def get_enriched_batch_size() -> int:

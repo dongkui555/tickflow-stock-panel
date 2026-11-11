@@ -45,18 +45,25 @@ class _MinuteRepo:
         if asset_type != "etf":
             return pl.DataFrame()
         day = START + timedelta(days=1)
-        return pl.DataFrame({
-            "symbol": [symbols[0], symbols[0]],
-            "datetime": [datetime.combine(day, datetime.min.time()).replace(hour=9, minute=31),
-                         datetime.combine(day, datetime.min.time()).replace(hour=9, minute=32)],
-            "open": [10.4, 10.6],
-            "high": [10.5, 10.7],
-            "low": [10.3, 10.5],
-            "close": [10.4, 10.6],
-            "volume": [100.0, 100.0],
+        times = [datetime.combine(day, datetime.min.time()).replace(hour=h, minute=1 if h == 13 else 31) + timedelta(minutes=i)
+                 for h in (9, 13) for i in range(120)]
+        entry = pl.DataFrame({
+            "symbol": [symbols[0]] * 240,
+            "datetime": times,
+            "open": [10.4, 10.6] * 120,
+            "high": [10.5, 10.7] * 120,
+            "low": [10.3, 10.5] * 120,
+            "close": [10.4, 10.6] * 120,
+            "volume": [100.0] * 240,
             # 契约口径: amount(元) = 价 x volume(手) x 100 股 (#387)
-            "amount": [10.4 * 100.0 * 100, 10.6 * 100.0 * 100],
+            "amount": [10.4 * 100.0 * 100, 10.6 * 100.0 * 100] * 120,
         })
+        exit_session = entry.with_columns(
+            pl.col('datetime').dt.offset_by('1d'),
+            *[pl.lit(12.).alias(field) for field in ('open', 'high', 'low', 'close')],
+            pl.lit(120000.).alias('amount'),
+        )
+        return pl.concat([entry, exit_session]).filter(pl.col('datetime').dt.date().is_in(dates))
 
 
 def _panel(symbol: str) -> pl.DataFrame:

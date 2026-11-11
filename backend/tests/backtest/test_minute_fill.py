@@ -51,6 +51,16 @@ def _to_compact_arr(mdf: pl.DataFrame) -> np.ndarray:
     return mdf.select([pl.col(c).cast(pl.Float64) for c in cols]).to_numpy()
 
 
+def _complete_session(df: pl.DataFrame) -> pl.DataFrame:
+    first = df.row(0, named=True)
+    day = first['datetime'].date()
+    times = [datetime.combine(day, datetime.min.time()).replace(hour=h, minute=m) + timedelta(minutes=i)
+             for h, m in [(9, 31), (13, 1)] for i in range(120)]
+    existing = set(df['datetime'].to_list())
+    extra = [dict(first, datetime=dt) for dt in times if dt not in existing]
+    return pl.concat([df, pl.DataFrame(extra)], how='vertical_relaxed').sort('datetime')
+
+
 def test_resolve_minute_fill_with_compact_array_no_index_error():
     """紧凑 float64 数组 + 整数列索引不再抛 IndexError (锁定原 bug)。
 
@@ -179,7 +189,7 @@ class _FakeRepo:
     def __init__(self, df: pl.DataFrame) -> None:
         self._df = df
 
-    def get_minute_by_dates(self, symbols, dates, asset_type="stock"):  # noqa: ANN001
+    def get_minute_by_dates(self, symbols, dates, asset_type="stock"):
         return self._df
 
 
@@ -190,7 +200,7 @@ def test_load_minute_for_fills_returns_compact_arrays():
       1) cache 值类型必须是 float64 ndarray (不能是 object, 也不能是臃肿的 DataFrame)。
       2) load 时已做 .cast(Float64), _resolve_minute_fill 直接整数索引可用。
     """
-    df = _sample_minute_df()
+    df = _complete_session(_sample_minute_df())
     repo = _FakeRepo(df)
     result = BacktestEngine._load_minute_for_fills(
         repo, ["000001.SZ"], {"2024-01-02"}, "stock",
@@ -201,19 +211,21 @@ def test_load_minute_for_fills_returns_compact_arrays():
     assert isinstance(arr, np.ndarray)
     assert arr.dtype == np.float64
     # 列顺序 = _MINUTE_NUMERIC_COLS (open=0, high=1, low=2, close=3, volume=4, amount=5)
-    assert arr.shape == (4, 6)
+    assert arr.shape == (240, 6)
     # 端到端: load → resolve 不抛异常
     price = BacktestEngine._resolve_minute_fill(arr, None, "buy")
-    assert price is not None and price > 0
+    expected = df['amount'].sum() / (df['volume'].sum() * 100)
+    assert price == pytest.approx(expected)
+    assert 10 < price < 11
 
 
 def test_load_minute_for_fills_handles_missing_dates():
-    """缺失的日期分区不报错, 直接跳过。"""
+    """缺失分钟不可静默降级到日线成交。"""
     repo = _FakeRepo(pl.DataFrame())  # 空返回
-    result = BacktestEngine._load_minute_for_fills(
-        repo, ["000001.SZ"], {"2024-01-02", "2024-01-03"}, "stock",
-    )
-    assert result == {}
+    with pytest.raises(ValueError, match='missing_session'):
+        BacktestEngine._load_minute_for_fills(
+            repo, ["000001.SZ"], {"2024-01-02", "2024-01-03"}, "stock",
+        )
 
 
 def _ma5_panel(fill_close: float) -> pl.DataFrame:
@@ -269,7 +281,7 @@ def test_polars_panel_minute_fill_independent_of_current_close():
     """
     fills = {}
     minute = pl.DataFrame({
-        "symbol": ["A", "A"],
+        "symbol": ["000001.SZ", "000001.SZ"],
         "datetime": [
             datetime(2024, 1, 5, 9, 31),
             datetime(2024, 1, 5, 10, 0),
@@ -282,10 +294,12 @@ def test_polars_panel_minute_fill_independent_of_current_close():
         "amount": [9.5 * 100.0 * 100, 9.5 * 100.0 * 100],
     })
     for c5 in (10.6, 9.6):
-        panel = _ma5_panel(c5)
+        panel = _ma5_panel(c5).with_columns(pl.lit("000001.SZ").alias("symbol"))
         entries = pl.Series([False, False, False, True, False, False])
         exits = pl.Series([False] * 6)
-        result = BacktestEngine(repo=_FakeRepo(minute)).simulate_portfolio(
+        entry_session = _complete_session(minute)
+        exit_session = entry_session.with_columns(pl.col('datetime').dt.offset_by('1d'))
+        result = BacktestEngine(repo=_FakeRepo(pl.concat([entry_session, exit_session]))).simulate_portfolio(
             panel,
             entries,
             exits,
@@ -304,3 +318,87 @@ def test_polars_panel_minute_fill_independent_of_current_close():
         fills[c5] = result.trades[0].entry_price
     assert fills[10.6] == pytest.approx(fills[9.6])
     assert fills[10.6] == pytest.approx(10.0)
+
+
+def _hold_exit_case(include_exit=True):
+    days = [date(2024, 1, 2) + timedelta(days=index) for index in range(4)]
+    panel = pl.DataFrame({
+        'symbol': ['000001.SZ'] * 4, 'date': days,
+        'open': [10.] * 4, 'high': [12.] * 4, 'low': [9.] * 4,
+        'close': [10.] * 4, 'volume': [1000.] * 4,
+    })
+    sessions = []
+    for index in ([1, 2, 3] if include_exit else [1]):
+        price = 10. if index == 1 else 11.
+        row = pl.DataFrame({
+            'symbol': ['000001.SZ'], 'datetime': [datetime.combine(days[index], datetime.min.time()).replace(hour=9, minute=31)],
+            'open': [price], 'high': [price], 'low': [price], 'close': [price],
+            'volume': [1.], 'amount': [price * 100],
+        })
+        sessions.append(_complete_session(row))
+    return panel, pl.concat(sessions)
+
+
+class _DateScopedRepo(_FakeRepo):
+    def get_minute_by_dates(self, symbols, dates, asset_type='stock'):
+        return self._df.filter(pl.col('symbol').is_in(symbols) & pl.col('datetime').dt.date().is_in(dates))
+
+
+@pytest.mark.parametrize('mode', ['portfolio', 'independent_candidates', 'portfolio_legacy', 'independent_candidates_legacy'])
+def test_max_hold_exit_loads_actual_minute_session(mode):
+    panel, minute = _hold_exit_case()
+    engine = BacktestEngine(_DateScopedRepo(minute))
+    simulate = getattr(engine, f'simulate_{mode}')
+    result = simulate(panel, pl.Series([True, False, False, False]), pl.Series([False] * 4),
+                      MatcherConfig(entry_fill='open_t+1', exit_fill='open_t+1', minute_fill=True,
+                                    max_hold_days=1, fees_pct=0, slippage_bps=0))
+    assert len(result.trades) == 1
+    assert result.trades[0].entry_price == 10
+    assert result.trades[0].exit_price == 11
+
+
+@pytest.mark.parametrize('mode', ['portfolio', 'independent_candidates', 'portfolio_legacy', 'independent_candidates_legacy'])
+def test_missing_max_hold_exit_minutes_cannot_use_daily_price(mode):
+    panel, minute = _hold_exit_case(include_exit=False)
+    engine = BacktestEngine(_DateScopedRepo(minute))
+    simulate = getattr(engine, f'simulate_{mode}')
+    with pytest.raises(ValueError, match='missing_session'):
+        simulate(panel, pl.Series([True, False, False, False]), pl.Series([False] * 4),
+                 MatcherConfig(entry_fill='open_t+1', exit_fill='open_t+1', minute_fill=True,
+                               max_hold_days=1, fees_pct=0, slippage_bps=0))
+
+
+@pytest.mark.parametrize('mode', ['portfolio', 'independent_candidates', 'portfolio_legacy', 'independent_candidates_legacy'])
+def test_missing_risk_exit_minutes_cannot_use_daily_override(mode):
+    panel, minute = _hold_exit_case(include_exit=False)
+    simulate = getattr(BacktestEngine(_DateScopedRepo(minute)), f'simulate_{mode}')
+    with pytest.raises(ValueError, match='missing_session'):
+        simulate(panel, pl.Series([True, False, False, False]), pl.Series([False] * 4),
+                 MatcherConfig(entry_fill='open_t+1', exit_fill='open_t+1', minute_fill=True,
+                               stop_loss_pct=0.05, fees_pct=0, slippage_bps=0))
+
+
+@pytest.mark.parametrize('mode', ['portfolio', 'independent_candidates', 'portfolio_legacy', 'independent_candidates_legacy'])
+@pytest.mark.parametrize('include_deferred_session', [True, False])
+def test_deferred_exit_requires_actual_execution_session(mode, include_deferred_session):
+    panel, minute = _hold_exit_case()
+    blocked_day = date(2024, 1, 4)
+    panel = panel.with_columns(
+        *[pl.when(pl.col('date') == blocked_day).then(9.).otherwise(pl.col(field)).alias(field)
+          for field in ('open', 'high', 'low', 'close')],
+        (pl.col('date') == blocked_day).alias('signal_limit_down'),
+    )
+    if not include_deferred_session:
+        minute = minute.filter(pl.col('datetime').dt.date() != date(2024, 1, 5))
+    simulate = getattr(BacktestEngine(_DateScopedRepo(minute)), f'simulate_{mode}')
+    config = MatcherConfig(entry_fill='open_t+1', exit_fill='open_t+1', minute_fill=True,
+                           max_hold_days=1, fees_pct=0, slippage_bps=0)
+    if not include_deferred_session:
+        with pytest.raises(ValueError, match='missing_session'):
+            simulate(panel, pl.Series([True, False, False, False]), pl.Series([False] * 4), config)
+    else:
+        result = simulate(panel, pl.Series([True, False, False, False]), pl.Series([False] * 4), config)
+        assert len(result.trades) == 1
+        assert result.trades[0].exit_date == '2024-01-05'
+        assert result.trades[0].exit_price == 11.
+        assert result.trades[0].blocked_exit_days == 1

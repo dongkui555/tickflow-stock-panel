@@ -2,8 +2,8 @@ import { useState, useEffect } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
-import { usePreferences, useCapabilities } from '@/lib/useSharedQueries'
-import { MissingCapChip } from '@/lib/capability-labels'
+import { usePreferences, useCapabilities, useCapabilityMatrix } from '@/lib/useSharedQueries'
+import { MissingCapChip, routeCapUsable } from '@/lib/capability-labels'
 
 /**
  * 五档盘口 sealed(真假涨停) 配置内容(纯内容, 无外框, 由父级 Card 包裹)。
@@ -17,8 +17,9 @@ export function DepthConfigContent({ disabled }: { disabled?: boolean }) {
   const qc = useQueryClient()
   const prefs = usePreferences()
   const caps = useCapabilities()
+  const matrix = useCapabilityMatrix()
 
-  const hasDepth = !!caps.data?.capabilities?.['depth5.batch']
+  const hasDepth = !!routeCapUsable(matrix.data, 'depth5')
   // 能力判定(非档位): 具备实时推送能力的数据源允许更快的盘口轮询
   const fastPolling = !!caps.data?.capabilities?.['websocket']
   const range = fastPolling ? { lo: 3, hi: 120 } : { lo: 10, hi: 120 }

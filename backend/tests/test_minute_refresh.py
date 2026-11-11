@@ -17,7 +17,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import polars as pl
-
+import pytest
 from app.services import minute_refresh, preferences
 from app.services.minute_refresh import MinuteRefreshService, _in_continuous_session
 
@@ -103,6 +103,64 @@ def test_gate_disabled(tmp_path, monkeypatch):
     assert _svc(tmp_path, monkeypatch, enabled=False)._gate_reason() == "disabled"
 
 
+@pytest.mark.parametrize("retry,issues,delay", [
+    (None, [{"source": "tdx", "retry_after_seconds": 180}], 180),
+    (90, [], 90),
+    (None, [], 60),
+    (None, [{"retry_after_seconds": float("inf")}, {"retry_after_seconds": "unknown"}], 60),
+])
+def test_failed_round_obeys_retry_delay_without_marking_data_healthy(tmp_path, monkeypatch, retry, issues, delay):
+    from types import SimpleNamespace
+
+    service = _svc(tmp_path, monkeypatch)
+    stopped = []
+    service._stop = SimpleNamespace(is_set=lambda: bool(stopped), wait=lambda seconds: stopped.append(seconds))
+    monkeypatch.setattr(service, "_gate_reason", lambda: None)
+    monkeypatch.setattr(service, "_effective_interval", lambda: 5)
+    monkeypatch.setattr(minute_refresh.time, "time", lambda: 100.)
+
+    def fail():
+        error = RuntimeError("backup cooling down")
+        error.retry_after_seconds = retry
+        error.issues = issues
+        raise error
+
+    monkeypatch.setattr(service, "_run_round", fail)
+    service._loop()
+    assert service._state.next_round_at == 100. + delay
+    assert service._state.last_round_at is None
+    assert "backup cooling down" in service._state.last_error
+
+
+def test_failed_round_does_not_fetch_again_until_cooldown_expires(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    service = _svc(tmp_path, monkeypatch)
+    clock = {"now": 100., "stopped": False}
+    calls, waits = [], []
+
+    def wait(seconds):
+        waits.append(seconds)
+        clock["now"] += seconds
+        assert len(waits) <= 30
+
+    service._stop = SimpleNamespace(is_set=lambda: clock["stopped"], wait=wait)
+    monkeypatch.setattr(service, "_gate_reason", lambda: None)
+    monkeypatch.setattr(service, "_effective_interval", lambda: 5)
+    monkeypatch.setattr(minute_refresh.time, "time", lambda: clock["now"])
+
+    def run():
+        calls.append(clock["now"])
+        if len(calls) == 1:
+            raise TimeoutError("upstream unavailable")
+        clock["stopped"] = True
+
+    monkeypatch.setattr(service, "_run_round", run)
+    service._loop()
+    assert calls == [100., 160.]
+    assert max(waits) <= 2.
+
+
 def test_gate_full_minute_custom_provider_runs(tmp_path, monkeypatch):
     """全量分钟路由到自定义源: 不再让位 — 能力口径统一 (capset 增广后放行)。"""
     class _P:
@@ -147,7 +205,8 @@ def test_run_round_writes_partition_and_updates_status(tmp_path, monkeypatch):
         calls["symbols"] = list(symbols)
         return (minute_df, 1)
 
-    def fake_write(df, minute_dir):
+    def fake_write(df, minute_dir, *, asset_type):
+        assert asset_type == "stock"
         calls["dir"] = minute_dir
         calls["rows"] = df.height
         return df.height
@@ -204,7 +263,7 @@ def _patch_round(monkeypatch, *, lag, inc_df, burst_df):
     )
     monkeypatch.setattr(
         "app.services.kline_sync._write_minute_partition",
-        lambda df, minute_dir: df.height,
+        lambda df, minute_dir, **kwargs: df.height,
     )
     return calls
 
@@ -312,7 +371,7 @@ def _patch_write(monkeypatch) -> dict:
     calls = {"rows": None}
     monkeypatch.setattr(
         "app.services.kline_sync._write_minute_partition",
-        lambda df, minute_dir: calls.update(rows=df.height) or df.height,
+        lambda df, minute_dir, **kwargs: calls.update(rows=df.height) or df.height,
     )
     return calls
 
@@ -439,7 +498,7 @@ def test_status_reports_gate_reason_when_stopped(tmp_path, monkeypatch):
     assert st["enabled"] is False
     assert st["running"] is False
     assert st["gate_reason"] == "disabled"
-    assert st["interval_seconds"] == 6
+    assert st["interval_seconds"] == 60
 
 
 # ── 偏好 ────────────────────────────────────────────────────────────
@@ -448,7 +507,7 @@ def test_status_reports_gate_reason_when_stopped(tmp_path, monkeypatch):
 def test_refresh_preferences_defaults_and_clamp(tmp_path, monkeypatch):
     _isolated_prefs(tmp_path, monkeypatch)
     assert preferences.get_minute_refresh_enabled() is False
-    assert preferences.get_minute_refresh_interval() == 6
+    assert preferences.get_minute_refresh_interval() == 60
     preferences.save({"minute_refresh_interval": 1})
     assert preferences.get_minute_refresh_interval() == 3  # 下限
     preferences.save({"minute_refresh_interval": 999})
@@ -483,3 +542,22 @@ def test_status_endpoint_without_service():
     resp = client.get("/api/settings/minute-refresh/status")
     assert resp.status_code == 200
     assert resp.json() == {"available": False}
+
+
+def test_scoped_minute_status_identifies_actual_source(tmp_path, monkeypatch):
+    svc = _svc(tmp_path, monkeypatch)
+    monkeypatch.setattr(preferences, "get_minute_data_provider", lambda: "tushare")
+    monkeypatch.setattr("app.services.kline_sync._resolve_minute_provider",
+                        lambda name: (object(), False, None))
+    status = svc.status()
+    assert status["provider"] == "tushare"
+    assert status["provider_effective"] == "tushare"
+    assert status["custom_provider_active"] is True
+
+
+def test_full_minute_status_takes_priority_over_scoped_minute(tmp_path, monkeypatch):
+    svc = _svc(tmp_path, monkeypatch, full_minute_provider="myfm", custom=_FakeCustomProvider(batch=True))
+    monkeypatch.setattr(preferences, "get_minute_data_provider", lambda: "tushare")
+    monkeypatch.setattr("app.services.kline_sync._resolve_minute_provider",
+                        lambda name: (object(), False, None))
+    assert svc.status()["provider_effective"] == "myfm"

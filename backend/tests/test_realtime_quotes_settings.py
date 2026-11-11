@@ -23,6 +23,8 @@ def quote_api(monkeypatch, tmp_path):
     monkeypatch.setattr(preferences, "load", lambda: saved.copy())
     monkeypatch.setattr(preferences, "save", lambda updates: saved.update(updates))
     monkeypatch.setattr(custom, "names", lambda: {"fuyao"})
+    monkeypatch.setattr(custom, "provider_has_dataset", lambda name, dataset: (name, dataset) == ("fuyao", "realtime"))
+    monkeypatch.setattr(custom, "get_provider", lambda name: SimpleNamespace(realtime_scope="all"))
     service = QuoteService()
     # 真实运行 enable/disable 与持久化流程, 隔离后台网络和交易日探测。
     monkeypatch.setattr(service, "_poll_loop", lambda: None)

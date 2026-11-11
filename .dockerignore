@@ -14,7 +14,8 @@ backend/data
 
 # ===== 前端构建产物 / 依赖(镜像内会重新 build, 带进来反而污染) =====
 frontend/node_modules
-frontend/dist
+# Hotfix layers may copy the locally verified frontend build into the
+# already-cached runtime image. The normal Dockerfile still rebuilds it.
 backend/static
 backend/app/static
 
@@ -42,11 +43,9 @@ packaging
 backend/dist
 backend/build
 
-# ===== 开发脚本(本地启服务用, 镜像不用; generate_manifest.py 例外 — Dockerfile 构建期生成升级保护清单) =====
+# ===== 开发脚本与镜像中的维护入口 =====
 dev.sh
 dev.ps1
-scripts/*
-!scripts/generate_manifest.py
 
 # ===== 密钥(防止误打进公开镜像) =====
 .env

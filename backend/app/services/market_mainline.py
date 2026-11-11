@@ -161,8 +161,12 @@ def compute_mainline_range(repo, data_dir: Path, start: date, end: date,
         if map_df.is_empty():
             return pl.DataFrame()
 
+    files = [f for p in enriched_dir.glob("date=????-??-??")
+             if str(start) <= p.name[5:] <= str(end) for f in p.glob("*.parquet")]
+    if not files:
+        return pl.DataFrame()
     limit_rows = (
-        pl.scan_parquet(enriched_dir / "**" / "*.parquet")
+        pl.scan_parquet(files)
         .select(["date", "symbol", "consecutive_limit_ups", "amount"])
         .filter(
             (pl.col("date") >= start) & (pl.col("date") <= end)
@@ -185,7 +189,9 @@ def compute_mainline_range(repo, data_dir: Path, start: date, end: date,
     if exclude_st:
         st_syms = load_risk_warning_symbols(repo.store.data_dir)
         if st_syms:
-            limit_rows = limit_rows.filter(~pl.col("_sym_up").is_in(sorted(st_syms)))
+            from app.services.regime_builder import _filter_excluded_symbols
+
+            limit_rows = _filter_excluded_symbols(limit_rows, list(st_syms))
 
     joined = limit_rows.join(map_df, on="_sym_up", how="inner")
     if joined.is_empty():
@@ -288,7 +294,7 @@ def upsert_mainline_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
 
 
 def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = None,
-                                 kind: str = "concept") -> pl.DataFrame:
+                                 kind: str = "concept", target_dates=None, on_progress=None) -> pl.DataFrame:
     """增量补算主线(供 daily_pipeline / 手动触发): 补 enriched 已有而主线缺失的日。"""
     today = today or cn_today()
     from app.services.regime_builder import enriched_date_set
@@ -297,10 +303,30 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
     existing = load_mainline_history(data_dir, kind)
     existing_dates = set(existing["date"].to_list()) if not existing.is_empty() else set()
     missing = sorted(d for d in enriched_dates if d not in existing_dates and d <= today)
+    if target_dates is not None:
+        missing = sorted(d for d in set(target_dates) & enriched_dates if d <= today)
     if not missing:
         return pl.DataFrame()
     logger.info("mainline incremental(%s): compute %d days", kind, len(missing))
-    new_rows = compute_mainline_range(repo, data_dir, missing[0], missing[-1], kind=kind)
+    positions = {d: i for i, d in enumerate(sorted(enriched_dates))}
+    batches = []
+    for d in missing:
+        if not batches or len(batches[-1]) == 10 or positions[d] != positions[batches[-1][-1]] + 1:
+            batches.append([])
+        batches[-1].append(d)
+    parts = []
+    done = 0
+    for batch in batches:
+        label = f"{batch[0]} ~ {batch[-1]}"
+        if on_progress:
+            on_progress(done, len(missing), label)
+        part = compute_mainline_range(repo, data_dir, batch[0], batch[-1], kind=kind)
+        parts.append(part)
+        done += len(batch)
+        if on_progress:
+            on_progress(done, len(missing), label)
+    new_rows = pl.concat([p for p in parts if not p.is_empty()], how="diagonal_relaxed") if any(
+        not p.is_empty() for p in parts) else pl.DataFrame()
     if not new_rows.is_empty():
         upsert_mainline_history(data_dir, new_rows)
     return new_rows

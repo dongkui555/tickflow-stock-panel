@@ -1043,6 +1043,8 @@ class StrategyEngine:
                 df = s.filter_minute_history_fn(history, params, daily=context.daily_history)
             else:
                 df = s.filter_minute_history_fn(history, params)
+            if df.is_empty():
+                return StrategyResult(as_of=as_of, strategy_id=strategy_id, exit_signal_hits=exit_signal_hits)
             # 基础过滤/展示列 (name/total_shares/change_pct 等) 来自 enriched 快照,
             # 在命中结果上事后联表, 避免把 enriched 列铺到全市场分钟行上。
             if current is not None and not current.is_empty():

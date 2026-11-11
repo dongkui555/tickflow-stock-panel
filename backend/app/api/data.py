@@ -148,11 +148,11 @@ def repair_integrity(body: IntegrityRepairIn, request: Request) -> dict:
 
 # 表统计仍沿用 TTL + 写入事件失效; 请求只返回快照, 重统计由单个后台线程执行。
 _TABLE_TTLS = {
-    name: 120.0 if name == "minute" else 30.0
+    name: 120.0 if name in {"minute", "auction_open", "moneyflow", "news"} else 30.0
     for name in (
         "daily", "enriched", "index_daily", "index_enriched", "index_instruments",
         "etf_daily", "etf_enriched", "etf_instruments", "minute", "adj_factor",
-        "instruments", "financials",
+        "instruments", "financials", "auction_open", "moneyflow", "news",
     )
 }
 _status_cache = DataStatusCache({**_TABLE_TTLS, "storage": 60.0, "last_runs": float("inf")})
@@ -228,13 +228,7 @@ def _safe_aggregate_enriched(repo) -> dict | None:
     日期范围从分区目录名获取（同 minute 策略），不读任何 parquet。
     标的数从 instruments 小表取。
     """
-    # 字段数：读 schema，不碰数据
-    fields = 0
-    try:
-        cols = repo.execute_all("DESCRIBE kline_enriched")
-        fields = len(cols)
-    except Exception:  # noqa: BLE001
-        pass
+    fields = len(ENRICHED_COLUMNS)
 
     # 日期范围：从分区目录名获取，不扫数据
     enriched_dir = repo.store.data_dir / "kline_daily_enriched"
@@ -297,22 +291,16 @@ def _safe_aggregate_instruments(repo) -> dict | None:
 
 
 def _safe_aggregate_index_daily(repo) -> dict | None:
-    """指数日K统计。指数数据量较小，直接读取 parquet 元数据统计真实行数。"""
-    return _safe_aggregate(repo, "kline_index_daily")
+    """指数日K统计 — 从分区目录读取覆盖范围，避免打开页面时扫表。"""
+    return _safe_aggregate_partitioned_dir(repo, "kline_index_daily")
 
 
 def _safe_aggregate_index_enriched(repo) -> dict | None:
-    """指数 enriched 统计。指数数据量较小，直接读取 parquet 元数据统计真实行数。"""
-    fields = 0
-    try:
-        cols = repo.execute_all("DESCRIBE kline_index_enriched")
-        fields = len(cols)
-    except Exception:  # noqa: BLE001
-        pass
-    stats = _safe_aggregate(repo, "kline_index_enriched")
+    """指数 enriched 统计 — 从分区目录读取覆盖范围，字段说明按需查询。"""
+    stats = _safe_aggregate_partitioned_dir(repo, "kline_index_enriched")
     if not stats:
         return None
-    return {**stats, "fields": fields}
+    return {**stats, "fields": len(ENRICHED_COLUMNS)}
 
 
 def _safe_aggregate_index_instruments(repo) -> dict | None:
@@ -367,85 +355,33 @@ def _safe_aggregate_etf_instruments(repo) -> dict | None:
 
 
 def _safe_aggregate_etf_enriched(repo) -> dict | None:
-    """ETF enriched 统计 — 独立 kline_etf_enriched。"""
-    fields = 0
-    try:
-        cols = repo.execute_all("DESCRIBE kline_etf_enriched")
-        fields = len(cols)
-    except Exception:  # noqa: BLE001
-        pass
-    stats = _safe_aggregate(repo, "kline_etf_enriched")
+    """ETF enriched 统计 — 从独立分区目录读取覆盖范围。"""
+    stats = _safe_aggregate_partitioned_dir(repo, "kline_etf_enriched")
     if not stats:
         return None
-    return {**stats, "fields": fields}
+    return {**stats, "fields": len(ENRICHED_COLUMNS)}
 
 
 def _safe_aggregate_etf_daily(repo) -> dict | None:
-    """ETF 日K统计 — 优先独立 kline_etf_daily，兼容旧 index 存储。"""
-    queries = [
-        """SELECT count(*) AS rows,
-                  min(date) AS earliest,
-                  max(date) AS latest,
-                  count(DISTINCT symbol) AS symbols,
-                  count(DISTINCT date) AS trading_days
-           FROM kline_etf_daily""",
-        """SELECT count(*) AS rows,
-                  min(date) AS earliest,
-                  max(date) AS latest,
-                  count(DISTINCT symbol) AS symbols,
-                  count(DISTINCT date) AS trading_days
-           FROM kline_index_daily
-           WHERE symbol IN (
-               SELECT DISTINCT symbol FROM instruments_index WHERE asset_type = 'etf'
-           )""",
-    ]
-    for sql in queries:
-        try:
-            row = repo.execute_one(sql)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("aggregate etf daily fallback failed: %s", e)
-            continue
-        if row and row[0]:
-            return {
-                "rows": int(row[0]),
-                "earliest_date": str(row[1]) if row[1] else None,
-                "latest_date": str(row[2]) if row[2] else None,
-                "symbols_covered": int(row[3] or 0),
-                "trading_days": int(row[4] or 0),
-            }
-    return None
+    """ETF 日K统计 — 从独立分区目录读取覆盖范围，旧兼容查询改到字段明细按需做。"""
+    return _safe_aggregate_partitioned_dir(repo, "kline_etf_daily")
 
 
 def _safe_aggregate_adj_factor(repo) -> dict | None:
-    """adj_factor 视图统计,日期范围对齐日 K 覆盖区间。"""
-    try:
-        # 取日 K 的日期范围作为过滤条件
-        dr = repo.execute_one(
-            "SELECT min(date), max(date) FROM kline_daily"
-        )
-        if not dr or not dr[0]:
-            return None
-        d_min, d_max = dr[0], dr[1]
-        row = repo.execute_one(
-            """SELECT count(*) AS rows,
-                      count(DISTINCT symbol) AS symbols,
-                      count(DISTINCT trade_date) AS trading_days
-               FROM adj_factor
-               WHERE trade_date BETWEEN ? AND ?""",
-            [str(d_min), str(d_max)],
-        )
-        if not row or not row[0]:
-            return None
-        return {
-            "rows": int(row[0]),
-            "symbols_covered": int(row[1]) if isinstance(row[1], (int, float)) else 0,
-            "earliest_date": str(d_min),
-            "latest_date": str(d_max),
-            "trading_days": int(row[2] or 0),
-        }
-    except Exception as e:  # noqa: BLE001
-        logger.debug("aggregate adj_factor failed: %s", e)
+    """复权因子画像 — 单文件存在即视为覆盖日 K 区间，避免每次扫全表。"""
+    adj_dir = repo.store.data_dir / "adj_factor"
+    if not adj_dir.exists() or not any(adj_dir.glob("*.parquet")):
         return None
+    daily = _safe_aggregate_daily(repo)
+    if not daily:
+        return None
+    return {
+        "rows": 0,
+        "symbols_covered": daily.get("symbols_covered", 0),
+        "earliest_date": daily.get("earliest_date"),
+        "latest_date": daily.get("latest_date"),
+        "trading_days": daily.get("trading_days", 0),
+    }
 
 
 def _safe_aggregate_minute(repo) -> dict | None:
@@ -467,43 +403,182 @@ def _safe_aggregate_minute(repo) -> dict | None:
     if not dates:
         return None
 
+    rows = 0
+    try:
+        import pyarrow.parquet as pq
+
+        for path in minute_dir.rglob("*.parquet"):
+            rows += int(pq.ParquetFile(path).metadata.num_rows)
+    except Exception:
+        rows = 0
+
+    symbols_covered = 0
+    try:
+        import polars as pl
+
+        latest_dir = minute_dir / f"date={max(dates)}"
+        files = list(latest_dir.glob("*.parquet"))
+        if files:
+            symbols_covered = int(
+                pl.scan_parquet([str(p) for p in files])
+                .select(pl.col("symbol").n_unique().alias("symbols"))
+                .collect()
+                .item()
+                or 0
+            )
+    except Exception:
+        symbols_covered = 0
+
     dates.sort()
     return {
-        "rows": 0,  # 不再查询行数
+        "rows": rows,
         "earliest_date": dates[0],
         "latest_date": dates[-1],
-        "symbols_covered": 0,  # 不再查询标的数
+        "symbols_covered": symbols_covered,
+        "trading_days": len(dates),
+    }
+
+
+def _safe_aggregate_partitioned_dir(repo, dirname: str) -> dict | None:
+    """按 date=YYYY-MM-DD 分区目录统计覆盖情况。"""
+    table_dir = repo.store.data_dir / dirname
+    if not table_dir.exists():
+        return None
+    dates: list[str] = []
+    files: list[str] = []
+    for d in table_dir.iterdir():
+        if d.is_dir() and d.name.startswith("date="):
+            dates.append(d.name[5:])
+            files.extend(str(p) for p in d.glob("*.parquet"))
+    if not dates:
+        return None
+    dates.sort()
+    rows = 0
+    symbols = 0
+    if files:
+        try:
+            import polars as pl
+            lf = pl.scan_parquet(files)
+            names = set(lf.collect_schema().names())
+            exprs = [pl.len().alias("rows")]
+            if "symbol" in names:
+                exprs.append(pl.col("symbol").n_unique().alias("symbols"))
+            result = lf.select(exprs).collect().row(0, named=True)
+            rows = int(result.get("rows") or 0)
+            symbols = int(result.get("symbols") or 0)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("aggregate partitioned %s failed: %s", dirname, e)
+    return {
+        "rows": rows,
+        "earliest_date": dates[0],
+        "latest_date": dates[-1],
+        "symbols_covered": symbols,
         "trading_days": len(dates),
     }
 
 
 def _safe_aggregate_financials(repo) -> dict | None:
-    """财务数据统计 — 检查各表文件是否存在及行数。"""
+    """财务数据统计 — 检查各表文件是否存在、行数与报告期覆盖范围。"""
     data_dir = repo.store.data_dir
     tables_info: dict[str, dict] = {}
     total_rows = 0
+    all_earliest: list[str] = []
+    all_latest: list[str] = []
+    covered_symbols: set[str] = set()
 
     for table in ("metrics", "income", "balance_sheet", "cash_flow", "shares"):
         path = data_dir / "financials" / table / "part.parquet"
         if path.exists():
             try:
                 import polars as pl
-                df = pl.read_parquet(path, columns=["symbol"])
-                rows = len(df)
-                symbols = df["symbol"].n_unique() if not df.is_empty() else 0
-                tables_info[table] = {"rows": rows, "symbols": symbols}
+
+                lf = pl.scan_parquet(path)
+                names = set(lf.collect_schema().names())
+                exprs = [pl.len().alias("rows")]
+                if "symbol" in names:
+                    exprs.append(pl.col("symbol").n_unique().alias("symbols"))
+                if "period_end" in names:
+                    period = pl.col("period_end").cast(pl.Date, strict=False)
+                    exprs.extend([
+                        period.min().alias("earliest_date"),
+                        period.max().alias("latest_date"),
+                    ])
+                row = lf.select(exprs).collect().row(0, named=True)
+                rows = int(row.get("rows") or 0)
+                symbols = int(row.get("symbols") or 0)
+                earliest = row.get("earliest_date")
+                latest = row.get("latest_date")
+                table_info = {
+                    "rows": rows,
+                    "symbols": symbols,
+                    "earliest_date": str(earliest) if earliest else None,
+                    "latest_date": str(latest) if latest else None,
+                }
+                tables_info[table] = table_info
                 total_rows += rows
+                if table != "shares" and table_info["earliest_date"]:
+                    all_earliest.append(table_info["earliest_date"])
+                if table != "shares" and table_info["latest_date"]:
+                    all_latest.append(table_info["latest_date"])
+                if "symbol" in names and rows > 0:
+                    syms = (
+                        lf.select(pl.col("symbol").drop_nulls().unique())
+                        .collect()
+                        .get_column("symbol")
+                        .to_list()
+                    )
+                    covered_symbols.update(str(s) for s in syms if s)
             except Exception:
-                tables_info[table] = {"rows": 0, "symbols": 0}
+                tables_info[table] = {"rows": 0, "symbols": 0, "earliest_date": None, "latest_date": None}
         else:
-            tables_info[table] = {"rows": 0, "symbols": 0}
+            tables_info[table] = {"rows": 0, "symbols": 0, "earliest_date": None, "latest_date": None}
 
     if total_rows == 0:
         return None
 
     return {
         "rows": total_rows,
+        "earliest_date": min(all_earliest) if all_earliest else None,
+        "latest_date": max(all_latest) if all_latest else None,
+        "symbols_covered": len(covered_symbols) if covered_symbols else max(
+            (info.get("symbols", 0) for info in tables_info.values()),
+            default=0,
+        ),
+        "trading_days": 0,
         "tables": tables_info,
+    }
+
+
+def _safe_aggregate_auction_open(repo) -> dict | None:
+    return _safe_aggregate_partitioned_dir(repo, "auction_open")
+
+
+def _safe_aggregate_moneyflow(repo) -> dict | None:
+    return _safe_aggregate_partitioned_dir(repo, "moneyflow")
+
+
+def _safe_aggregate_news(repo) -> dict | None:
+    """新闻库统计。"""
+    try:
+        row = repo.execute_one(
+            """SELECT count(*) AS rows,
+                      min(date) AS earliest,
+                      max(date) AS latest,
+                      count(DISTINCT source) AS sources,
+                      count(DISTINCT market) AS markets
+               FROM news"""
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("aggregate news failed: %s", e)
+        return None
+    if not row or not row[0]:
+        return None
+    return {
+        "rows": int(row[0]),
+        "earliest_date": str(row[1]) if row[1] else None,
+        "latest_date": str(row[2]) if row[2] else None,
+        "symbols_covered": int(row[3] or 0),
+        "trading_days": int(row[4] or 0),
     }
 
 
@@ -565,6 +640,9 @@ def _compute_storage(data_dir: Path) -> dict:
         "etf_adj_factor": data_dir / "adj_factor_etf",
         "minute": data_dir / "kline_minute",
         "adj_factor": data_dir / "adj_factor",
+        "auction_open": data_dir / "auction_open",
+        "moneyflow": data_dir / "moneyflow",
+        "news": data_dir / "news",
         "instruments": data_dir / "instruments",
         "ext_data": data_dir / "ext_data",
     }
@@ -622,7 +700,7 @@ def _load_last_runs() -> dict[str, str | None]:
         if job["status"] not in ("succeeded", "failed"):
             continue
         result = job.get("result") or {}
-        if "instruments_rows" in result and cache["last_instruments_run"] is None:
+        if ("instruments_rows" in result or "instrument_rows" in result) and cache["last_instruments_run"] is None:
             cache["last_instruments_run"] = job["finished_at"]
         if "daily_days" in result and cache["last_pipeline_run"] is None:
             cache["last_pipeline_run"] = job["finished_at"]
@@ -634,6 +712,15 @@ def _data_pipeline_busy(request: Request) -> bool:
     if not getattr(request.app.state, "indicators_ready", True):
         return True
     return job_store.active_status() in ("pending", "running")
+
+
+def _next_full_sync_runs(scheduler) -> dict[str, str | None]:
+    return {
+        "premarket": _next_cron_run(scheduler, "full_sync_premarket"),
+        "midday": _next_cron_run(scheduler, "full_sync_midday"),
+        "after_close": _next_cron_run(scheduler, "daily_pipeline"),
+        "evening": _next_cron_run(scheduler, "evening_pipeline"),
+    }
 
 
 @router.get("/status")
@@ -653,6 +740,9 @@ async def status(request: Request) -> dict:
         "adj_factor": _safe_aggregate_adj_factor,
         "instruments": _safe_aggregate_instruments,
         "financials": _safe_aggregate_financials,
+        "auction_open": _safe_aggregate_auction_open,
+        "moneyflow": _safe_aggregate_moneyflow,
+        "news": _safe_aggregate_news,
     }
     loaders = {name: lambda fetch=fetch: fetch(repo) for name, fetch in aggregates.items()}
     loaders["storage"] = lambda: _compute_storage(repo.store.data_dir)
@@ -666,6 +756,7 @@ async def status(request: Request) -> dict:
         **last_runs,
         "next_instruments_run": _next_cron_run(scheduler, "pre_market_instruments"),
         "next_pipeline_run": _next_cron_run(scheduler, "daily_pipeline"),
+        "next_full_sync_runs": _next_full_sync_runs(scheduler),
         "checked_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "indicators_ready": getattr(request.app.state, "indicators_ready", True),
     }
@@ -726,7 +817,8 @@ def _clear_data_impl(request: Request):
     for sub in (
         "kline_daily", "kline_daily_enriched", "kline_index_daily", "kline_index_enriched",
         "kline_etf_daily", "kline_etf_enriched", "kline_etf_minute", "kline_minute",
-        "adj_factor", "adj_factor_etf", "instruments", "instruments_index", "instruments_etf", "pools", "financials",
+        "adj_factor", "adj_factor_etf", "auction_open", "moneyflow",
+        "news", "instruments", "instruments_index", "instruments_etf", "pools", "financials",
         "backtest_results", "screener_results", "ai_cache",
     ):
         d = data_dir / sub
@@ -855,6 +947,56 @@ _TABLE_FIELD_DESC: dict[str, dict[str, str]] = {
         "allot_price": "配股价(元/股)。可空, 仅事件明细数据源回填",
         "prev_close": "除权前一日收盘价(元), 因子推导基准。可空, 仅事件明细数据源回填",
     },
+    "auction_open": {
+        "symbol": "股票代码",
+        "date": "交易日期",
+        "market": "竞价时段(open/close)",
+        "open": "竞价价格",
+        "high": "竞价最高价",
+        "low": "竞价最低价",
+        "close": "竞价收盘价",
+        "volume": "竞价成交量",
+        "amount": "竞价成交额",
+        "vwap": "竞价均价",
+    },
+    "moneyflow": {
+        "symbol": "股票代码",
+        "date": "交易日期",
+        "buy_sm_vol": "小单买入量",
+        "buy_sm_amount": "小单买入额(元)",
+        "sell_sm_vol": "小单卖出量",
+        "sell_sm_amount": "小单卖出额(元)",
+        "buy_md_vol": "中单买入量",
+        "buy_md_amount": "中单买入额(元)",
+        "sell_md_vol": "中单卖出量",
+        "sell_md_amount": "中单卖出额(元)",
+        "buy_lg_vol": "大单买入量",
+        "buy_lg_amount": "大单买入额(元)",
+        "sell_lg_vol": "大单卖出量",
+        "sell_lg_amount": "大单卖出额(元)",
+        "buy_elg_vol": "特大单买入量",
+        "buy_elg_amount": "特大单买入额(元)",
+        "sell_elg_vol": "特大单卖出量",
+        "sell_elg_amount": "特大单卖出额(元)",
+        "net_mf_vol": "主力净流入量",
+        "net_mf_amount": "主力净流入额(元)",
+    },
+    "news": {
+        "id": "新闻唯一标识",
+        "date": "新闻日期",
+        "published_at": "发布时间",
+        "market": "市场(domestic/overseas)",
+        "market_scope": "市场范围",
+        "source": "新闻来源",
+        "title": "标题",
+        "summary": "摘要",
+        "content": "正文/内容",
+        "channels": "频道或主题",
+        "symbols": "关联标的",
+        "url": "原文链接",
+        "language": "语言",
+        "sentiment": "情绪标签",
+    },
     "instruments": {
         "symbol": "股票代码",
         "name": "股票名称",
@@ -897,6 +1039,9 @@ _SCHEMA_VIEWS: dict[str, str] = {
     "etf_instruments": "instruments_etf",
     "minute": "kline_minute",
     "adj_factor": "adj_factor",
+    "auction_open": "auction_open",
+    "moneyflow": "moneyflow",
+    "news": "news",
     "instruments": "instruments",
 }
 

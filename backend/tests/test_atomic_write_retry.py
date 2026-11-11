@@ -127,7 +127,7 @@ def test_write_minute_partition_survives_reader_race(tmp_path, monkeypatch):
     old_dir.mkdir(parents=True)
     _minute_frame().write_parquet(old_dir / "part.parquet")
 
-    written = kline_sync._write_minute_partition(_minute_frame(), tmp_path)
+    written = kline_sync._write_minute_partition(_minute_frame(), tmp_path, identity_lookup={"600519": "600519.SH"})
 
     assert written == 1
     assert state["calls"] >= 3  # 至少经历了重试
@@ -146,7 +146,7 @@ def test_minute_date_queries_do_not_pin_partition_handles(tmp_path):
 
     minute_dir = tmp_path / "kline_minute"
     kline_sync._write_minute_partition(
-        _minute_frame(), minute_dir)  # date=2026-01-15
+        _minute_frame(), minute_dir, identity_lookup={"600519": "600519.SH"})  # date=2026-01-15
     repo = KlineRepository(DataStore(data_dir=tmp_path))
 
     assert repo.latest_minute_date("600519.SH") == date(2026, 1, 15)
@@ -158,4 +158,4 @@ def test_minute_date_queries_do_not_pin_partition_handles(tmp_path):
     assert held == []
 
     # 钉住场景的端到端后果: 查询后重写同一分区必须成功 (旧实现在此 PermissionError)
-    assert kline_sync._write_minute_partition(_minute_frame(), minute_dir) == 1
+    assert kline_sync._write_minute_partition(_minute_frame(), minute_dir, identity_lookup={"600519": "600519.SH"}) == 1

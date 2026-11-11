@@ -26,12 +26,19 @@ def isolated_settings(tmp_path, monkeypatch):
     preferences._invalidate_cache()
 
 
+def _seed_instrument(tmp_path, symbol, table="instruments"):
+    folder = tmp_path / table
+    folder.mkdir(exist_ok=True)
+    pl.DataFrame({"symbol": [symbol], "code": [symbol.split(".")[0]]}).write_parquet(folder / f"{table}.parquet")
+
+
 @pytest.mark.parametrize("change", ["unrelated", "route", "key", "endpoint", "basis"])
 def test_backward_sync_checks_only_active_source_before_each_write(tmp_path, monkeypatch, change):
     repo = KlineRepository(DataStore(tmp_path))
     caps = CapabilitySet()
     caps.grant(Cap.KLINE_MINUTE_BATCH)
     symbol = "600000.SH"
+    _seed_instrument(tmp_path, symbol)
     first = datetime(2026, 11, 2, 9, 31)
     second = first.replace(minute=32)
     secrets_store.save({"tickflow_api_key": "fixture-key"})
@@ -124,21 +131,27 @@ def test_batch_waiting_for_write_lock_rechecks_source(tmp_path, monkeypatch):
     assert not list((tmp_path / "kline_minute").rglob("*.parquet"))
 
 
-def test_mixed_assets_cannot_restart_with_new_source_between_groups(tmp_path, monkeypatch):
+@pytest.mark.parametrize("change", ["source", "basis"])
+def test_mixed_assets_cannot_restart_with_changed_source_or_basis_between_groups(tmp_path, monkeypatch, change):
     repo = KlineRepository(DataStore(tmp_path))
     caps = CapabilitySet()
     caps.grant(Cap.KLINE_MINUTE_BATCH)
     stock, etf = "600000.SH", "510300.SH"
+    _seed_instrument(tmp_path, stock)
+    _seed_instrument(tmp_path, etf, "instruments_etf")
     monkeypatch.setattr(repo, "get_etf_symbol_set", lambda: {etf})
     fetched = []
 
     def fetch(symbols, *, on_segment, **_):
         fetched.extend(symbols)
         on_segment(pl.DataFrame({"symbol": symbols, "datetime": datetime(2026, 11, 2, 9, 31), "close": 1.0}))
-        secrets_store.save({"tickflow_api_key": "fixture-replacement"})
+        if change == "source":
+            secrets_store.save({"tickflow_api_key": "fixture-replacement"})
+        else:
+            kline_sync.minute_adjust.mark_minute_basis_raw(tmp_path)
 
     monkeypatch.setattr(kline_sync, "sync_minute_batch", fetch)
-    with pytest.raises(WorkBusyError, match="分钟数据源配置已变化"):
+    with pytest.raises(WorkBusyError, match="分钟数据源配置已变化" if change == "source" else "分钟价格基准已变化"):
         kline_sync.sync_and_persist_minute([stock, etf], repo, caps, extend_backward=True)
     assert fetched == [stock]
     assert repo.get_minute(stock, datetime(2026, 11, 2).date()).height == 1

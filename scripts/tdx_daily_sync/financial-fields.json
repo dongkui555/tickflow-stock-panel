@@ -1,0 +1,51 @@
+{
+  "metrics": {
+    "eps_basic": 1,
+    "bps": 4,
+    "ocfps": 7,
+    "debt_to_asset_ratio": 210
+  },
+  "income": {
+    "revenue": 74,
+    "operating_cost": 75,
+    "operating_profit": 86,
+    "selling_expense": 77,
+    "admin_expense": 78,
+    "rd_expense": 304,
+    "financial_expense": 80,
+    "non_operating_income": 88,
+    "non_operating_expense": 89,
+    "total_profit": 92,
+    "income_tax": 93,
+    "net_income": 95,
+    "net_income_attributable": 96,
+    "basic_eps": 1
+  },
+  "balance_sheet": {
+    "total_assets": 40,
+    "total_current_assets": 21,
+    "total_non_current_assets": 39,
+    "cash_and_equivalents": 8,
+    "accounts_receivable": 11,
+    "inventory": 17,
+    "fixed_assets": 27,
+    "intangible_assets": 33,
+    "goodwill": 35,
+    "total_liabilities": 63,
+    "total_current_liabilities": 54,
+    "total_non_current_liabilities": 62,
+    "short_term_borrowing": 41,
+    "long_term_borrowing": 55,
+    "accounts_payable": 44,
+    "total_equity": 72,
+    "retained_earnings": 68,
+    "minority_interest": 69
+  },
+  "cash_flow": {
+    "net_operating_cash_flow": 107,
+    "net_investing_cash_flow": 119,
+    "net_financing_cash_flow": 128,
+    "capex": 114,
+    "net_cash_change": 131
+  }
+}

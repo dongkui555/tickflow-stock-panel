@@ -17,7 +17,7 @@
 单位与口径 (CONTRIBUTING §3.1, 不可凭字段名推断):
   - 扶摇 price_change_ratio_pct 为百分数数值 (1.74 = +1.74%), 本项目 realtime
     change_pct 契约为小数制 (0.0174 = 1.74%) → 此处显式 / 100。
-  - 扶摇 volume 单位为股, 本项目日K/实时契约均为手 → 统一 floor(股/100)。
+  - 扶摇 volume 单位为股, 本项目日K/实时契约按当前历史库统一为股 → 直接透传。
   - turnover 单位元, 与内部一致, 直接透传。
   - 日K取数 adjust=none 锁定: 官方 forward 序列事件间有逐日漂移(2026-08 实测),
     项目内前复权一律由 indicators.pipeline 用本地因子计算。
@@ -193,12 +193,85 @@ def _ref_price(
 
 def _price_limit(symbol: str) -> float:
     """按代码前缀给涨跌停幅度(自检容差用): 创业板/科创板 20%, 北交所 30%, 主板 10%。"""
-    code = symbol.split(".")[0]
+    code = _compact_symbol(symbol)
     if code.startswith(("300", "301", "302", "688", "689")):
         return 0.20
     if code.startswith(("8", "4", "92")):
         return 0.30
     return 0.10
+
+
+def _compact_symbol(symbol: object) -> str:
+    """系统内部股票口径: 6 位代码, 不带交易所后缀。"""
+    text = str(symbol or "").strip().upper()
+    if not text or text in {"NAN", "NONE", "NULL"}:
+        return ""
+    if "." in text:
+        text = text.split(".", 1)[0]
+    for prefix in ("SH", "SZ", "BJ"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits[-6:].zfill(6) if digits else text
+
+
+def _to_thscode(symbol: object) -> str:
+    """系统内部代码 → 扶摇 thscode 请求口径。"""
+    raw = str(symbol or "").strip().upper()
+    code = _compact_symbol(raw)
+    if not code:
+        return ""
+    if "." in raw:
+        suffix = raw.rsplit(".", 1)[-1]
+    elif raw.startswith("SH"):
+        suffix = "SH"
+    elif raw.startswith("SZ"):
+        suffix = "SZ"
+    elif raw.startswith("BJ"):
+        suffix = "BJ"
+    elif code.startswith(("60", "68")):
+        suffix = "SH"
+    elif code.startswith(("00", "30")):
+        suffix = "SZ"
+    elif code.startswith(("43", "83", "87", "88", "92")):
+        suffix = "BJ"
+    else:
+        return ""
+    return f"{code}.{suffix}"
+
+
+def _canonical_symbol(symbol: object) -> str:
+    """Return a canonical ``CODE.EXCHANGE`` identity for provider output."""
+    raw = str(symbol or "").strip().upper()
+    if not raw or raw in {"NAN", "NONE", "NULL"}:
+        return ""
+    code = _compact_symbol(raw)
+    if not code:
+        return ""
+    suffix = raw.rsplit(".", 1)[-1] if "." in raw else ""
+    if suffix not in {"SH", "SZ", "BJ"}:
+        if raw.startswith("SH"):
+            suffix = "SH"
+        elif raw.startswith("SZ"):
+            suffix = "SZ"
+        elif raw.startswith("BJ"):
+            suffix = "BJ"
+        elif code.startswith(("60", "68", "51", "56")):
+            suffix = "SH"
+        elif code.startswith(("00", "30", "12", "15")):
+            suffix = "SZ"
+        elif code.startswith(("43", "83", "87", "88", "92")):
+            suffix = "BJ"
+    return f"{code}.{suffix}" if suffix in {"SH", "SZ", "BJ"} else ""
+
+
+def _compact_symbol_expr(column: str = "thscode") -> pl.Expr:
+    return pl.col(column).map_elements(_compact_symbol, return_dtype=pl.String)
+
+
+def _canonical_symbol_expr(column: str = "thscode") -> pl.Expr:
+    return pl.col(column).map_elements(_canonical_symbol, return_dtype=pl.String)
 
 
 def _release_of(url: str) -> str:
@@ -216,7 +289,7 @@ def _cache_dir() -> Path:
 
 
 def _kline_rows(symbol: str, bars: list[dict]) -> list[dict]:
-    """historical/dump 原始行(价格元, volume 股) → 内部行(volume 手)。"""
+    """historical/dump 原始行(价格元, volume 股) → 内部行(volume 股)。"""
     out = []
     for b in bars:
         v = _to_float(b.get("volume"))
@@ -228,7 +301,7 @@ def _kline_rows(symbol: str, bars: list[dict]) -> list[dict]:
                 "high": _to_float(b.get("high_price")),
                 "low": _to_float(b.get("low_price")),
                 "close": _to_float(b.get("close_price")),
-                "volume": math.floor(v / 100.0) if v is not None else None,
+                "volume": v,
                 "amount": _to_float(b.get("turnover")),
             }
         )
@@ -264,14 +337,21 @@ def _dump_date_range(path: Path) -> tuple[date | None, date | None]:
     return row["dmin"][0], row["dmax"][0]
 
 
-def _map_snapshot_row(row: dict, fetched_ms: int, *, volume_to_hand: bool = True) -> dict | None:
+def _map_snapshot_row(
+    row: dict,
+    fetched_ms: int,
+    *,
+    volume_to_hand: bool = False,
+    compact_symbol: bool = True,
+) -> dict | None:
     """扶摇快照行 → 内部 realtime record。字段缺失时按依赖推导, 不伪造数据。
 
     实测字段(2026-08): high_price / low_price / prev_price;
     官方文档示例: highest_price / lowest_price / prev_close_price。两者都取。
-    volume_to_hand: A 股快照 volume 为股 → 手; 指数快照无此口径, 直接透传。
+    volume_to_hand: 兼容旧调用。当前内部日K/实时 volume 统一按股保存, 默认不转换。
     """
-    symbol = row.get("thscode")
+    raw_symbol = row.get("thscode")
+    symbol = _canonical_symbol(raw_symbol)
     if not symbol:
         return None
     last = _to_float(row.get("last_price"))
@@ -460,7 +540,7 @@ class FuyaoProvider:
         fetched_ms = server_ts or int(time.time() * 1000)
         records = []
         for row in rows:
-            rec = _map_snapshot_row(row, fetched_ms, volume_to_hand=False)
+            rec = _map_snapshot_row(row, fetched_ms, volume_to_hand=False, compact_symbol=False)
             if rec is not None:
                 records.append(rec)
         logger.info("扶摇指数行情拉取完成: %d 条(请求 %d 只)", len(records), len(wanted))
@@ -475,7 +555,7 @@ class FuyaoProvider:
         asset_type: str = "stock",
         on_chunk_done: Callable[[int, int], None] | None = None,
     ) -> pl.DataFrame:
-        """A 股日K → 内部契约。原始价(adjust=none 锁定)、volume 股→手(floor /100)。
+        """A 股日K → 内部契约。原始价(adjust=none 锁定)、volume 按股保存。
 
         - ≤10 只: 优先股票批量历史接口,每次最多10只,避免小查询下载全市场整包;
         - 更大范围的近端窗口(跨度 ≤12 天): daily-k-10d dump(约 1MB);
@@ -661,18 +741,19 @@ class FuyaoProvider:
     def _map_daily_dump(
         self, df: pl.DataFrame, symset: set[str], start_d: date, end_d: date
     ) -> pl.DataFrame:
-        """dump 原始行 → 内部日K契约(股→手、字段重命名、停牌过滤)。"""
+        """dump 原始行 → 内部日K契约(成交量按股保存、字段重命名、停牌过滤)。"""
         if "adjusted" in df.columns:
             df = df.filter(pl.col("adjusted") == "none")  # 防御: dump 变为复权口径时拒绝落库
+        requested = {_to_thscode(s) for s in symset if _to_thscode(s)}
         out = (
             df.filter(
                 (pl.col("date") >= start_d)
                 & (pl.col("date") <= end_d)
-                & pl.col("thscode").is_in(sorted(symset))
+                & pl.col("thscode").is_in(sorted(requested))
             )
             .with_columns(
-                (pl.col("volume") / 100.0).floor().alias("volume"),  # 股 → 手
-                pl.col("thscode").alias("symbol"),
+                pl.col("volume").cast(pl.Float64, strict=False).alias("volume"),
+                _canonical_symbol_expr("thscode").alias("symbol"),
             )
             .rename(
                 {
@@ -687,6 +768,78 @@ class FuyaoProvider:
         out = filter_halt_days(out)
         cols = [c for c in DAILY_COLS if c in out.columns]
         return out.select(cols).sort(["symbol", "date"]) if not out.is_empty() else out.select(cols)
+
+    def _daily_from_big_dump(
+        self, symset: set[str], start_d: date, end_d: date
+    ) -> pl.DataFrame | None:
+        """深窗口主路径: 10 年全量 dump(lazy 按需筛) + 必要时 10d dump 补尾。
+
+        覆盖不了(窗口早于 10 年 / dump 拉取失败)返回 None, 由调用方走单标的接口。
+        """
+        path = self._ensure_daily_big_dump(start_d)
+        if path is None:
+            return None
+        _, dmax = _dump_date_range(path)
+        big_hi = min(end_d, dmax)
+        # 窗口/标的过滤下推到 lazy 计划, 只物化需要的行(全量 10 年 ≈ 13.6M 行)
+        window = (
+            pl.scan_parquet(path)
+            .with_columns(
+                pl.from_epoch(pl.col("date_ms") + _SH_MS, time_unit="ms").dt.date().alias("date")
+            )
+            .filter(
+                (pl.col("date") >= start_d)
+                & (pl.col("date") <= big_hi)
+                & pl.col("thscode").is_in(sorted(symset))
+            )
+            .collect()
+        )
+        parts = [self._map_daily_dump(window, symset, start_d, big_hi)]
+        if not _tail_ok(end_d, dmax):
+            # 末端缺口(如 10 年 dump 是旧 release, end 是最近交易日): 10d dump 补尾
+            try:
+                ten = self._ensure_dump(_DAILY10_DUMP_KIND, "daily_k_10d")
+                ten_dates = pl.from_epoch(
+                    ten["date_ms"].cast(pl.Int64) + _SH_MS, time_unit="ms"
+                ).dt.date()
+                ten_min, ten_max = ten_dates.min(), ten_dates.max()
+                if (
+                    ten_min is not None
+                    and ten_min <= dmax + timedelta(days=1)
+                    and _tail_ok(end_d, ten_max)
+                ):
+                    tail_start = max(start_d, dmax + timedelta(days=1))
+                    parts.append(self._daily_from_dump(ten, symset, tail_start, end_d))
+                else:
+                    return None  # 中段或尾部仍有缺口 → 单标的兜底, 不交缺口数据
+            except FuyaoError as e:
+                logger.warning("扶摇 10d dump 补尾失败: %s", e)
+                return None
+        non_empty = [p for p in parts if not p.is_empty()]
+        if not non_empty:
+            return pl.DataFrame()
+        out = pl.concat(non_empty, how="vertical_relaxed")
+        return out.unique(subset=["symbol", "date"], keep="last").sort(["symbol", "date"])
+
+    def _daily_from_api(
+        self,
+        symbols: list[str],
+        start_d: date,
+        end_d: date,
+        on_chunk_done: Callable[[int, int], None] | None,
+    ) -> pl.DataFrame:
+        frames: list[pl.DataFrame] = []
+        for i, sym in enumerate(symbols):
+            rows = self._historical_bars(_to_thscode(sym), start_d, end_d)
+            time.sleep(_HIST_INTERVAL_S)
+            if rows:
+                canonical = _canonical_symbol(sym) or sym
+                df = normalize_daily(_kline_rows(canonical, rows), default_symbol=canonical, source=self.name)
+                if not df.is_empty():
+                    frames.append(df)
+            if on_chunk_done:
+                on_chunk_done(i + 1, len(symbols))
+        return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     def _historical_batch_rows(self, symbols: list[str], start_d: date, end_d: date) -> list[dict]:
         """每组至多10只、每片至多10年;只为缺组回退,合法空组不重复拉取。"""
@@ -728,14 +881,17 @@ class FuyaoProvider:
     def _historical_bars(self, symbol: str, start_d: date, end_d: date) -> list[dict]:
         """按 ≤10 年窗口分片拉取单标的原始日K。中途失败软返回已得行, 不抛出。"""
         out: list[dict] = []
+        thscode = _to_thscode(symbol)
+        if not thscode:
+            return out
         s = _ms_of_date(start_d)
         e = _ms_of_date(end_d)
         while s <= e:
             chunk_end = min(e, s + _HIST_MAX_SPAN_MS - 1)
             try:
-                out.extend(self._get_client().historical_kline(symbol, s, chunk_end, adjust="none"))
+                out.extend(self._get_client().historical_kline(thscode, s, chunk_end, adjust="none"))
             except FuyaoError as err:
-                logger.warning("扶摇日K拉取失败 %s [%s ~ %s]: %s", symbol, start_d, end_d, err)
+                logger.warning("扶摇日K拉取失败 %s [%s ~ %s]: %s", thscode, start_d, end_d, err)
                 break
             if s + _HIST_MAX_SPAN_MS <= e:
                 time.sleep(_HIST_INTERVAL_S)
@@ -875,9 +1031,11 @@ class FuyaoProvider:
         - 配股但配股价缺失 → 无法推导, 过滤。
         """
         today = datetime.now().date()
-        df = self._ensure_dump(_ADJ_DUMP_KIND, "adj_factors").rename({"thscode": "symbol"})
+        canonical_set = {_canonical_symbol(s) for s in symset if _canonical_symbol(s)}
+        df = self._ensure_dump(_ADJ_DUMP_KIND, "adj_factors")
         df = (
             df.with_columns(
+                _canonical_symbol_expr("thscode").alias("symbol"),
                 pl.from_epoch(pl.col("ex_date_ms") + _SH_MS, time_unit="ms")
                 .dt.date()
                 .alias("ex_date"),
@@ -902,7 +1060,7 @@ class FuyaoProvider:
                 pl.col("allotment_price").max().alias("allot_price"),  # 同日拆行共享配股价
             )
             .filter(~((pl.col("allot") > 0) & (pl.col("allot_price") <= 0)))
-            .filter(pl.col("symbol").is_in(sorted(symset)))
+            .filter(pl.col("symbol").is_in(sorted(canonical_set)))
         )
         if start_time is not None:
             df = df.filter(pl.col("ex_date") >= start_time.date())
@@ -998,14 +1156,18 @@ class FuyaoProvider:
         for i, sym in enumerate(symbols):
             if i:
                 time.sleep(_HIST_INTERVAL_S)
+            canonical_sym = _canonical_symbol(sym)
+            thscode = _to_thscode(sym)
+            if not canonical_sym or not thscode:
+                continue
             try:
-                rows = client.financial_statements(stmt, sym, limit=limit)
+                rows = client.financial_statements(stmt, thscode, limit=limit)
             except FuyaoError as e:
-                logger.warning("扶摇财务 %s %s 失败: %s", stmt, sym, e)
+                logger.warning("扶摇财务 %s %s 失败: %s", stmt, thscode, e)
                 continue
             for r in rows:
                 row: dict = {
-                    "symbol": sym,
+                    "symbol": canonical_sym,
                     "period_end": _iso_of_ms(r.get("period_end_ms")),
                     "announce_date": _iso_of_ms(r.get("report_date_ms")),
                 }
@@ -1027,13 +1189,17 @@ class FuyaoProvider:
         for i, sym in enumerate(symbols):
             if i:
                 time.sleep(_HIST_INTERVAL_S)
+            canonical_sym = _canonical_symbol(sym)
+            thscode = _to_thscode(sym)
+            if not canonical_sym or not thscode:
+                continue
             try:
-                rows = client.financial_statements("income", sym, limit=1)
+                rows = client.financial_statements("income", thscode, limit=1)
             except FuyaoError as e:
-                logger.warning("扶摇财务 income %s 失败: %s", sym, e)
+                logger.warning("扶摇财务 income %s 失败: %s", thscode, e)
                 continue
             if rows:
-                latest[sym] = rows[0]
+                latest[canonical_sym] = rows[0]
         if not latest:
             return pl.DataFrame()
         bps_by_sym = self._derive_bps(sorted(latest))
@@ -1050,9 +1216,9 @@ class FuyaoProvider:
             }
             if report:
                 try:
-                    abilities = client.financial_indicators(sym, report)
+                    abilities = client.financial_indicators(_to_thscode(sym), report)
                 except FuyaoError as e:
-                    logger.warning("扶摇指标 %s %s 失败: %s", sym, report, e)
+                    logger.warning("扶摇指标 %s %s 失败: %s", _to_thscode(sym), report, e)
                     abilities = []
                 for ability in abilities:
                     for ind in ability.get("indicators") or []:
@@ -1105,7 +1271,8 @@ class FuyaoProvider:
         for i in range(0, len(symbols), _VALUATION_BATCH):
             if i:
                 time.sleep(_HIST_INTERVAL_S)
-            batch = symbols[i : i + _VALUATION_BATCH]
+            batch = [_to_thscode(s) for s in symbols[i : i + _VALUATION_BATCH]]
+            batch = [s for s in batch if s]
             for fetch, store in (
                 (client.valuations_snapshot, pb),
                 (client.price_snapshot_batch, price),
@@ -1114,7 +1281,7 @@ class FuyaoProvider:
                 try:
                     for r in fetch(batch):
                         value = _to_float(r.get("pb_mrq" if store is pb else "last_price"))
-                        code = r.get("thscode")
+                        code = _canonical_symbol(r.get("thscode"))
                         if code and value is not None and value != 0:
                             store[code] = value
                 except FuyaoError as e:
@@ -1126,7 +1293,7 @@ class FuyaoProvider:
         }
 
     def _fetch_closes(self, symbol: str, start_d: date, end_d: date) -> dict[date, float]:
-        rows = self._historical_bars(symbol, start_d, end_d)
+        rows = self._historical_bars(_to_thscode(symbol), start_d, end_d)
         out: dict[date, float] = {}
         for r in rows:
             d = _date_of_ms(r.get("date_ms"))
@@ -1192,7 +1359,7 @@ class FuyaoProvider:
         if "adjusted" in lf.collect_schema().names():
             lf = lf.filter(pl.col("adjusted") == "none")
         return lf.select(
-            pl.col("thscode").alias("symbol"),
+            _canonical_symbol_expr("thscode").alias("symbol"),
             pl.from_epoch(pl.col("date_ms").cast(pl.Int64) + _SH_MS, time_unit="ms")
             .dt.date()
             .alias("date"),

@@ -79,6 +79,12 @@ def test_restarted_cache_preserves_each_asset_quote_timestamp(tmp_path, asset, s
     from app.tickflow.repository import DataStore, KlineRepository
 
     repo = KlineRepository(DataStore(tmp_path))
+    table = "instruments" if asset == "stock" else f"instruments_{asset}"
+    directory = tmp_path / table
+    directory.mkdir(exist_ok=True)
+    pl.DataFrame({"symbol": [symbol], "code": [symbol.split(".")[0]]}).write_parquet(
+        directory / f"{table}.parquet",
+    )
     rows = pl.DataFrame([{**_row(), "symbol": symbol, "date": date(2026, 11, 6),
                           "open": 100., "high": 101., "low": 99., "volume": 100., "amount": 10000.}])
     repo.append_enriched_asset(asset, rows)

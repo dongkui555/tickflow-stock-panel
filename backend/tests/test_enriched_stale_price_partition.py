@@ -81,3 +81,15 @@ def test_daily_partition_missing_left_alone(tmp_path) -> None:
 
     assert _prune_stale_price_partitions(tmp_path / "kline_daily", enriched) == []
     assert (enriched / "date=2026-09-04" / "part.parquet").exists()
+
+
+def test_compact_enriched_is_compared_with_qualified_daily_without_deleting(tmp_path):
+    daily = tmp_path / "kline_daily"
+    enriched = tmp_path / "kline_daily_enriched"
+    _write_partition(daily, "2026-09-04", ["002084.SZ"], [7.10], "close")
+    _write_partition(enriched, "2026-09-04", ["002084"], [7.07], "raw_close")
+    target = enriched / "date=2026-09-04" / "part.parquet"
+    original = target.read_bytes()
+
+    assert _prune_stale_price_partitions(daily, enriched, prune=False) == ["2026-09-04"]
+    assert target.read_bytes() == original

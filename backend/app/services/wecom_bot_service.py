@@ -2,8 +2,8 @@
 
 与「群推送 Webhook」(webhook_adapter, 单向 POST) 并存的第二条企业微信通道:
 智能机器人开「API 模式 / 长连接」后, 通过 WebSocket 双向通信, 支持 @机器人
-交互、流式回复、模板卡片。本服务只负责连接保活(连接/鉴权/心跳/重连),
-暂不处理消息收发 — 后续可在此基础上扩展。
+交互、流式回复、模板卡片。本服务管理连接、主动 Markdown 推送和回执,
+收到过的会话仅供用户选择, 不自动订阅。
 
 架构(对齐 depth_service):
   - daemon 线程内跑 asyncio 事件循环, 用已安装的 websockets(v16) 库
@@ -25,6 +25,7 @@ import logging
 import threading
 import time
 import uuid
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,8 @@ class WecomBotService:
         self._connected = False        # WebSocket 是否已连接并通过鉴权
         self._last_error: str = ""
         self._app_state = None         # 延迟注入, 避免循环导入
+        self._ws = None
+        self._pending: dict[str, asyncio.Future] = {}
 
     # ================================================================
     # 生命周期
@@ -130,7 +133,89 @@ class WecomBotService:
             "bot_id_configured": bool(preferences.get_wecom_bot_id()),
             "secret_configured": bool(preferences.get_wecom_bot_secret()),
             "last_error": self._last_error,
+            "chats": self._known_chats(),
         }
+
+    def _chat_path(self):
+        from pathlib import Path
+
+        from app.config import settings
+        return Path(settings.data_dir) / "user_data" / "wecom_bot_chats.json"
+
+    def _known_chats(self):
+        from app.services import preferences
+        try:
+            value = json.loads(self._chat_path().read_text(encoding="utf-8"))
+            return value.get("chats", []) if value.get("bot_id") == preferences.get_wecom_bot_id() else []
+        except (OSError, ValueError):
+            return []
+
+    def _remember_chat(self, body):
+        import os
+
+        from app.market_time import cn_now
+        from app.services import preferences
+        kind = body.get("chattype")
+        chatid = body.get("chatid") if kind == "group" else (body.get("from") or {}).get("userid") if kind == "single" else None
+        if not isinstance(chatid, str) or not chatid:
+            return
+        chats = [r for r in self._known_chats() if r.get("chatid") != chatid]
+        chats.insert(0, {"chatid": chatid, "kind": kind, "seen_at": cn_now().isoformat()})
+        path = self._chat_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps({"bot_id": preferences.get_wecom_bot_id(), "chats": chats[:50]}, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp, path)
+
+    def send_markdown(self, chatid: str, content: str, timeout: float = 15.0) -> dict:
+        """Use the authenticated connection; wait for the matching server receipt."""
+        with self._lock:
+            loop, connected = self._ws_loop, self._connected
+        if not chatid or not connected or loop is None or not loop.is_running():
+            return {"status": "not_connected"}
+        if threading.current_thread() is self._thread:
+            return {"status": "failed", "error": "发送必须在工作线程调用"}
+        operation = self._send_markdown(chatid, content, timeout)
+        try:
+            pending = asyncio.run_coroutine_threadsafe(operation, loop)
+        except RuntimeError:
+            operation.close()
+            return {"status": "not_connected"}
+        try:
+            return pending.result(timeout=timeout + 2)
+        except FutureTimeoutError:
+            pending.cancel()
+            return {"status": "unknown", "error": "发送回执超时, 请核验后再重发"}
+        except Exception:
+            return {"status": "unknown", "error": "连接中断, 发送结果待核验"}
+
+    async def _send_markdown(self, chatid, content, timeout):
+        ws = self._ws
+        if ws is None or not self._connected:
+            return {"status": "not_connected"}
+        req_id = "prediction_" + uuid.uuid4().hex
+        receipt = asyncio.get_running_loop().create_future()
+        self._pending[req_id] = receipt
+        try:
+            await ws.send(json.dumps({"cmd": "aibot_send_msg", "headers": {"req_id": req_id},
+                                      "body": {"chatid": chatid, "msgtype": "markdown",
+                                               "markdown": {"content": content}}}, ensure_ascii=False))
+            frame = await asyncio.wait_for(receipt, timeout)
+            code = frame.get("errcode")
+            if type(code) is not int:
+                return {"status": "unknown", "error": "回执缺少有效错误码"}
+            return {"status": "sent" if code == 0 else "failed", "errcode": code}
+        except (TimeoutError, ConnectionError):
+            return {"status": "unknown", "error": "发送回执超时或连接断开"}
+        finally:
+            self._pending.pop(req_id, None)
+
+    def _disconnect_pending(self):
+        self._ws = None
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(ConnectionError("connection closed"))
+        self._pending.clear()
 
     # ================================================================
     # 连接线程
@@ -151,6 +236,7 @@ class WecomBotService:
                 logger.warning("智能机器人连接线程异常: %s", e)
                 self._last_error = str(e)
         finally:
+            self._disconnect_pending()
             with self._lock:
                 self._connected = False
                 self._ws_loop = None
@@ -179,6 +265,7 @@ class WecomBotService:
     async def _connect_loop(self) -> None:
         """主连接循环: 连接 → 鉴权 → 心跳保活 → 断开 → 退避重连。"""
         import websockets
+
         from app.services import preferences
 
         attempt = 0
@@ -221,6 +308,7 @@ class WecomBotService:
                     # 连接成功
                     with self._lock:
                         self._connected = True
+                    self._ws = ws
                     self._last_error = ""
                     attempt = 0
                     logger.info("智能机器人已连接 (bot_id=%s)", bot_id)
@@ -235,6 +323,7 @@ class WecomBotService:
                 self._last_error = str(e)
                 logger.warning("智能机器人连接异常: %s", e)
             finally:
+                self._disconnect_pending()
                 with self._lock:
                     self._connected = False
 
@@ -251,18 +340,21 @@ class WecomBotService:
 
         本阶段收到消息解析并记 INFO 日志(验证接收能力), 后续消息处理在此扩展。
         """
+        next_ping = time.monotonic() + _HEARTBEAT_INTERVAL
         while self._running:
             try:
                 # 用 wait_for 同时实现"心跳定时"和"接收消息", 哪个先到都行
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=_HEARTBEAT_INTERVAL)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=max(0.01, next_ping - time.monotonic()))
                     self._log_incoming(raw)
-                    continue
+                    if time.monotonic() < next_ping:
+                        continue
                 except asyncio.TimeoutError:
                     pass  # 接收超时 → 到了心跳时间
                 # 发送业务层 ping 保活
-                await ws.send(json.dumps({"cmd": "ping"}))
-            except Exception as e:  # noqa: BLE001 — 连接断开, 抛给上层重连
+                await ws.send(json.dumps({"cmd": "ping", "headers": {"req_id": uuid.uuid4().hex}}))
+                next_ping = time.monotonic() + _HEARTBEAT_INTERVAL
+            except Exception:  # 连接断开交给上层重连。
                 raise
 
     def _log_incoming(self, raw) -> None:
@@ -270,25 +362,33 @@ class WecomBotService:
         try:
             frame = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
-            logger.info("智能机器人收到非 JSON 消息: %s", str(raw)[:200])
+            logger.info("智能机器人收到非 JSON 消息")
+            return
+        if not isinstance(frame, dict):
+            return
+        req_id = (frame.get("headers") or {}).get("req_id")
+        pending = self._pending.get(req_id)
+        if pending is not None and not pending.done() and frame.get("cmd") not in {"aibot_msg_callback", "aibot_event_callback"}:
+            pending.set_result(frame)
             return
         cmd = frame.get("cmd", "?")
         body = frame.get("body", {})
         # 用户消息: aibot_msg_callback (用户 @机器人 / 单聊发消息)
         if cmd == "aibot_msg_callback":
-            userid = body.get("from", {}).get("userid", "?")
+            try:
+                self._remember_chat(body)
+            except Exception:
+                logger.warning("智能机器人保存会话失败")
             chattype = body.get("chattype", "?")
             msgtype = body.get("msgtype", "?")
             # 文本消息内容在 body.text.content 或 body.content
-            content = body.get("text", {}).get("content") or body.get("content", "")
-            logger.info("智能机器人收到用户消息 [%s/%s] %s: %s",
-                        chattype, msgtype, userid, str(content)[:100])
+            logger.info("智能机器人收到用户消息 [%s/%s]", chattype, msgtype)
         # 事件回调: 进入会话 / 卡片点击 / 连接被踢等
         elif cmd == "aibot_event_callback":
             eventtype = body.get("event", {}).get("eventtype", "?")
             logger.info("智能机器人收到事件回调: %s", eventtype)
         else:
-            logger.info("智能机器人收到帧 cmd=%s: %s", cmd, str(raw)[:200])
+            logger.debug("智能机器人收到帧 cmd=%s", cmd)
 
     async def _sleep_interruptible(self, seconds: float) -> None:
         """可被 stop() 中断的 sleep(通过检查 _running)。"""

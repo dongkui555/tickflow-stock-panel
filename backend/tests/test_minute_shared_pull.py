@@ -23,7 +23,9 @@ def test_overlapping_symbol_batches_share_pull_and_persistence(tmp_path, monkeyp
         return pl.DataFrame({"symbol": symbols, "close": [10.0] * len(symbols)})
 
     monkeypatch.setattr(service.kline_sync, "sync_minute_batch", fetch)
-    monkeypatch.setattr(service.kline_sync, "_write_minute_partition", lambda frame, path: writes.append(frame))
+    monkeypatch.setattr(
+        service.kline_sync, "_write_minute_partition", lambda frame, path, *, asset_type: writes.append(frame),
+    )
     args = {"asset_type": "stock", "start": datetime(2026, 11, 4, 9, 30),
             "end": datetime(2026, 11, 4, 15, 5), "batch_size": 200, "rpm": 48, "raw_basis": False}
     with ThreadPoolExecutor(2) as pool:

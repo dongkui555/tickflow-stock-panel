@@ -589,6 +589,7 @@ class ExtConfigStore:
         atomic_write_text(
             cp, json.dumps(config.to_dict(), ensure_ascii=False, indent=2),
         )
+        _load_all_cache.pop(str(self._base), None)
         # 字段集/模式变化会改变扩展列集合: 失效扩展帧缓存与策略结果缓存。
         # 定时拉取循环的 last_run/next_run 例行回写传 keep_strategy_cache=True,
         # 否则每轮拉取后策略页缓存被状态回写清空 (数据写入链路已另行放行)。
@@ -603,6 +604,7 @@ class ExtConfigStore:
         if not cp.exists():
             return False
         shutil.rmtree(cp.parent, ignore_errors=True)
+        _load_all_cache.pop(str(self._base), None)
         _invalidate_ext_derived(self._base.parent)
         return True
 
@@ -718,6 +720,8 @@ def normalize_symbol(series: pl.Series, lookup: dict[str, str] | None = None) ->
             if mapped:
                 return mapped
             # 兜底规则
+            if val.startswith("92"):
+                return f"{val}.BJ"
             if val.startswith(("6",)):
                 return f"{val}.SH"
             else:

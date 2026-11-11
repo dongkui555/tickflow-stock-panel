@@ -1,0 +1,8 @@
+name: tushare
+display_name: "Tushare（日线/分钟/财务/资金）"
+runtime: python
+entry: app.plugins.tushare.provider:TushareProvider
+check: app.plugins.tushare.bridge:availability
+datasets: [daily, adj_factor, financial, auction, moneyflow, news, minute]
+description: "基于 Tushare 的 A 股日线、分钟K、复权因子、财务表、集合竞价、主力资金流、新闻与标的维表。适合本地缓存、选股和回测前置同步；实时行情快照继续使用其他实时源。"
+install_hint: "请先设置 TUSHARE_TOKEN，再安装 tushare 依赖并重载数据源。"

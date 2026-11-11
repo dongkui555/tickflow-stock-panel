@@ -19,6 +19,9 @@ dependencies = [
     "duckdb>=1.0",
     "pyarrow>=16.0",
     "pandas>=2.2",                # 仅在 BacktestService 边界使用,见 §7.4 / ADR-19
+    "xgboost>=2.1,<4",            # StockFormer 生产级表格因子模型
+    "lightgbm>=4.0,<5",           # 与 XGBoost 组成第一层树模型集成
+    "scikit-learn>=1.4,<2",        # LightGBM sklearn API 与模型校准工具
     "psutil>=5.9",                # 独立回测 worker 的峰值 RSS 与退出后内存指标
     # llvmlite 不再提供 macOS Intel wheel；该平台使用 Matrix 纯 Python fallback。
     "numba>=0.65.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
@@ -40,6 +43,7 @@ dependencies = [
     "platformdirs>=4.0",          # 桌面版用户数据目录 (跨平台持久可写)
     "winotify>=1.1; sys_platform == 'win32'",  # Windows 系统通知 (进操作中心)
     "plyer>=2.1",                 # 系统通知跨平台兜底 (macOS/Linux)
+    "requests>=2.31",             # AI Agents 本地新闻/海外市场抓取
     # Watchlist screenshot OCR (Tesseract)
     "pytesseract>=0.3.10",
     "Pillow>=10.0",
@@ -58,6 +62,11 @@ legacy-cpu = [
 # 启用:`uv sync --extra backtest`
 backtest = [
     "vectorbt>=0.26",
+]
+
+# Transformer 研究实验(独立于生产 XGBoost, 默认不安装以控制镜像体积)。
+transformer = [
+    "torch>=2.4",
 ]
 
 # 桌面客户端依赖: pywebview 桌面窗口。打包用 (PyInstaller), 生产/Docker 不需要。
@@ -109,3 +118,4 @@ ignore = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["../scripts"]

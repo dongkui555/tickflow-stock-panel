@@ -311,7 +311,7 @@ class AIStrategyGenerator:
         ):
             yield chunk
 
-    def validate_code(self, code: str) -> dict:
+    def validate_code(self, code: str, *, provided_signals: tuple[str, ...] = ()) -> dict:
         code = self._extract_code_block(code)
 
         # 验证
@@ -358,7 +358,7 @@ class AIStrategyGenerator:
 
         try:
             self._validate_meta_semantics(code, meta)
-            self._validate_signals(code)
+            self._validate_signals(code, provided_signals)
         except ValueError as e:
             return {
                 "code": code,
@@ -386,10 +386,10 @@ class AIStrategyGenerator:
             "ENTRY_SIGNALS", "EXIT_SIGNALS",
         ))
 
-    def _validate_signals(self, code: str) -> None:
+    def _validate_signals(self, code: str, provided_signals: tuple[str, ...]) -> None:
         tree = ast.parse(code)
         columns = self._signal_columns()
-        allowed = columns | {column.removeprefix("signal_") for column in columns}
+        allowed = columns | {column.removeprefix("signal_") for column in columns} | set(provided_signals)
         unknown: set[str] = set()
         for name in ("ENTRY_SIGNALS", "EXIT_SIGNALS"):
             found = _top_level_assignment(tree, name)

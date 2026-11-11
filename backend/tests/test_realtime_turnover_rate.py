@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 import polars as pl
 import pytest
 
@@ -46,5 +48,29 @@ def test_realtime_turnover_rate_uses_api_value_directly_after_entry_normalizatio
 
 def test_realtime_turnover_rate_falls_back_to_float_shares_when_missing():
     out = pipeline._compute_limit_signals_today(_today_rows(), _instruments())
+
+    # Canonical volume is shares: 8,000 / 100,000,000 * 100 = 0.008%.
+    assert out["turnover_rate"][0] == pytest.approx(0.008)
+
+
+def test_realtime_turnover_rate_uses_share_history_when_instruments_lack_float_shares(monkeypatch):
+    today = date(2026, 9, 2)
+    monkeypatch.setattr(pipeline, "cn_today", lambda: today)
+    rows = _today_rows().with_columns(pl.lit(today).alias("date"))
+    instruments = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "name": ["浦发银行"],
+    })
+    shares = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "period_end": ["2026-06-30"],
+        "float_shares": [1_000_000.0],
+    })
+
+    out = pipeline._compute_limit_signals_today(
+        rows,
+        instruments,
+        historical_shares=shares,
+    )
 
     assert out["turnover_rate"][0] == pytest.approx(0.8)

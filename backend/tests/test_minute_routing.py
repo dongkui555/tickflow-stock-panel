@@ -167,6 +167,79 @@ def test_provider_without_minute_dataset_fails_closed(monkeypatch):
     mock_provider.get_minute.assert_not_called()
 
 
+def test_sync_and_persist_minute_uses_symbol_specific_latest(tmp_path, monkeypatch):
+    """默认增量同步按每只股票最新分钟分组, 不被全局 max(datetime) 误导。"""
+    minute_dir = tmp_path / "kline_minute"
+    day_dir = minute_dir / "date=2026-01-15"
+    day_dir.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["000001", "000002"],
+        "datetime": [
+            datetime(2026, 1, 15, 9, 31),
+            datetime(2026, 1, 15, 10, 0),
+        ],
+        "open": [10.0, 20.0],
+        "high": [10.1, 20.1],
+        "low": [9.9, 19.9],
+        "close": [10.0, 20.0],
+        "volume": [100.0, 200.0],
+        "amount": [1000.0, 4000.0],
+    }).write_parquet(day_dir / "part.parquet")
+
+    class _Repo:
+        def __init__(self):
+            self.store = type("S", (), {"data_dir": tmp_path})()
+            self._write_lock = Lock()
+
+    class _CapSet:
+        def has(self, cap):
+            return True
+
+        def limits(self, cap):
+            return None
+
+    calls: list[tuple[tuple[str, ...], datetime]] = []
+
+    def fake_sync(symbols, *, start_time, end_time, on_segment=None, **kwargs):
+        calls.append((tuple(symbols), start_time))
+        if on_segment:
+            on_segment(pl.DataFrame({
+                "symbol": list(symbols),
+                "datetime": [start_time.replace(tzinfo=None)] * len(symbols),
+                "open": [1.0] * len(symbols),
+                "high": [1.0] * len(symbols),
+                "low": [1.0] * len(symbols),
+                "close": [1.0] * len(symbols),
+                "volume": [1.0] * len(symbols),
+                "amount": [1.0] * len(symbols),
+            }))
+        return pl.DataFrame()
+
+    monkeypatch.setattr(kline_sync.preferences, "get_minute_data_provider", lambda: "tickflow")
+    monkeypatch.setattr(kline_sync.preferences, "get_minute_sync_segment_days", lambda: 20)
+    monkeypatch.setattr(kline_sync, "_cleanup_null_datetime_minute", lambda repo: None)
+    monkeypatch.setattr(kline_sync, "_migrate_symbol_to_date_partition", lambda repo: None)
+    monkeypatch.setattr(kline_sync, "sync_minute_batch", fake_sync)
+    instruments = tmp_path / "instruments"
+    instruments.mkdir(exist_ok=True)
+    pl.DataFrame({"symbol": ["000001.SZ", "000002.SZ", "000003.SZ"],
+                  "code": ["000001", "000002", "000003"]}).write_parquet(instruments / "instruments.parquet")
+
+    kline_sync.sync_and_persist_minute(
+        ["000001", "000002", "000003"],
+        _Repo(),
+        _CapSet(),
+        days=5000,
+    )
+
+    starts = {symbols: start for symbols, start in calls}
+    assert starts[("000001",)].replace(tzinfo=None) == datetime(2026, 1, 15, 9, 31)
+    assert starts[("000002",)].replace(tzinfo=None) == datetime(2026, 1, 15, 10, 0)
+    missing = [item for item in calls if item[0] == ("000003",)]
+    assert len(missing) == 1
+    assert missing[0][1].replace(tzinfo=None) < datetime(2026, 1, 15)
+
+
 # ---------- 测试 5: asset_type 透传到 provider ----------
 
 def test_asset_type_threaded_to_provider(monkeypatch):
@@ -213,6 +286,50 @@ def test_custom_success_skips_tickflow(monkeypatch):
     # 规范化后保留 provider 的数据，不请求其他源。
     assert_frame_equal(df, expected_df)
     # TickFlow 路径未进入
+    get_client_spy.assert_not_called()
+
+
+def test_fetch_minute_single_falls_back_to_tdx_when_primary_empty(monkeypatch):
+    """当日单股分时: 首选分钟源为空时, 自动尝试本地 TDX。"""
+    empty_provider = MagicMock()
+    empty_provider.config.datasets = {"minute": object()}
+    empty_provider.get_minute.return_value = pl.DataFrame(
+        schema={
+            "symbol": pl.Utf8,
+            "datetime": pl.Datetime,
+            "open": pl.Float64,
+            "high": pl.Float64,
+            "low": pl.Float64,
+            "close": pl.Float64,
+            "volume": pl.Float64,
+            "amount": pl.Float64,
+        }
+    )
+    tdx_df = _mock_minute_df("000065.SZ")
+    tdx_provider = MagicMock()
+    tdx_provider.config.datasets = {"minute": object()}
+    tdx_provider.get_minute.return_value = tdx_df
+    providers = {"tushare": empty_provider, "tdx": tdx_provider}
+
+    monkeypatch.setattr(kline_sync.preferences, "get_minute_data_provider", lambda: "tushare")
+    monkeypatch.setattr(kline_sync.preferences, "get_realtime_data_provider", lambda: "fuyao")
+    monkeypatch.setattr(kline_sync, "cn_today", lambda: date(2026, 9, 2))
+    monkeypatch.setattr(
+        "app.data_providers.custom.provider_has_dataset",
+        lambda name, ds: name in providers and ds == "minute",
+    )
+    monkeypatch.setattr(
+        "app.data_providers.custom.get_provider",
+        lambda name: providers[name],
+    )
+    get_client_spy = MagicMock(name="get_client_spy")
+    monkeypatch.setattr(kline_sync, "get_client", get_client_spy)
+
+    df = kline_sync.fetch_minute_single("000065.SZ", date(2026, 9, 2), asset_type="stock")
+
+    assert df.equals(tdx_df)
+    empty_provider.get_minute.assert_called_once()
+    tdx_provider.get_minute.assert_called_once()
     get_client_spy.assert_not_called()
 
 
@@ -353,7 +470,7 @@ def _endpoint_mocks(monkeypatch, local_df: pl.DataFrame, sync_ret: pl.DataFrame 
     monkeypatch.setattr(kline_api.kline_sync, "sync_minute_batch", fake_sync)
     writes: list[pl.DataFrame] = []
     monkeypatch.setattr(kline_api.kline_sync, "_write_minute_partition",
-                        lambda df, d: writes.append(df))
+                        lambda df, d, **kwargs: writes.append(df))
 
     mock_repo = MagicMock()
     mock_repo.get_etf_symbol_set.return_value = set()
@@ -599,7 +716,7 @@ def test_sync_and_persist_minute_holds_repository_write_lock(monkeypatch, tmp_pa
 
     write_lock = Lock()
 
-    def assert_locked(df, minute_dir):
+    def assert_locked(df, minute_dir, **kwargs):
         assert not write_lock.acquire(blocking=False)
         return df.height
 

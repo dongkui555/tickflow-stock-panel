@@ -136,18 +136,54 @@ def sync_index_instruments(request: Request):
     return {"status": "ok", "count": count}
 
 
+@router.get("/universe")
+def get_index_universe(request: Request):
+    """Return the exact local index universe for authenticated QMT batching."""
+    repo = request.app.state.repo
+    instruments = repo.get_index_instruments()
+    if instruments.is_empty() or "symbol" not in instruments.columns:
+        return {"count": 0, "symbols": [], "rows": [], "source": "local"}
+    if "asset_type" in instruments.columns:
+        instruments = instruments.filter(pl.col("asset_type") != "etf")
+    columns = [column for column in ("symbol", "name", "code", "asset_type") if column in instruments.columns]
+    instruments = instruments.select(columns).unique(subset=["symbol"], keep="last").sort("symbol")
+    return {
+        "count": instruments.height,
+        "symbols": instruments["symbol"].to_list(),
+        "rows": instruments.to_dicts(),
+        "source": "local",
+    }
+
+
 @router.post("/sync_daily")
 def sync_index_daily(
     request: Request,
-    days: int = Query(365, ge=30, le=5000),
+    days: int = Query(365, ge=1, le=5000),
 ):
     """同步指数日K到独立 parquet。"""
     repo = request.app.state.repo
     capset = request.app.state.capabilities
-    if not capset.has(Cap.KLINE_DAILY_BATCH):
-        raise HTTPException(status_code=403, detail="需要 Pro+ 权限 (batch K-line)")
-    end = datetime.now()
+    if not capset.has(Cap.KLINE_DAILY_BATCH) and index_sync.custom_asset_provider() is None:
+        raise HTTPException(status_code=403, detail="当前数据源不支持指数日K")
+    from app.market_time import cn_now
+    from app.services import index_incremental
+    end = cn_now()
     start = end - timedelta(days=days)
-    count = index_sync.sync_index_instruments(repo)
-    rows = index_sync.sync_and_persist_index_daily(repo, capset, start_date=start, end_date=end)
-    return {"status": "ok", "index_count": count, "rows_written": rows}
+    instruments = repo.get_index_instruments()
+    if instruments.is_empty():
+        index_sync.sync_index_instruments(repo, pull_index=True, pull_etf=False)
+        instruments = repo.get_index_instruments()
+    if 'asset_type' in instruments.columns:
+        instruments = instruments.filter(pl.col('asset_type') == 'index')
+    if instruments.is_empty():
+        raise HTTPException(status_code=422, detail="指数维表为空")
+    # The API only queues work; network and writes use the shared pipeline slot.
+    try:
+        result = index_incremental.sync(
+            repo, capset, symbols=instruments['symbol'].to_list(),
+            start_date=start.date(), end_date=end.date(), max_symbols=0,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {'status': 'ok' if result['complete'] else 'queued',
+            'index_count': instruments.height, 'rows_written': 0, 'index_sync': result}

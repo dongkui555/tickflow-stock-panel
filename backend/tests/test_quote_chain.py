@@ -32,8 +32,19 @@ def test_three_assets_share_publication_and_readers_preserve_other_symbols(tmp_p
     others = {"stock": "600000.SH", "etf": "510300.SH", "index": "000001.SH"}
     monkeypatch.setattr(watchlist, "list_symbols", lambda: [{"symbol": s} for s in targets.values()])
     repo = KlineRepository(DataStore(tmp_path))
-    repo.save_etf_instruments(pl.DataFrame({"symbol": [targets['etf'], others['etf']], "name": ["ETF", "other ETF"]}))
-    repo.save_index_instruments(pl.DataFrame({"symbol": [targets['index'], others['index']], "name": ["index", "other index"], "asset_type": ["index", "index"]}))
+    stock = [targets["stock"], others["stock"]]
+    etfs = [targets["etf"], others["etf"]]
+    indices = [targets["index"], others["index"]]
+    pl.DataFrame({"symbol": stock, "code": [symbol.split(".")[0] for symbol in stock]}).write_parquet(
+        tmp_path / "instruments/instruments.parquet",
+    )
+    repo.save_etf_instruments(pl.DataFrame({
+        "symbol": etfs, "code": [symbol.split(".")[0] for symbol in etfs], "name": ["ETF", "other ETF"],
+    }))
+    repo.save_index_instruments(pl.DataFrame({
+        "symbol": indices, "code": [symbol.split(".")[0] for symbol in indices], "name": ["index", "other index"],
+        "asset_type": ["index", "index"],
+    }))
     for asset, symbol in targets.items():
         rows = pl.DataFrame([
             {"symbol": symbol, "date": yesterday, "open": 9., "high": 9., "low": 9., "close": 9., "volume": 100., "amount": 900.},
@@ -70,6 +81,7 @@ def test_three_assets_share_publication_and_readers_preserve_other_symbols(tmp_p
         assert detail['rows'][-1]['close'] == 10.
         assert detail['quote_freshness']['state'] == 'live'
         latest = client.get("/api/kline/daily/latest", params={"symbol": symbol}).json()
+        assert latest["row"] is not None, (asset, latest)
         assert latest['row']['quote_ts'] == stamp
         folder = {'stock': 'kline_daily_enriched', 'etf': 'kline_etf_enriched', 'index': 'kline_index_enriched'}[asset]
         current = pl.read_parquet(tmp_path / folder / f'date={today}' / 'part.parquet')

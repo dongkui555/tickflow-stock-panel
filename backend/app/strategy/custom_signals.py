@@ -770,7 +770,7 @@ def seed_if_empty(data_dir: Path) -> int:
 def signal_names(data_dir: Path) -> dict[str, str]:
     """自定义信号列名 (csg_/csgi_) → 用户命名的映射, 带目录指纹缓存。
 
-    指纹含文件名 + mtime, 保存/删除信号后自动失效重载, 调用方无需配合失效。
+    定义文件指纹变化后自动重载, 调用方无需配合失效。
     """
     fp = _STORE.fingerprint(data_dir)
     cached = _names_cache.get(data_dir)

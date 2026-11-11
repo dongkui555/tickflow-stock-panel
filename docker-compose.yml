@@ -1,7 +1,72 @@
 # Phase 0 单 service:FastAPI 启动后既跑 API 又托管前端 dist。
 # 见 ADR-17 / §8.1。
 services:
+  tdx-api:
+    build:
+      context: ./tools/tdx_api
+      dockerfile: Dockerfile
+      args:
+        USE_CN_MIRROR: ${USE_CN_MIRROR:-1}
+    container_name: TickFlow_TDX_API
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TZ=Asia/Shanghai
+      - TDX_CONNECT_TIMEOUT=${TDX_CONNECT_TIMEOUT:-3}
+      - TDX_HOSTS=${TDX_HOSTS:-180.153.18.170:7709,119.147.212.81:7709,119.97.185.5:7709,101.227.73.20:7709,180.153.39.51:7709,14.215.128.18:7709}
+    ports:
+      - "${TDX_API_HOST_PORT:-127.0.0.1:8080}:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  stockdb-api:
+    image: tick-stock-panel-v022-integrated-app
+    container_name: TickFlow_StockDB
+    entrypoint: ["/app/.venv/bin/python", "-m", "app.plugins.stockdb.manager"]
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 2
+    mem_limit: 1g
+    pids_limit: 256
+    environment:
+      - HOME=/tmp
+      - TZ=Asia/Shanghai
+      - STOCKDB_WORK_DIR=/work
+      - STOCKDB_AUTO_UPDATE_ENABLED=${STOCKDB_AUTO_UPDATE_ENABLED:-0}
+      - STOCKDB_UPDATE_TRIGGER=${STOCKDB_UPDATE_TRIGGER:-/work/update.trigger}
+      - STOCKDB_UPDATE_TIMES=${STOCKDB_UPDATE_TIMES:-15:20,15:50,16:30,17:30,18:40,19:20}
+      - STOCKDB_UPDATE_RETRY_SECONDS=${STOCKDB_UPDATE_RETRY_SECONDS:-600}
+      - STOCKDB_UPDATER_TIMEOUT_SECONDS=${STOCKDB_UPDATER_TIMEOUT_SECONDS:-180}
+      - STOCKDB_UPDATE_READINESS_SYMBOLS=${STOCKDB_UPDATE_READINESS_SYMBOLS:-000001,000333,000651,000858,300750,600000,600519,601318,688981}
+      - STOCKDB_UPDATE_READINESS_MODE=${STOCKDB_UPDATE_READINESS_MODE:-full}
+      - STOCKDB_UPDATE_DATA_DIR=${STOCKDB_UPDATE_DATA_DIR:-/app-data}
+      - STOCKDB_UPDATE_READINESS_MIN_BARS=${STOCKDB_UPDATE_READINESS_MIN_BARS:-240}
+      - STOCKDB_UPDATE_READINESS_TIMEOUT_SECONDS=${STOCKDB_UPDATE_READINESS_TIMEOUT_SECONDS:-5}
+      - STOCKDB_UPDATE_READINESS_MAX_WORKERS=${STOCKDB_UPDATE_READINESS_MAX_WORKERS:-16}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    ports:
+      - "${STOCKDB_HOST_PORT:-127.0.0.1:7899}:7899"
+    volumes:
+      - ${STOCKDB_DIST_HOST:-./stockdb-dist}:/opt/stockdb:ro
+      - ${STOCKDB_MANAGED_DATA_HOST:-./stockdb-data}:/work
+      - ${DATA_VOLUME_HOST:-./data}:/app-data:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',7899),3); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
   app:
+    image: tick-stock-panel-v022-integrated-app
     build:
       context: .
       dockerfile: Dockerfile
@@ -9,6 +74,9 @@ services:
         BACKEND_EXTRAS: ${BACKEND_EXTRAS:-}
         CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.144.3}
     container_name: TickFlow_Stock_Panel
+    depends_on:
+      - tdx-api
+      - stockdb-api
     ports:
       - "${HOST:-0.0.0.0}:${PORT:-3018}:3018"
     extra_hosts:
@@ -21,14 +89,24 @@ services:
       # 导致每次 up --build 重建容器都丢数据。environment 优先级高于 env_file,
       # 无论 .env 怎么写这里都以容器路径为准。
       - DATA_DIR=/app/data
+      # 本 Compose 已内置本地 TDX HTTP API；主应用在容器网络内用服务名访问。
+      - TDX_ENABLED=${TDX_ENABLED:-1}
+      - TDX_BASE_URL=${TDX_BASE_URL:-http://tdx-api:8080}
+      - TDX_TIMEOUT_SECONDS=${TDX_TIMEOUT_SECONDS:-8}
+      - TDX_VOLUME_SCALE=${TDX_VOLUME_SCALE:-1}
+      # The app must use the Compose service name.  The host-published port is
+      # for tools running on Windows; host.docker.internal:7899 is not mapped.
+      - STOCKDB_BASE_URL=http://stockdb-api:7899
+      - OFFLINE_DATA_DIR=/app/offline-data
       # 将主机 Codex Desktop 的 loopback local-access 端点映射到 Docker host gateway。
       - CODEX_DOCKER_HOST=host.docker.internal
     volumes:
-      - ./data:/app/data
+      - ${DATA_VOLUME_HOST:-./data}:/app/data
+      - ${OFFLINE_DATA_HOST:-../offline-data}:/app/offline-data:ro
       - ./tiers.yaml:/app/tiers.yaml:ro
       # 保留原始 dotenv 值供首次密码初始化读取，避免 Compose 展开密码中的 $VAR。
       - ./.env:/app/.env:ro
       # 复用主机 Codex 登录态；后端只读后复制到单次请求的临时 CODEX_HOME。
       # Windows PowerShell/CMD 下 HOME 常未设置, 可通过 .env 里 CODEX_HOME_HOST 覆盖。
-      - ${CODEX_HOME_HOST:-${HOME}/.codex}:/root/.codex:ro
+      - ${CODEX_HOME_HOST:-C:/Users/G7/.codex}:/root/.codex:ro
     restart: unless-stopped

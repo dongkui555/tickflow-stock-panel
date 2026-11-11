@@ -20,6 +20,7 @@ from app.price_limits import (
     polars_price_limit_pct,
 )
 from app.services import watchlist
+from app.services.security_identity import exchange_for_code
 from app.services.watchlist_csv import import_watchlist_codes, import_watchlist_csv
 from app.services.watchlist_ocr import import_watchlist_image
 from app.services.watchlist_ocr.provider import get_ocr_provider
@@ -417,6 +418,74 @@ _WATCHLIST_COLS = [
 ]
 
 
+def _compact_symbol(value: object) -> str:
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    if "." in text:
+        text = text.split(".", 1)[0]
+    for prefix in ("SH", "SZ", "BJ"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits[-6:].zfill(6) if digits else text
+
+
+def _stock_symbol(value: object) -> str:
+    """Return the canonical stock symbol without collapsing it into an index code.
+
+    Stock and index tables can share a six-digit code (for example 000070).
+    The enriched watchlist must keep the stock exchange suffix so joins and
+    delete actions cannot accidentally target the same-code index.
+    """
+    raw = str(value or "").strip().upper()
+    compact = _compact_symbol(raw)
+    if not compact:
+        return raw
+    suffix = raw.rsplit(".", 1)[-1] if "." in raw else ""
+    if suffix in {"SH", "SZ", "BJ"}:
+        expected = exchange_for_code(compact, "stock")
+        return f"{compact}.{suffix}" if expected == suffix else ""
+    exchange = exchange_for_code(compact, "stock")
+    return f"{compact}.{exchange}" if exchange else ""
+
+
+def _symbol_aliases(value: object) -> list[str]:
+    raw = str(value or "").strip().upper()
+    compact = _compact_symbol(raw)
+    aliases = []
+    for item in (
+        raw,
+        compact,
+        f"{compact}.SH" if compact else "",
+        f"{compact}.SZ" if compact else "",
+        f"{compact}.BJ" if compact else "",
+        f"SH{compact}" if compact else "",
+        f"SZ{compact}" if compact else "",
+        f"BJ{compact}" if compact else "",
+    ):
+        if item and item not in aliases:
+            aliases.append(item)
+    return aliases
+
+
+def _matches_any_symbol_set(symbol: str, values: set[str]) -> bool:
+    if not values:
+        return False
+    raw = str(symbol or "").strip().upper()
+    # An explicit exchange suffix is authoritative. Do not let a stock such
+    # as 000070.SZ match the same six-digit index code 000070.SH via aliases.
+    if raw.rsplit(".", 1)[-1] in {"SH", "SZ", "BJ"}:
+        return raw in values
+    return any(alias in values for alias in _symbol_aliases(symbol))
+
+
+def _resolve_symbol_for_set(symbol: str, values: set[str]) -> str:
+    for alias in _symbol_aliases(symbol):
+        if alias in values:
+            return alias
+    return str(symbol or "").strip().upper()
 def _added_dates_bj(entries: list[dict]) -> dict[str, date]:
     """自选条目的 added_at (naive UTC ISO 串) → 北京日期; 空值/非法值跳过该条。
 
@@ -517,8 +586,8 @@ def watchlist_enriched(
 
     repo = request.app.state.repo
     entries = watchlist.list_symbols()
-    symbols = [r["symbol"] for r in entries]
-    if not symbols:
+    raw_symbols = [r["symbol"] for r in entries]
+    if not raw_symbols:
         return {"rows": [], "as_of": None, "elapsed_ms": 0,
                 "dates": {"stock": None, "etf": None, "index": None}}
 
@@ -526,11 +595,30 @@ def watchlist_enriched(
     # (避免无 ETF 用户在缓存冷启动时触发 ETF 全量懒加载)
     etf_set = repo.get_etf_symbol_set()
     index_set = repo.get_index_symbol_set()
-    etf_symbols = [s for s in symbols if s in etf_set]
-    index_symbols = [s for s in symbols if s not in etf_set and s in index_set]
-    stock_symbols = [s for s in symbols if s not in etf_set and s not in index_set]
+    etf_symbols = [
+        _resolve_symbol_for_set(s, etf_set)
+        for s in raw_symbols
+        if _matches_any_symbol_set(s, etf_set)
+    ]
+    index_symbols = [
+        _resolve_symbol_for_set(s, index_set)
+        for s in raw_symbols
+        if not _matches_any_symbol_set(s, etf_set) and _matches_any_symbol_set(s, index_set)
+    ]
+    stock_symbols = [
+        _compact_symbol(s)
+        for s in raw_symbols
+        if not _matches_any_symbol_set(s, etf_set) and not _matches_any_symbol_set(s, index_set)
+    ]
+    stock_display_map = {
+        _compact_symbol(s): s
+        for s in raw_symbols
+        if not _matches_any_symbol_set(s, etf_set) and not _matches_any_symbol_set(s, index_set)
+    }
+    symbols = [*stock_symbols, *etf_symbols, *index_symbols]
 
     df_e, cache_date = repo.get_enriched_latest()
+    stock_as_of = cache_date
 
     # 以自选列表为主表 LEFT JOIN enriched, 保证自选的每一只都返回一行;
     # 不在 enriched 缓存里的标的 (新股/冷门股/新用户未同步) 指标为 null, 前端渲染为 "—".
@@ -541,7 +629,35 @@ def watchlist_enriched(
         if df_e.is_empty():
             df = watchlist_df
         else:
+            df_e = df_e.filter(
+                pl.col("symbol").map_elements(_stock_symbol, return_dtype=pl.Utf8) != ""
+            ).with_columns(
+                pl.col("symbol").map_elements(_compact_symbol, return_dtype=pl.Utf8)
+            )
             df = watchlist_df.join(_latest_watchlist_rows(df_e, stock_symbols), on="symbol", how="left")
+        qs = getattr(request.app.state, "quote_service", None)
+        if qs is not None:
+            try:
+                live_df, live_date = qs.get_enriched_today()
+                if live_date == cn_today() and not live_df.is_empty():
+                    live_df = live_df.filter(
+                        pl.col("symbol").map_elements(_stock_symbol, return_dtype=pl.Utf8) != ""
+                    ).with_columns(
+                        pl.col("symbol").map_elements(_compact_symbol, return_dtype=pl.Utf8)
+                    )
+                    live_stock = _latest_watchlist_rows(live_df, stock_symbols)
+                    if not live_stock.is_empty():
+                        live_symbols = live_stock["symbol"].to_list()
+                        df = pl.concat(
+                            [
+                                df.filter(~pl.col("symbol").is_in(live_symbols)),
+                                live_stock,
+                            ],
+                            how="diagonal_relaxed",
+                        )
+                        stock_as_of = live_date
+            except Exception as e:  # noqa: BLE001
+                logger.debug("watchlist live overlay failed: %s", e)
     else:
         df = pl.DataFrame()
 
@@ -569,14 +685,14 @@ def watchlist_enriched(
         df = df_idx if df.is_empty() else pl.concat([df, df_idx], how="diagonal_relaxed")
 
     # as_of 取三类缓存中较旧者
-    dates = [d for d in (cache_date if stock_symbols else None, etf_date, index_date) if d is not None]
+    dates = [d for d in (stock_as_of if stock_symbols else None, etf_date, index_date) if d is not None]
     as_of = min(dates) if dates else None
     # 按资产类型的行情日期 (ISO): as_of 是三类取 min 的全局值, 分不清哪类过期。
     # 前端分时缩略图续画据此判定「该类行情是否为当日」—— ETF 未开实时拉取时
     # etf 缓存停在旧日, 过期 close 拼到当日分钟K尾部会画出错价 (issue 场景)。
     # None = 未加载/无缓存, 前端一律按不新鲜处理 (fail-closed)。
     quote_dates = {
-        "stock": str(cache_date) if cache_date else None,
+        "stock": str(stock_as_of) if stock_as_of else None,
         "etf": str(etf_date) if etf_date else None,
         "index": str(index_date) if index_date else None,
     }
@@ -587,8 +703,17 @@ def watchlist_enriched(
     # JOIN float_shares (仅股票有) + 名称 (股票/ETF 统一走 get_name_map)
     df_i = repo.get_instruments()
     if not df_i.is_empty() and "float_shares" in df_i.columns:
-        shares = df_i.select(["symbol", "float_shares"]).unique(subset=["symbol"], keep="first")
-        df = df.join(shares, on="symbol", how="left")
+        df_i = df_i.with_columns(
+            pl.col("symbol").map_elements(_compact_symbol, return_dtype=pl.Utf8)
+        ).unique(subset=["symbol"], keep="last")
+        df = df.join(df_i.select(["symbol", "float_shares"]), on="symbol", how="left")
+    # Stock parquet uses compact six-digit symbols internally. Restore the
+    # explicit exchange suffix before returning rows so UI actions target the
+    # exact watchlist entry and cannot collide with a same-code index.
+    if stock_display_map:
+        df = df.with_columns(
+            pl.col("symbol").replace(stock_display_map).alias("symbol")
+        )
     name_map = repo.get_name_map(df["symbol"].to_list())
     df = df.with_columns(
         pl.col("symbol").replace_strict(name_map, default=None, return_dtype=pl.Utf8).alias("name")
@@ -604,7 +729,7 @@ def watchlist_enriched(
     prepared_reader = getattr(repo, "get_prepared_daily", None)
     if callable(prepared_reader):
         parts = []
-        for asset, group in (("stock", stock_symbols), ("etf", etf_symbols), ("index", index_symbols)):
+        for asset, group in (("stock", list(stock_display_map.values())), ("etf", etf_symbols), ("index", index_symbols)):
             missing = df.filter(pl.col("symbol").is_in(group))
             if "close" in missing.columns:
                 missing = missing.filter(pl.col("close").is_null())
@@ -656,14 +781,14 @@ def watchlist_enriched(
     try:
         added_at_df = pl.DataFrame(
             {
-                "symbol": symbols,
+                "symbol": raw_symbols,
                 # 旧 schema 迁移补的空串归一为 null, 前端只需判断一种「缺失」
                 "added_at": [(r.get("added_at") or None) for r in entries],
             },
             schema={"symbol": pl.Utf8, "added_at": pl.Utf8},
         )
         with_base = df.join(added_at_df, on="symbol", how="left")
-        base_df = _added_base_closes(repo, _added_dates_bj(entries), set(stock_symbols))
+        base_df = _added_base_closes(repo, _added_dates_bj(entries), set(stock_display_map.values()))
         if base_df.is_empty():
             # 无基准价 (缓存冷 / 全为 ETF 或超窗): 整列降级为 null
             df = with_base.with_columns(pl.lit(None, dtype=pl.Float64).alias("pct_since_added"))
@@ -756,7 +881,14 @@ def watchlist_enriched(
         ])
 
     # 按自选添加顺序（新加的在前）重排行
-    order_map = {s: i for i, s in enumerate(symbols)}
+    order_map: dict[str, int] = {}
+    for i, raw in enumerate(raw_symbols):
+        aliases = _symbol_aliases(raw)
+        for alias in aliases:
+            order_map.setdefault(alias, i)
+        compact = _compact_symbol(raw)
+        if compact:
+            order_map.setdefault(compact, i)
     df = df.with_columns(pl.col("symbol").map_elements(lambda s: order_map.get(s, len(symbols)), return_dtype=pl.Int32).alias("_sort_order"))
     df = df.sort("_sort_order").drop("_sort_order")
 

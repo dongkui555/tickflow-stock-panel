@@ -17,7 +17,7 @@ from app.tickflow.capabilities import CapabilitySet
 
 
 def _run_pipeline(tmp_path: Path, monkeypatch, minute_provider: str) -> tuple[dict, list[dict]]:
-    """跑 run_now 到分钟阶段, 返回 (result, sync_and_persist_minute 调用记录)。"""
+    """跑 run_now 到分钟阶段, 返回 (result, 分钟补差入队记录)。"""
     monkeypatch.setattr(daily_pipeline.settings, "data_dir", tmp_path)
     monkeypatch.setattr(preferences, "load", lambda: {
         "pipeline_pull_a_share": False, "pipeline_pull_etf": False,
@@ -53,13 +53,13 @@ def _run_pipeline(tmp_path: Path, monkeypatch, minute_provider: str) -> tuple[di
 
     calls: list[dict] = []
 
-    def fake_sync_minute(symbols, *args, **kwargs):
-        calls.append({"symbols": symbols, **kwargs})
-        return 1
+    def fake_enqueue(data_dir, kind, symbols, **kwargs):
+        if kind == "minute":
+            calls.append({"symbols": symbols, **kwargs})
+        return "test-task"
 
-    monkeypatch.setattr(
-        daily_pipeline.kline_sync, "sync_and_persist_minute", fake_sync_minute,
-    )
+    monkeypatch.setattr("app.services.maintenance_queue.enqueue", fake_enqueue)
+    monkeypatch.setattr(daily_pipeline.kline_sync, "resolve_minute_sync_universe", lambda *_a, **_kw: (["600519.SH"], "test"))
     repo = SimpleNamespace(
         store=SimpleNamespace(data_dir=tmp_path),
         latest_daily_date=lambda: date(2026, 9, 28),

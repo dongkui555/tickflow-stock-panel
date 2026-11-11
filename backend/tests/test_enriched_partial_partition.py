@@ -17,7 +17,7 @@ import pytest
 from app.indicators import pipeline
 from app.jobs import daily_pipeline
 from app.jobs.daily_pipeline import _prune_partial_enriched_partitions
-from app.services import data_integrity, preferences
+from app.services import daily_maintenance, data_integrity, maintenance_queue, preferences
 from app.tickflow.capabilities import CapabilitySet
 
 
@@ -93,7 +93,7 @@ def test_computed_partition_with_halt_is_preserved_on_repeated_checks(tmp_path, 
     )
     raw.write_parquet(raw_path)
     computed = pipeline._select_storage_cols(pipeline.compute_enriched(raw))
-    assert computed["symbol"].to_list() == ["600001.SH"]
+    assert computed["symbol"].to_list() == ["600001"]
     target = enriched / f"date={day}" / "part.parquet"
     target.parent.mkdir(parents=True)
     computed.write_parquet(target)
@@ -180,15 +180,23 @@ def test_all_halted_partition_does_not_require_active_rows(tmp_path):
     assert _prune_partial_enriched_partitions(daily, enriched) == []
 
 
-def test_pruned_interior_date_is_rebuilt_without_new_daily_or_factors(tmp_path, monkeypatch):
+@pytest.mark.parametrize("defect", ["missing", "partial", "stale_price"])
+def test_interior_date_is_queued_and_rebuilt_without_new_daily_or_factors(tmp_path, monkeypatch, defect):
     daily = tmp_path / "kline_daily"
     enriched = tmp_path / "kline_daily_enriched"
-    dates = ["2026-09-01", "2026-09-02", "2026-09-03"]
+    dates = [f"2026-09-{d:02}" for d in (1, 2, 3, 4, 7, 8, 9, 10)]
     for day in dates:
         _write_partition(daily, day, ["a", "b"])
-        _write_partition(enriched, day, ["a"] if day == dates[1] else ["a", "b"])
+        if day == dates[1] and defect == "missing":
+            continue
+        _write_partition(enriched, day, ["a"] if day == dates[1] and defect == "partial" else ["a", "b"])
+        target = enriched / f"date={day}" / "part.parquet"
+        pl.read_parquet(target).with_columns(
+            pl.lit(0.9 if day == dates[1] and defect == "stale_price" else 1.0).alias("raw_close")
+        ).write_parquet(target)
 
     monkeypatch.setattr(daily_pipeline.settings, "data_dir", tmp_path)
+    monkeypatch.setattr(daily_pipeline, "cn_today", lambda: date.fromisoformat(dates[-1]))
     monkeypatch.setattr(preferences, "load", lambda: {
         "pipeline_pull_a_share": False, "pipeline_regime_enabled": False,
         "minute_sync_enabled": False, "adj_factor_provider": "tickflow",
@@ -201,18 +209,32 @@ def test_pruned_interior_date_is_rebuilt_without_new_daily_or_factors(tmp_path, 
     monkeypatch.setattr(data_integrity, "scan_recent_integrity", lambda *_, **__: [])
     calls = []
 
-    def rebuild(**kwargs):
-        calls.append(kwargs)
-        assert kwargs["new_dates_only"] is True
-        assert kwargs["symbols"] is None
+    def rebuild(root, day):
+        assert root == tmp_path
+        calls.append(day)
         _write_partition(enriched, dates[1], ["a", "b"])
         return 2
 
-    monkeypatch.setattr(daily_pipeline, "run_pipeline", rebuild)
+    monkeypatch.setattr(pipeline, "run_date_pipeline", rebuild)
+    monkeypatch.setattr(daily_pipeline, "run_pipeline", lambda **_: pytest.fail("historical work must be queued"))
     repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path),
-                           latest_daily_date=lambda: date.fromisoformat(dates[-1]))
+                           latest_daily_date=lambda: date.fromisoformat(dates[-1]), refresh_cache=lambda: None)
     daily_pipeline.run_now(repo, CapabilitySet(set()))
-    assert len(calls) == 1
+    assert calls == []
+    task = maintenance_queue._read(tmp_path)[0]
+    assert task["kind"] == "enriched_dates" and task["items"] == [dates[1]]
+    daily_pipeline.run_now(repo, CapabilitySet(set()))
+    assert len(maintenance_queue._read(tmp_path)) == 1
+
+    def runner(fn, label, on_started):
+        on_started()
+        fn()
+        return True
+
+    assert maintenance_queue.tick(tmp_path, runner, lambda task, emit: daily_maintenance.execute(
+        repo, CapabilitySet(set()), task, emit))
+    assert calls == [date.fromisoformat(dates[1])]
     assert pl.read_parquet(enriched / f"date={dates[1]}" / "part.parquet")["symbol"].to_list() == ["a", "b"]
-    daily_pipeline.run_now(repo, CapabilitySet(set()))
-    assert len(calls) == 1
+    rows = maintenance_queue._read(tmp_path)
+    assert next(r for r in rows if r["kind"] == "enriched_dates")["status"] == "succeeded"
+    assert next(r for r in rows if r["kind"] == "regime")["options"]["reason"] == "input_changed"

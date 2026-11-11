@@ -332,8 +332,14 @@ def test_plain_zip_can_supply_dependencies_for_separately_uploaded_strategy(env,
 
 @pytest.mark.parametrize("name", ["../策略.py", "/策略.py", "包/../策略.py", "包\\策略.py"])
 def test_plain_zip_rejects_unsafe_paths(env, name):
-    with pytest.raises(resource_bundle.ResourceBundleError, match=r"路径|条目"):
-        inspect(loose_zip({name: strategy("custom_a").encode()}))
+    with io.BytesIO() as buffer:
+        with zipfile.ZipFile(buffer, "w") as archive:
+            entry = zipfile.ZipInfo(name)
+            # 写入原始路径，避免 Windows 的 ZipInfo 提前规范化反斜杠。
+            entry.filename = name
+            archive.writestr(entry, strategy("custom_a"))
+        with pytest.raises(resource_bundle.ResourceBundleError, match=r"路径|条目"):
+            inspect(buffer.getvalue())
 
 
 def test_plain_zip_rejects_duplicate_entries(env):

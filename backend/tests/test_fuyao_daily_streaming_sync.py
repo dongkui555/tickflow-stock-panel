@@ -36,6 +36,10 @@ class _StreamingProvider:
 
 @pytest.fixture
 def repo(tmp_path):
+    instruments = tmp_path / "instruments"
+    instruments.mkdir()
+    pl.DataFrame({"symbol": ["000001.SZ", "000002.SZ"],
+                  "code": ["000001", "000002"], "name": ["平安银行", "万科A"]}).write_parquet(instruments / "part.parquet")
     return KlineRepository(DataStore(tmp_path))
 
 
@@ -56,6 +60,7 @@ def test_sync_promotes_staged_files_without_reading_them_back(monkeypatch, repo)
         _daily("000002.SZ", date(2020, 1, 2)),
     ])
     _route_fuyao(monkeypatch, provider)
+    repo.get_instruments_asset("stock")
     monkeypatch.setattr(
         kline_sync.pl,
         "scan_parquet",

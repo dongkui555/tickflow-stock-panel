@@ -42,7 +42,13 @@ def _frame(symbol: str, rows: list[tuple[date, float, float]]) -> pl.DataFrame:
 
 
 def _write_bars(tmp_path: Path) -> None:
+    instruments = tmp_path / "instruments"
+    instruments.mkdir(exist_ok=True)
+    pl.DataFrame({"symbol": [SYM], "code": [SYM.split(".")[0]],
+                  "name": ["贵州茅台"]}).write_parquet(instruments / "part.parquet")
     repo = KlineRepository(DataStore(tmp_path))
+    repo.save_etf_instruments(pl.DataFrame({"symbol": [ETF], "code": [ETF.split(".")[0]],
+                                           "name": ["沪深300ETF"]}))
     repo.append_daily(_frame(SYM, BARS))
     repo.append_etf_daily(_frame(ETF, BARS))
 

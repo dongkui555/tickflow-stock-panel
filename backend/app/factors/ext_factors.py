@@ -202,9 +202,34 @@ def _timeseries_signature(ts_dir: Path) -> tuple | None:
         return None
 
 
+def _source_symbol_column(df: pl.DataFrame, config) -> str | None:
+    """Resolve the persisted identity column declared by an extension config.
+
+    Tushare tables commonly persist ``ts_code`` while the internal frames use
+    ``symbol``. Market-level tables have no security identity and therefore
+    cannot be joined into a security frame.
+    """
+    if "symbol" in df.columns:
+        return "symbol"
+    if bool(getattr(config, "market_level", False)):
+        return None
+    mapping = getattr(config, "symbol_map", {}) or {}
+    if mapping.get("type") == "mapped":
+        source = str(mapping.get("col") or "").strip()
+        if source and source in df.columns:
+            return source
+    for candidate in ("ts_code", "code"):
+        if candidate in df.columns:
+            return candidate
+    return None
+
+
 def _select_fields(df: pl.DataFrame, config, fields: list, *, with_date: str | None) -> pl.DataFrame:
     """选列 + 统一 dtype: int/float → Float64 (数值阈值), string → Utf8 (contains)。"""
-    exprs = [pl.col("symbol").cast(pl.Utf8)]
+    source_symbol = _source_symbol_column(df, config)
+    if source_symbol is None:
+        return pl.DataFrame()
+    exprs = [pl.col(source_symbol).cast(pl.Utf8).alias("symbol")]
     for f in fields:
         name = ext_column_name(config.id, f.name)
         if f.name not in df.columns:

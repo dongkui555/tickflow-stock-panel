@@ -40,6 +40,9 @@ def env(tmp_path, monkeypatch):
         raise AssertionError("精准修补不应调用整条盘后管道")
     monkeypatch.setattr(daily_pipeline, "run_now", full_pipeline)
     repo = KlineRepository(DataStore(tmp_path))
+    pl.DataFrame({"symbol": [A, B], "code": ["600001", "600002"]}).write_parquet(
+        tmp_path / "instruments/all.parquet",
+    )
     for n in range(4):
         day = BAD_DAY + timedelta(days=n)
         repo.append_daily(frame(day))
@@ -110,7 +113,8 @@ def test_empty_source_removes_only_confirmed_nontrading_residue_with_backup(env,
         )
     elif evidence == "before_listing":
         monkeypatch.setattr(env.repo, "get_instruments_asset", lambda _: pl.DataFrame({
-            "symbol": [A, B], "listing_date": [BAD_DAY + timedelta(days=1), date(2000, 1, 1)],
+            "symbol": [A, B], "code": ["600001", "600002"],
+            "listing_date": [BAD_DAY + timedelta(days=1), date(2000, 1, 1)],
         }))
     else:
         ts = int(datetime.combine(BAD_DAY - timedelta(days=1), time(15), tzinfo=CN_TZ).timestamp() * 1000)
@@ -133,7 +137,7 @@ def test_empty_source_removes_only_confirmed_nontrading_residue_with_backup(env,
     enriched = pl.read_parquet(env.root / f"kline_daily_enriched/date={BAD_DAY}/part.parquet")
     assert enriched["symbol"].to_list() == [B]
     later = pl.read_parquet(env.root / f"kline_daily_enriched/date={BAD_DAY + timedelta(days=1)}/part.parquet")
-    assert A in later["symbol"].to_list()
+    assert later.filter(pl.col("symbol").is_in([A, "600001"])).height == 1
 
 
 @pytest.mark.parametrize("column,value", [("volume", None), ("amount", None), ("amount", 1.0), ("volume", -1.0)])
@@ -417,7 +421,12 @@ def test_repair_rejects_linked_history_and_preserves_outside_file(env, table):
     original = path.read_bytes()
     outside.write_bytes(original)
     path.unlink()
-    path.symlink_to(outside)
+    try:
+        path.symlink_to(outside)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        pytest.skip("Windows does not grant symlink creation to this test process")
     report = integrity_check.run_check(env.root, asset_types=["stock"])
     with pytest.raises(ValueError, match=r"链接|目录以外"):
         integrity_check.run_repair(env.repo, env.caps, report["id"])
@@ -431,6 +440,8 @@ def test_etf_and_index_repairs_never_write_stock_data(env, monkeypatch, asset, s
     from app.tickflow.repository import daily_dirname
 
     stock_before = {p: p.read_bytes() for p in (env.root / "kline_daily").rglob("*.parquet")}
+    save_instruments = env.repo.save_etf_instruments if asset == "etf" else env.repo.save_index_instruments
+    save_instruments(pl.DataFrame({"symbol": [symbol], "code": [symbol.split(".")[0]]}))
     for n in range(3):
         env.repo.append_daily_asset(asset, frame(BAD_DAY + timedelta(days=n), (symbol,), (10.0,)))
     path = env.root / daily_dirname(asset) / f"date={BAD_DAY}/part.parquet"
@@ -460,7 +471,9 @@ def test_recompute_uses_full_raw_history_and_preserves_prior_dates_and_other_sto
             days.append(cursor)
             env.repo.append_daily(frame(cursor, prices=(10 + len(days) % 11 / 10, 20.0)))
         cursor += timedelta(days=1)
-    instruments = pl.DataFrame({"symbol": [A, B], "name": ["A", "B"], "float_shares": [1e6, 2e6]})
+    instruments = pl.DataFrame({
+        "symbol": [A, B], "code": ["600001", "600002"], "name": ["A", "B"], "float_shares": [1e6, 2e6],
+    })
     instruments.write_parquet(env.root / "instruments/all.parquet")
     factors = pl.DataFrame({"symbol": [A], "trade_date": [days[30]], "ex_factor": [1.1]})
     factors.write_parquet(env.root / "adj_factor/all.parquet")
@@ -472,20 +485,25 @@ def test_recompute_uses_full_raw_history_and_preserves_prior_dates_and_other_sto
     correct = raw.with_columns(pl.when((pl.col("symbol") == A) & (pl.col("date") == BAD_DAY))
                                .then(pl.lit(10.0)).otherwise(pl.col("close")).alias("close"))
     expected = pipeline._select_storage_cols(pipeline.compute_enriched(correct, factors=factors, instruments=instruments, historical_shares=shares))
-    env.repo.append_enriched(expected)
+    for (day,), part in expected.partition_by("date", as_dict=True).items():
+        path = env.root / f"kline_daily_enriched/date={day}/part.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        part.write_parquet(path)
     prior = env.root / f"kline_daily_enriched/date={days[-1]}/part.parquet"
     prior_bytes = prior.read_bytes()
-    other_before = expected.filter(pl.col("symbol") == B).sort("date")
+    other_before = expected.filter(pl.col("symbol") == "600002").sort("date")
     report = integrity_check.run_check(env.root, asset_types=["stock"])
     result = integrity_check.run_repair(env.repo, env.caps, report["id"])
     assert result["status"] == "clean"
     from app.parquet import scan_enriched_parquet
     actual = scan_enriched_parquet(str(env.root / "kline_daily_enriched/date=*/*.parquet")).collect().select(expected.columns).sort("symbol", "date")
-    assert_frame_equal(actual.filter(pl.col("symbol") == B).sort("date"), other_before, check_exact=True)
-    assert_frame_equal(actual.filter(pl.col("symbol") == A), expected.filter(pl.col("symbol") == A).sort("date"), check_exact=True)
+    assert_frame_equal(actual.filter(pl.col("symbol") == "600002").sort("date"), other_before, check_exact=True)
+    actual_target = actual.filter(pl.col("symbol") == "600001")
+    expected_target = expected.filter(pl.col("symbol") == "600001").sort("date")
+    assert_frame_equal(actual_target, expected_target, check_exact=True)
     assert prior.read_bytes() == prior_bytes
-    indicators = pipeline.compute_indicators(actual.filter(pl.col("symbol") == A))
-    full_expected = pipeline.compute_indicators(expected.filter(pl.col("symbol") == A))
+    indicators = pipeline.compute_indicators(actual_target)
+    full_expected = pipeline.compute_indicators(expected_target)
     assert_frame_equal(indicators.select("date", "ma20", "macd_dif"), full_expected.select("date", "ma20", "macd_dif"), check_exact=True)
 
 

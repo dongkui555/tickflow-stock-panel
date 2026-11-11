@@ -54,6 +54,9 @@ const DATASET_LABEL: Record<string, string> = {
   adj_factor: '除权',
   depth5: '五档',
   financial: '财务',
+  moneyflow: '主力资金',
+  auction: '集合竞价',
+  news: '新闻',
   full_minute: '全量分钟',
 }
 
@@ -65,6 +68,9 @@ const CAP_ICON: Record<string, React.ComponentType<{ className?: string }>> = {
   full_minute: Zap,
   adj_factor: Scale,
   financial: Landmark,
+  moneyflow: Landmark,
+  auction: Timer,
+  news: Database,
 }
 
 /** TickFlow 档位要求文本: none → 全档位, 其余 → starter+ 形式 */
@@ -180,7 +186,7 @@ function CapabilityCard({ cap, pendingKey, onSelect }: {
             title={`「${cap.label}」当前路由的源无法提供该能力 — 可切换下方可用源, 或在数据源区接入其他源`}
           >
             <AlertTriangle className="h-3 w-3 shrink-0" />
-            能力不可用
+            {cap.backup_available ? '主源不可用，备用已启用' : '能力不可用'}
           </span>
         ) : (
           <>
@@ -235,7 +241,7 @@ function CapabilityCard({ cap, pendingKey, onSelect }: {
         ))}
         {chipsEmpty && (
           <span className="text-[10px] text-muted/50">
-            暂无可用提供方
+            {cap.backup_available ? '腾讯 → 新浪 → 东方财富 → 雪球' : '暂无可用提供方'}
           </span>
         )}
       </div>
@@ -350,13 +356,13 @@ function CapabilityRoutingSection() {
           </button>
         </div>
       ) : matrix.isLoading || list.length === 0 ? (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-2.5">
           {Array.from({ length: 5 }).map((_, i) => (
             <div key={i} className="h-[120px] rounded-lg border border-border/50 bg-elevated/20 animate-pulse" />
           ))}
         </div>
       ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-2.5">
           {list.map(cap => (
             <CapabilityCard
               key={cap.id}
@@ -540,10 +546,13 @@ function CapabilityChips({ caps, servingSet, isTickFlow, paid = false }: {
     <div className="flex flex-wrap gap-1">
       {caps.map(cap => {
         const servingNow = servingSet.has(cap.id)
-        const locked = isTickFlow && !cap.tf_available
+        const unsupported = isTickFlow && cap.tf_supported === false
+        const locked = isTickFlow && !unsupported && !cap.tf_available
         const cls = servingNow
           ? 'bg-accent/15 text-accent'
-          : locked
+          : unsupported
+            ? 'bg-elevated/30 text-muted/40'
+            : locked
             ? 'bg-warning/8 text-warning/70'
             : 'bg-elevated/60 text-muted/70'
         const title = servingNow
@@ -568,6 +577,51 @@ function CapabilityChips({ caps, servingSet, isTickFlow, paid = false }: {
         )
       })}
     </div>
+  )
+}
+
+function BackupRoutesPanel() {
+  const query = useQuery({ queryKey: QK.backupRoutes, queryFn: api.backupRoutes, refetchInterval: 15000 })
+  const data = query.data
+  const names = Object.fromEntries((data?.chain ?? []).map(s => [s.source, s.label]))
+  const label = (name: string) => name.startsWith('primary_realtime:') ? `行情主源 · ${name.split(':')[1]}`
+    : name.startsWith('primary_depth5:') ? `盘口主源 · ${name.split(':')[1]}` : names[name] ?? name
+  const errorLabel = (error: string) => (({ ConnectionError: '连接失败', TimeoutError: '请求超时',
+    empty_or_stale_or_invalid_for_batch: '本批无有效数据', empty_or_invalid_depth: '本批无有效盘口',
+    invalid_or_empty: '主源数据未通过校验' } as Record<string, string>)[error] ?? error)
+  const live = data?.realtime
+  return (
+    <section className="border-y border-border py-4 space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-sm font-medium flex items-center gap-2"><Route className="h-4 w-4 text-accent" />自动备用链路</h2>
+        <button title="刷新备用链路状态" aria-label="刷新备用链路状态" onClick={() => query.refetch()} disabled={query.isFetching}
+          className="p-1.5 hover:bg-elevated rounded disabled:opacity-50">
+          <RefreshCw className={`h-3.5 w-3.5 ${query.isFetching ? 'animate-spin' : ''}`} />
+        </button>
+      </div>
+      {query.isError ? <p className="text-xs text-warning">备用链路状态读取失败</p> : !data ?
+        <p className="text-xs text-muted">加载中</p> : <>
+        <dl className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+          <div><dt className="text-muted">实时行情</dt><dd className="mt-1 break-words">{data.primary} → {data.chain.map(s => s.label).join(' → ')}</dd></div>
+          <div><dt className="text-muted">五档盘口</dt><dd className="mt-1 break-words">TickFlow → {data.chain.map(s => s.label).join(' → ')}</dd></div>
+          <div><dt className="text-muted">历史分钟</dt><dd className="mt-1">{data.minute.primary} → {data.minute.backup ?? '未配置备用'}</dd></div>
+          <div><dt className="text-muted">本轮行情</dt><dd className={`mt-1 ${live?.degraded ? 'text-warning' : ''}`}>
+            {!data.enabled ? '备用未启用' : !live ? '等待行情轮询' : live.degraded ? '降级覆盖' : '主源正常'}
+            {live ? ` · 重点标的缺 ${live.priority_missing}/${live.priority_requested}` : ''}
+            {live?.rejected_primary ? ` · 主源校验排除 ${live.rejected_primary} 条` : ''}
+          </dd></div>
+        </dl>
+        {live && <div className="text-xs text-muted break-words">实际来源：{Object.entries(live.sources).map(([s, n]) => `${label(s)} ${n}只`).join('、') || '暂无有效行情'} · {live.checked_at.replace('T', ' ').slice(0, 19)}</div>}
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs text-left"><thead className="text-muted"><tr>
+            <th className="py-2 font-normal">来源</th><th className="font-normal">检查状态</th><th className="font-normal">重试等待</th>
+          </tr></thead><tbody>{Object.entries(data.health).map(([source, item]) => <tr key={source} className="border-t border-border/60">
+            <td className="py-2 break-all">{label(source)}</td><td title={item.error || undefined} className={item.failures ? 'text-warning' : 'text-muted'}>{errorLabel(item.error) || '最近检查有效'}</td>
+            <td>{item.retry_in_s > 0 ? `${Math.ceil(item.retry_in_s)}秒` : '无'}</td>
+          </tr>)}</tbody></table>
+        </div>
+      </>}
+    </section>
   )
 }
 
@@ -597,21 +651,11 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
 
   const selectedCustom = customList.find(s => s.name === selected)
 
-  // ===== 各能力当前的有效提供方 (除权 same_as_daily = 跟随日K) =====
-  // 用于能力芯片"服务中"态与详情卡标识: 路由切换在上方能力路由区, 这里只读展示
-  const dailyPref = prefs.data?.daily_data_provider || 'tickflow'
-  const adjPref = prefs.data?.adj_factor_provider || 'same_as_daily'
-  const effProvider: Record<string, string> = {
-    daily: dailyPref,
-    adj_factor: adjPref === 'same_as_daily' ? dailyPref : adjPref,
-    minute: prefs.data?.minute_data_provider || 'tickflow',
-    full_minute: prefs.data?.full_minute_data_provider || 'tickflow',
-    realtime: prefs.data?.realtime_data_provider || 'tickflow',
-    depth5: prefs.data?.depth5_data_provider || 'tickflow',
-    financial: prefs.data?.financial_data_provider || 'tickflow',
+  const servingDatasets = (name: string) => {
+    return (matrix.data?.capabilities ?? [])
+      .filter(c => c.effective === name && c.usable)
+      .map(c => c.id)
   }
-  const servingDatasets = (name: string) =>
-    Object.entries(effProvider).filter(([, v]) => v === name).map(([k]) => k)
   const servingSetOf = (name: string) => new Set(servingDatasets(name))
 
   const matrixCaps = matrix.data?.capabilities ?? []
@@ -703,6 +747,7 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
     <div className="space-y-5 max-w-5xl">
       {/* ===== 上区: 能力路由 (能力为主视图, 点标签切换提供方) ===== */}
       <CapabilityRoutingSection />
+      <BackupRoutesPanel />
 
       {/* ===== 下区: 数据源 (源为主视图, 配置/接入) ===== */}
       <AnchorWrap highlight={highlight} anchor="data-sources">
@@ -900,7 +945,7 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
         )}
 
         <div className="mt-3 flex items-center gap-3 text-[10px] text-muted/50 flex-wrap">
-          <span>芯片: 高亮=服务中 · 灰=已适配 · <Lock className="inline h-2.5 w-2.5" />=需更高档位</span>
+          <span>芯片: 高亮=服务中 · 灰=已适配 · <Lock className="inline h-2.5 w-2.5" />=需更高档位 · 淡灰=该源不提供</span>
           <span className="text-muted/30">·</span>
           <span>单击卡片查看介绍与配置, 点「套用」让该源接管其适配的全部能力</span>
         </div>
@@ -1201,11 +1246,17 @@ function TickFlowDetail({ active, matrix }: { active: boolean; matrix?: Capabili
                       <span className="text-xs text-foreground">{cap.label}</span>
                       <span className="ml-1.5 text-[10px] text-muted/60">{cap.desc}</span>
                     </div>
-                    <TierReqChip tier={cap.tf_tier} currentLabel={tier} />
+                    {cap.tf_supported === false ? (
+                      <span className="w-[70px] text-right text-[10px] text-muted/40 shrink-0">不支持</span>
+                    ) : (
+                      <TierReqChip tier={cap.tf_tier} currentLabel={tier} />
+                    )}
                     {cap.tf_available ? (
                       <span className="w-[52px] text-right text-[10px] text-bear inline-flex items-center justify-end gap-0.5 shrink-0">
                         <Check className="h-2.5 w-2.5" />可用
                       </span>
+                    ) : cap.tf_supported === false ? (
+                      <span className="w-[52px] text-right text-[10px] text-muted/40 shrink-0">—</span>
                     ) : (
                       <span className="w-[52px] text-right text-[10px] text-warning/80 shrink-0">未解锁</span>
                     )}

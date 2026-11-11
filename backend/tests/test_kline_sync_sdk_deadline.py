@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import time
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -94,3 +95,43 @@ def test_daily_loop_timeout_marks_failed(monkeypatch):
     assert df.is_empty()
     assert sorted(failed) == ["000001.SZ", "600000.SH"]
     assert [b[0] for b in beats] == [1, 2]
+
+
+@pytest.mark.parametrize('kind', ['daily_count', 'daily_range', 'minute_count', 'minute_range', 'adj_factor'])
+def test_late_sdk_calls_keep_original_batch_and_segment(monkeypatch, kind):
+    pending, calls = [], []
+
+    def abandon(fn):
+        pending.append(fn)
+        raise SDKCallTimeoutError('delayed worker')
+
+    def record(symbols, **kwargs):
+        calls.append((list(symbols), kwargs))
+
+    monkeypatch.setattr(kline_sync, '_sdk_call_with_deadline', abandon)
+    monkeypatch.setattr(kline_sync, 'get_client', lambda: SimpleNamespace(
+        klines=SimpleNamespace(batch=record, ex_factors=record)))
+    monkeypatch.setattr(kline_sync, 'sleep_between_batches', lambda *a: None)
+    monkeypatch.setattr(kline_sync, '_try_custom_minute', lambda *a, **k: (None, True))
+    symbols = ['600000.SH', '000001.SZ']
+    window = {'start_time': datetime(2026, 8, 3), 'end_time': datetime(2026, 8, 5)}
+    if kind.startswith('daily'):
+        kline_sync.sync_daily_batch(symbols, batch_size=1, **(window if kind.endswith('range') else {}))
+    elif kind.startswith('minute'):
+        from app.data_providers.base import ProviderRequestError
+
+        with pytest.raises(ProviderRequestError, match="分钟同步未完成"):
+            kline_sync.sync_minute_batch(symbols, batch_size=1, segment_trading_days=1,
+                                        **(window if kind.endswith('range') else {}))
+    else:
+        monkeypatch.setattr(kline_sync.preferences, 'get_adj_factor_provider', lambda: 'tickflow')
+        monkeypatch.setattr(kline_sync, 'resolve_limit', lambda *a, **k: SimpleNamespace(batch=1, rpm=None))
+        kline_sync.sync_adj_factor(symbols, None, SimpleNamespace(has=lambda _: True))
+    # Execute abandoned workers only after both loops advanced to their end.
+    for fn in pending:
+        fn()
+    assert [call[0] for call in calls] == [[symbols[0]], [symbols[1]]] * (len(pending) // 2)
+    if kind == 'minute_range':
+        expected = [datetime(2026, 8, 3), datetime(2026, 8, 4)]
+        assert [calls[index][1]['start_time'] for index in (0, 2)] == [
+            kline_sync._datetime_to_ms(value) for value in expected]

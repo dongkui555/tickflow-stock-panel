@@ -1,0 +1,17 @@
+# Local acceptance runtime, using the previously frozen dependency environment.
+# This does not replace the production image or certify the normal image build.
+FROM tick-panel-v035-locked-tests:latest
+WORKDIR /app
+COPY backend/app /app/app
+COPY scripts /app/scripts
+COPY frontend/dist /app/static
+COPY tiers.yaml backend/pyproject.toml backend/uv.lock /app/
+ENV PYTHONPATH=/app \
+    DATA_DIR=/acceptance-data \
+    STATIC_DIR=/app/static \
+    TIERS_YAML=/app/tiers.yaml \
+    TICKFLOW_ENV_FILE=/tmp/no-env \
+    WATCHDOG_ENABLED=false \
+    BACKTEST_MATRIX_CACHE_PREWARM=false
+ENTRYPOINT ["/opt/v035-venv/bin/python"]
+CMD ["/app/scripts/serve_upgrade_acceptance.py", "--data-dir", "/acceptance-data", "--host", "0.0.0.0", "--port", "3019"]

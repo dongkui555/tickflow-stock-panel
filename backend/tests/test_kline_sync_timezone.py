@@ -47,6 +47,26 @@ def test_fetch_minute_single_window_is_beijing_wall_clock(monkeypatch):
     assert (end.date(), end.hour, end.minute) == (date(2026, 8, 14), 15, 5)
 
 
+def test_latest_minute_watermark_resolves_each_requested_alias(tmp_path):
+    instruments = tmp_path / "instruments"
+    instruments.mkdir()
+    pl.DataFrame({"symbol": ["600000.SH"], "code": ["600000"]}).write_parquet(
+        instruments / "instruments.parquet"
+    )
+    partition = tmp_path / "kline_minute" / "date=2026-10-08"
+    partition.mkdir(parents=True)
+    latest = datetime(2026, 10, 8, 15)
+    pl.DataFrame({"symbol": ["600000.SH", "600000.SZ"],
+                  "datetime": [latest, latest + timedelta(days=1)]}).write_parquet(
+        partition / "part.parquet"
+    )
+    repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
+    result = kline_sync._latest_minute_datetime_by_symbol(
+        repo, ["600000", "600000.SH", "600000.SZ"]
+    )
+    assert result == {"600000": latest, "600000.SH": latest}
+
+
 def _capture_minute_window(monkeypatch, tmp_path, local_dt: datetime, **kwargs) -> dict:
     """桩掉 sync_and_persist_minute 的外部依赖, 只截获传给取数层的时间窗口。
 
@@ -64,6 +84,7 @@ def _capture_minute_window(monkeypatch, tmp_path, local_dt: datetime, **kwargs) 
     monkeypatch.setattr(kline_sync, "_migrate_symbol_to_date_partition", lambda repo: None)
     monkeypatch.setattr(kline_sync, "resolve_limit", lambda *a, **kw: SimpleNamespace(batch=100, rpm=30))
     monkeypatch.setattr(kline_sync, "sync_minute_batch", _fake_sync_minute_batch)
+    monkeypatch.setattr(kline_sync, "_latest_minute_datetime_by_symbol", lambda *a, **kw: {"600000.SH": local_dt})
 
     repo = MagicMock()
     repo.store.data_dir = tmp_path

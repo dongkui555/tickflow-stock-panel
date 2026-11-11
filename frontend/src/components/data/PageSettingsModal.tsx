@@ -21,7 +21,7 @@ import { storage } from '@/lib/storage'
 
 export type CardKey =
   | 'instruments' | 'daily' | 'adj_factor' | 'enriched'
-  | 'index' | 'etf' | 'minute' | 'financials' | 'regime'
+  | 'index' | 'etf' | 'minute' | 'financials' | 'moneyflow' | 'auction_open' | 'news' | 'regime'
 
 interface CardDef {
   key: CardKey
@@ -43,6 +43,9 @@ export const DATA_CARD_DEFS: CardDef[] = [
   { key: 'etf',         label: 'ETF',      desc: '场内交易基金日K',         defaultHiddenIfNoCap: false, defaultHidden: true },
   { key: 'minute',      label: '分钟 K',   desc: '分钟级K线(依赖分钟K批量数据)',  defaultHiddenIfNoCap: true },
   { key: 'financials',  label: '财务数据', desc: '财报数据(依赖财务数据)',    defaultHiddenIfNoCap: true },
+  { key: 'moneyflow',   label: '主力资金', desc: '大单与主力资金流向',     defaultHiddenIfNoCap: false },
+  { key: 'auction_open', label: '集合竞价', desc: '开盘集合竞价量价',       defaultHiddenIfNoCap: false },
+  { key: 'news',        label: '国内外新闻', desc: 'A股、海外与美股新闻归档', defaultHiddenIfNoCap: false },
   { key: 'regime',      label: '市场环境', desc: '每日环境状态(本地计算)', defaultHiddenIfNoCap: false },
 ]
 
@@ -54,6 +57,8 @@ const CAP_KEY_MAP: Partial<Record<CardKey, string>> = {
   adj_factor: 'adj_factor',
   minute: 'kline.minute.batch',
   financials: 'financial',
+  moneyflow: 'moneyflow',
+  auction_open: 'auction',
 }
 
 /**

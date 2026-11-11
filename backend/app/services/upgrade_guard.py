@@ -197,6 +197,7 @@ class UpgradeGuard:
         modified: list[str] = []
         added: list[str] = []
         seen: set[str] = set()
+        stable_before = time.time_ns() - 1_000_000_000
         data_root = self.data_dir.resolve()
         if self.root == data_root:
             raise ValueError("程序目录与数据目录相同，无法安全扫描升级备份")
@@ -216,11 +217,18 @@ class UpgradeGuard:
                 seen.add(rel)
                 stat = path.stat()
                 entry = cache.get(rel)
-                if entry and entry.get("s") == stat.st_size and entry.get("m") == stat.st_mtime_ns:
+                signature = [stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+                if entry and entry.get("stable") and entry.get("signature") == signature:
                     digest = str(entry.get("h", ""))
                 else:
                     digest = _sha256(path)
-                    cache[rel] = {"s": stat.st_size, "m": stat.st_mtime_ns, "h": digest}
+                    # A rapid, same-size rewrite may share the filesystem
+                    # timestamp of the content just hashed. Recheck recent edits.
+                    cache[rel] = {
+                        "signature": signature,
+                        "stable": max(stat.st_mtime_ns, stat.st_ctime_ns) < stable_before,
+                        "h": digest,
+                    }
                 expected = self.manifest.get(rel)
                 if expected is None:
                     added.append(rel)

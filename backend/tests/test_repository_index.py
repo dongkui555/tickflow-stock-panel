@@ -67,20 +67,20 @@ def test_name_map_partial_query_does_not_poison_cache(repo):
     """
     _write_stock_instruments(repo, ["600000.SH", "000001.SZ"], ["浦发银行", "平安银行"])
     first = repo.get_name_map(["600000.SH"])
-    assert first == {"600000.SH": "浦发银行"}
+    assert first == {"600000.SH": "浦发银行", "600000": "浦发银行"}
     # 缓存必须是全量: 后续其他 symbols 查询仍能命中
     second = repo.get_name_map(["000001.SZ"])
-    assert second == {"000001.SZ": "平安银行"}
+    assert second == {"000001.SZ": "平安银行", "000001": "平安银行"}
     full = repo.get_name_map()
-    assert full == {"600000.SH": "浦发银行", "000001.SZ": "平安银行"}
+    assert full == {"600000.SH": "浦发银行", "600000": "浦发银行", "000001.SZ": "平安银行", "000001": "平安银行"}
 
 
 def test_name_map_cache_invalidated_on_instruments_refresh(repo):
     """维表刷新后缓存必须失效: 新收录的股票能立刻查到名称。"""
     _write_stock_instruments(repo, ["600000.SH"], ["浦发银行"])
-    assert repo.get_name_map(["600000.SH"]) == {"600000.SH": "浦发银行"}
+    assert repo.get_name_map(["600000.SH"]) == {"600000.SH": "浦发银行", "600000": "浦发银行"}
     _write_stock_instruments(repo, ["600000.SH", "301999.SZ"], ["浦发银行", "新股股份"])
-    assert repo.get_name_map(["301999.SZ"]) == {"301999.SZ": "新股股份"}
+    assert repo.get_name_map(["301999.SZ"]) == {"301999.SZ": "新股股份", "301999": "新股股份"}
 
 
 import datetime as _dt

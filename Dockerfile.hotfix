@@ -1,0 +1,18 @@
+# Offline hotfix layer: reuse the already-cached application image when the
+# registry is unreachable, while replacing the runtime source tree.
+FROM tick-stock-panel-v022-integrated-app:latest
+
+# The production image imports Python modules from /app/app.  Copying to
+# /app/backend leaves the running service on the old code, even though the
+# build appears successful.
+COPY backend/app/services/kline_sync.py /app/app/services/kline_sync.py
+COPY backend/app/services/minute_failover.py /app/app/services/minute_failover.py
+COPY backend/app/services/minute_repair.py /app/app/services/minute_repair.py
+COPY backend/app/services/data_integrity.py /app/app/services/data_integrity.py
+COPY backend/app/services/stockformer.py /app/app/services/stockformer.py
+COPY backend/app/services/minute_features.py /app/app/services/minute_features.py
+COPY backend/app/config.py /app/app/config.py
+COPY backend/app/plugins/qmt/provider.py /app/app/plugins/qmt/provider.py
+COPY backend/app/plugins/qmt/bridge.py /app/app/plugins/qmt/bridge.py
+COPY backend/app/api/kline.py /app/app/api/kline.py
+COPY frontend/dist /app/static

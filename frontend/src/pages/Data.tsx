@@ -10,6 +10,7 @@ import {
   Clock,
   Calendar,
   CheckSquare,
+  FileUp,
   Trash2,
   Plus,
   Wifi,
@@ -42,6 +43,8 @@ import { findDataSource } from '@/lib/dataSources'
 // 拆分出的子组件
 import { StatCard, type FieldTab, type CapLimitValue } from '@/components/data/StatCard'
 import { ActiveJobCard } from '@/components/data/ActiveJobCard'
+import { MaintenanceQueues } from '@/components/data/MaintenanceQueues'
+import { TushareCatalogPanel } from '@/components/data/TushareCatalogPanel'
 import { SectionTitle, HistoryRow } from '@/components/data/SectionTitle'
 import { SettingsModal } from '@/components/data/SettingsModal'
 import { ScheduleEditor } from '@/components/data/ScheduleEditor'
@@ -49,6 +52,7 @@ import { ExtendHistoryPanel } from '@/components/data/ExtendHistoryPanel'
 import { RepairDailyPanel } from '@/components/data/RepairDailyPanel'
 import { DataIntegrityPanel } from '@/components/data/DataIntegrityPanel'
 import { EnrichedRebuildPanel } from '@/components/data/EnrichedRebuildPanel'
+import { HistoryCsvImportPanel } from '@/components/data/HistoryCsvImportPanel'
 import { FinancialSyncPanel } from '@/components/data/FinancialSyncPanel'
 import { MinuteSyncConfig } from '@/components/data/MinuteSyncConfig'
 import { AdjFactorSyncConfig } from '@/components/data/AdjFactorSyncConfig'
@@ -185,6 +189,7 @@ export function Data() {
   const syncIndexDaily = useMutation({
     mutationFn: () => api.syncIndexDaily(indexSyncDays),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: QK.maintenanceQueue })
       qc.invalidateQueries({ queryKey: QK.dataStatus })
       qc.invalidateQueries({ queryKey: QK.indexQuotes })
       qc.invalidateQueries({ queryKey: ['index-daily'] })
@@ -218,12 +223,22 @@ export function Data() {
     merge('kline.daily.batch', usableOr('daily', !!tfCaps?.['kline.daily.batch']))
     merge('kline.minute.batch', usableOr('minute', !!tfCaps?.['kline.minute.batch']))
     merge('financial', usableOr('financial', !!tfCaps?.['financial']))
+    merge('moneyflow', usableOr('moneyflow', !!tfCaps?.['moneyflow']))
+    merge('auction', usableOr('auction', !!tfCaps?.['auction']))
+    merge('news', usableOr('news', !!tfCaps?.['news']))
     return m
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tfCaps, matrix.data])
 
   const minuteAuto = prefs.data?.minute_sync_enabled ?? false
   const pipelineSched = prefs.data?.pipeline_schedule ?? { hour: 15, minute: 30 }
+  const fullSyncSched = prefs.data?.full_sync_schedule ?? {
+    enabled: true,
+    premarket: { hour: 8, minute: 55 },
+    midday: { hour: 11, minute: 45 },
+    after_close: pipelineSched,
+    evening: { hour: 19, minute: 0 },
+  }
   const instrumentsSched = prefs.data?.instruments_schedule ?? { hour: 9, minute: 10 }
   const indexDailyBatchSize = prefs.data?.index_daily_batch_size ?? 100
 
@@ -274,6 +289,10 @@ export function Data() {
     { label: '日K', cap: 'daily' },
     ...(hasAdjCap ? [{ label: '复权', cap: 'adj_factor' as const }] : []),
     { label: '指标' },
+    { label: '财务' },
+    { label: '资金' },
+    { label: '竞价' },
+    { label: '新闻' },
     ...(indexAuto ? [{ label: '指数', cap: 'daily' as const }] : []),
     ...(etfAuto ? [{ label: 'ETF', cap: 'daily' as const }] : []),
     ...((hasMinuteCap && minuteAuto) ? [{ label: '分钟K', cap: 'minute' as const }] : []),
@@ -371,6 +390,10 @@ export function Data() {
     sync_adj: 'adj_factor',
     compute_enriched: 'enriched',
     rebuild_enriched: 'enriched',
+    sync_financials: 'financials',
+    sync_moneyflow: 'moneyflow',
+    sync_auction: 'auction_open',
+    sync_news: 'news',
     sync_index: 'index_daily',
     sync_minute: 'minute',
     extend_minute: 'minute',
@@ -413,6 +436,18 @@ export function Data() {
       topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
     })
   }, [])
+
+  const formatSchedule = (value: { hour: number; minute: number }) =>
+    `${String(value.hour).padStart(2, '0')}:${String(value.minute).padStart(2, '0')}`
+
+  const renderNextRun = (value?: string | null) => (
+    value ? (
+      <span className="inline-flex flex-col items-center leading-tight text-foreground">
+        <span>→ {formatScheduleDatePart(value)}</span>
+        <span>{formatScheduleTimePart(value)}</span>
+      </span>
+    ) : null
+  )
 
   // 按卡片 key 渲染对应的 StatCard (顺序由 getCardOrder 控制, 显隐由 cardVisible 控制)
   const renderStatCard = (k: CardKey): React.ReactNode => {
@@ -567,7 +602,7 @@ export function Data() {
           <StatCard
             title="财务数据"
             hint="财报 / 指标 / 历史股本"
-            stats={s?.financials ? { rows: s.financials.rows } : null}
+            stats={s?.financials ?? null}
             loading={isLoading}
             tierKey="financials"
             capLimits={mergedCaps}
@@ -581,6 +616,60 @@ export function Data() {
           />
         )
       }
+      case 'moneyflow':
+        return (
+          <StatCard
+            title="主力资金"
+            hint="分单成交 · 主力净流入"
+            stats={s?.moneyflow}
+            loading={isLoading}
+            active={activeCard === 'moneyflow'}
+            done={doneStages.has('moneyflow')}
+            skipped={skippedCards.has('moneyflow')}
+            stagePct={activeCard === 'moneyflow' ? (job.data?.stage_pct ?? 0) : 0}
+            tierKey="moneyflow"
+            capLimits={mergedCaps}
+            customProvider={routeProviderDisplay(matrix.data, 'moneyflow')}
+            subLabel="小单 · 中单 · 大单 · 特大单"
+            onShowFields={() => setSchemaTable('moneyflow')}
+          />
+        )
+      case 'auction_open':
+        return (
+          <StatCard
+            title="集合竞价"
+            hint="开盘竞价量价"
+            stats={s?.auction_open}
+            loading={isLoading}
+            active={activeCard === 'auction_open'}
+            done={doneStages.has('auction_open')}
+            skipped={skippedCards.has('auction_open')}
+            stagePct={activeCard === 'auction_open' ? (job.data?.stage_pct ?? 0) : 0}
+            tierKey="auction_open"
+            capLimits={mergedCaps}
+            customProvider={routeProviderDisplay(matrix.data, 'auction')}
+            subLabel="竞价价格 · 成交量 · 成交额"
+            onShowFields={() => setSchemaTable('auction_open')}
+          />
+        )
+      case 'news':
+        return (
+          <StatCard
+            title="国内外新闻"
+            hint="历史归档 · 实时公开源"
+            stats={s?.news}
+            loading={isLoading}
+            active={activeCard === 'news'}
+            done={doneStages.has('news')}
+            skipped={skippedCards.has('news')}
+            stagePct={activeCard === 'news' ? (job.data?.stage_pct ?? 0) : 0}
+            tierKey="news"
+            capLimits={mergedCaps}
+            customProvider={routeProviderDisplay(matrix.data, 'news')}
+            subLabel="A股 · 美股 · 海外财经 · 宏观"
+            onShowFields={() => setSchemaTable('news')}
+          />
+        )
       case 'regime':
         return (
           <StatCard
@@ -651,6 +740,14 @@ export function Data() {
             >
               <WandSparkles className="h-3.5 w-3.5" />
               自检/修补
+            </button>
+            <button
+              onClick={() => setOpenSettings('history-import')}
+              disabled={isRunning}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-btn text-secondary hover:text-accent hover:bg-accent/8 text-xs transition-colors duration-150 disabled:opacity-40 disabled:pointer-events-none"
+            >
+              <FileUp className="h-3.5 w-3.5" />
+              历史导入
             </button>
             <div className="w-px h-4 bg-border" />
             <div className="flex items-center gap-1.5">
@@ -762,11 +859,16 @@ export function Data() {
               </div>
             ) : (
               <div className="space-y-2">
-                <div className="flex items-center gap-1.5 text-[10px] text-muted pb-2 border-b border-border/50 flex-wrap">
-                  <span className="text-accent/60 font-medium">盘前</span>
-                  <span>个股维表</span>
+                <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-muted pb-2 border-b border-border/50">
+                  <span className="text-accent/60 font-medium">增强同步</span>
+                  <span>开盘前</span>
                   <span className="text-border">→</span>
-                  <span className="text-accent/60 font-medium">盘后</span>
+                  <span>午盘</span>
+                  <span className="text-border">→</span>
+                  <span>盘后</span>
+                  <span className="text-border">→</span>
+                  <span>晚间</span>
+                  <span className="text-muted/50">·</span>
                   {pipelineSteps.map((step, i) => (
                     <span key={step.label} className="contents">
                       {i > 0 && <span className="text-border">→</span>}
@@ -790,6 +892,76 @@ export function Data() {
                   <span className="text-muted">时区</span>
                   <span className="font-mono text-secondary">Asia/Shanghai</span>
                 </div>
+                <div className="flex items-center justify-between text-[11px]">
+                  <div className="flex items-center gap-1">
+                    <span className="text-muted">开盘前 · 增量补齐</span>
+                    <span className="text-muted/50">·</span>
+                    <span className="font-mono text-secondary">{formatSchedule(fullSyncSched.premarket)}</span>
+                  </div>
+                  <div className="flex items-center gap-2 font-mono text-secondary">
+                    {renderNextRun(s?.next_full_sync_runs?.premarket)}
+                  </div>
+                </div>
+                <div className="flex items-center justify-between text-[11px]">
+                  <div className="flex items-center gap-1">
+                    <span className="text-muted">午盘 · 增量补齐</span>
+                    <span className="text-muted/50">·</span>
+                    <span className="font-mono text-secondary">{formatSchedule(fullSyncSched.midday)}</span>
+                  </div>
+                  <div className="flex items-center gap-2 font-mono text-secondary">
+                    {renderNextRun(s?.next_full_sync_runs?.midday)}
+                  </div>
+                </div>
+                <div className="flex items-center justify-between text-[11px]">
+                  <div className="flex items-center gap-1">
+                    <span className="text-muted">盘后 · 增量补齐</span>
+                    <span className="text-muted/50">·</span>
+                    <span className="font-mono text-secondary">{formatSchedule(fullSyncSched.after_close)}</span>
+                    <button
+                      onClick={() => setShowScheduleEdit(v => !v)}
+                      className={`p-0.5 rounded hover:bg-elevated transition-colors ${showScheduleEdit ? 'text-accent' : 'text-secondary'}`}
+                    >
+                      <Clock className="h-3 w-3" />
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-2 font-mono text-secondary">
+                    {s?.last_pipeline_run && (
+                      <span className={`inline-flex flex-col items-center leading-tight ${isToday(s.last_pipeline_run) ? 'text-bear' : 'text-secondary/70'}`}>
+                        <span>✓ {formatScheduleDatePart(s.last_pipeline_run)}</span>
+                        <span>{formatScheduleTimePart(s.last_pipeline_run)}</span>
+                      </span>
+                    )}
+                    {renderNextRun(s?.next_full_sync_runs?.after_close ?? s?.next_pipeline_run)}
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span className="text-muted">晚间 · 增量补齐</span>
+                    <span className="text-muted/50">·</span>
+                    <span className="font-mono text-secondary">{formatSchedule(fullSyncSched.evening ?? { hour: 19, minute: 0 })}</span>
+                  </div>
+                  <div className="flex items-center gap-2 font-mono text-secondary">
+                    {renderNextRun(s?.next_full_sync_runs?.evening)}
+                  </div>
+                </div>
+                <AnimatePresence>
+                  {showScheduleEdit && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                      transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+                      className="overflow-hidden"
+                    >
+                      <ScheduleEditor
+                        value={fullSyncSched.after_close}
+                        onSave={(h, m) => updateSchedule.mutate({ hour: h, minute: m })}
+                        loading={updateSchedule.isPending}
+                        hint="不早于 15:00"
+                      />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
                 <div className="flex items-center justify-between text-[11px]">
                   <div className="flex items-center gap-1">
                     <span className="text-muted">盘前 · 个股维表</span>
@@ -837,53 +1009,6 @@ export function Data() {
                     </motion.div>
                   )}
                 </AnimatePresence>
-                <div className="flex items-center justify-between text-[11px]">
-                  <div className="flex items-center gap-1">
-                    <span className="text-muted">盘后 · 全量管道</span>
-                    <span className="text-muted/50">·</span>
-                    <span className="font-mono text-secondary">
-                      {`${String(pipelineSched.hour).padStart(2, '0')}:${String(pipelineSched.minute).padStart(2, '0')}`}
-                    </span>
-                    <button
-                      onClick={() => setShowScheduleEdit(v => !v)}
-                      className={`p-0.5 rounded hover:bg-elevated transition-colors ${showScheduleEdit ? 'text-accent' : 'text-secondary'}`}
-                    >
-                      <Clock className="h-3 w-3" />
-                    </button>
-                  </div>
-                  <div className="flex items-center gap-2 font-mono text-secondary">
-                    {s?.last_pipeline_run && (
-                      <span className={`inline-flex flex-col items-center leading-tight ${isToday(s.last_pipeline_run) ? 'text-bear' : 'text-secondary/70'}`}>
-                        <span>✓ {formatScheduleDatePart(s.last_pipeline_run)}</span>
-                        <span>{formatScheduleTimePart(s.last_pipeline_run)}</span>
-                      </span>
-                    )}
-                    {s?.next_pipeline_run && (
-                      <span className="inline-flex flex-col items-center leading-tight text-foreground">
-                        <span>→ {formatScheduleDatePart(s.next_pipeline_run)}</span>
-                        <span>{formatScheduleTimePart(s.next_pipeline_run)}</span>
-                      </span>
-                    )}
-                  </div>
-                </div>
-                <AnimatePresence>
-                  {showScheduleEdit && (
-                    <motion.div
-                      initial={{ opacity: 0, height: 0 }}
-                      animate={{ opacity: 1, height: 'auto' }}
-                      exit={{ opacity: 0, height: 0 }}
-                      transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-                      className="overflow-hidden"
-                    >
-                      <ScheduleEditor
-                        value={pipelineSched}
-                        onSave={(h, m) => updateSchedule.mutate({ hour: h, minute: m })}
-                        loading={updateSchedule.isPending}
-                        hint="不早于 15:00"
-                      />
-                    </motion.div>
-                  )}
-                </AnimatePresence>
               </div>
             )}
           </div>
@@ -919,6 +1044,9 @@ export function Data() {
                 { label: 'Enriched', files: storage?.enriched_files,    size: storage?.enriched_size_mb },
                 { label: '分钟 K',   files: storage?.minute_files,      size: storage?.minute_size_mb },
                 { label: '财务数据', files: storage?.financials_files,   size: storage?.financials_size_mb },
+                { label: '主力资金', files: storage?.moneyflow_files,    size: storage?.moneyflow_size_mb },
+                { label: '集合竞价', files: storage?.auction_open_files, size: storage?.auction_open_size_mb },
+                { label: '国内外新闻', files: storage?.news_files, size: storage?.news_size_mb },
               ].map((item) => (
                 <div key={item.label} className="flex items-center justify-between text-[11px]">
                   <span className="text-muted">{item.label}</span>
@@ -968,6 +1096,10 @@ export function Data() {
             ))}
           </div>
         </div>
+
+        <TushareCatalogPanel />
+
+        <MaintenanceQueues onJobClick={handleJobClick} />
 
         {/* 同步历史 */}
         <div>
@@ -1067,6 +1199,17 @@ export function Data() {
               onStart={() => setShowRepair(false)}
               /></div>
             </details>
+          </SettingsModal>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {openSettings === 'history-import' && (
+          <SettingsModal title="历史 CSV · 导入" onClose={() => setOpenSettings(null)}>
+            <HistoryCsvImportPanel
+              isRunning={!!activeJobId}
+              onStart={(jobId) => { setActiveJobId(jobId); setOpenSettings(null) }}
+            />
           </SettingsModal>
         )}
       </AnimatePresence>
@@ -1219,6 +1362,14 @@ export function Data() {
                 {!hasDailyBatchCap && (
                   <MissingCapChip capKey="kline.daily.batch" />
                 )}
+                {syncIndexDaily.data?.index_sync && (
+                  <p className="text-xs text-secondary" role="status">
+                    已完成 {syncIndexDaily.data.index_sync.completed_count}/{syncIndexDaily.data.index_sync.total_count} 只，
+                    未完成 {syncIndexDaily.data.index_sync.remaining_count} 只。
+                    {syncIndexDaily.data.status === 'queued' ? '缺口已加入增量队列。' : '所选区间已完整。'}
+                  </p>
+                )}
+                {syncIndexDaily.isError && <p className="text-xs text-danger" role="alert">{syncIndexDaily.error.message}</p>}
               </div>
             </div>
           </SettingsModal>

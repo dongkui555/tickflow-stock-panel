@@ -19,7 +19,8 @@ def abnormal_intraday(
 ):
     """盘中异动: 涨停/炸板/跌停翘板/跌停/新高/新低/放量 信号命中行。"""
     repo = request.app.state.repo
-    return build_intraday(repo, limit=limit)
+    quote_service = getattr(request.app.state, "quote_service", None)
+    return build_intraday(repo, quote_service, limit=limit)
 
 
 @router.get("/overview")

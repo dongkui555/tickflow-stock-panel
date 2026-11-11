@@ -119,7 +119,7 @@ def test_historical_turnover_uses_only_available_share_capital(monkeypatch):
             date(2024, 6, 30),
             date(2026, 7, 18),
         ],
-        "volume": [10_000.0] * 5,
+        "volume": [1_000_000.0] * 5,
     })
     instruments = pl.DataFrame({
         "symbol": ["600000.SH"],
@@ -147,7 +147,7 @@ def test_turnover_without_share_history_keeps_existing_behavior(monkeypatch):
     bars = pl.DataFrame({
         "symbol": ["600000.SH"],
         "date": [date(2024, 4, 15)],
-        "volume": [10_000.0],
+        "volume": [1_000_000.0],
     })
     instruments = pl.DataFrame({
         "symbol": ["600000.SH"],
@@ -163,6 +163,33 @@ def test_turnover_without_share_history_keeps_existing_behavior(monkeypatch):
     assert result["turnover_rate"][0] == pytest.approx(0.5)
 
 
+def test_turnover_uses_share_history_when_instruments_lack_float_shares(monkeypatch):
+    monkeypatch.setattr(pipeline, "cn_today", lambda: date(2026, 7, 18))
+    bars = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "date": [date(2026, 7, 18)],
+        "volume": [1_000_000.0],
+    })
+    instruments = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "name": ["浦发银行"],
+    })
+    shares = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "period_end": ["2026-06-30"],
+        "float_shares": [100_000_000.0],
+    })
+
+    result = pipeline.compute_limit_signals(
+        bars,
+        instruments,
+        needed={"turnover_rate"},
+        historical_shares=shares,
+    )
+
+    assert result["turnover_rate"][0] == pytest.approx(1.0)
+
+
 def test_data_status_includes_share_history(tmp_path):
     path = tmp_path / "financials" / "shares" / "part.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,4 +203,9 @@ def test_data_status_includes_share_history(tmp_path):
 
     assert result is not None
     assert result["rows"] == 3
-    assert result["tables"]["shares"] == {"rows": 3, "symbols": 2}
+    assert result["tables"]["shares"] == {
+        "rows": 3,
+        "symbols": 2,
+        "earliest_date": "2023-12-31",
+        "latest_date": "2024-06-30",
+    }

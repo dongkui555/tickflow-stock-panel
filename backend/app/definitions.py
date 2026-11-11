@@ -4,7 +4,7 @@
 本模块承载其中与计算无关的公共半边:
 
   - JsonDefinitionStore: 四处同型 JSON 持久化 (自定义信号/因子/监控规则/
-    批次) 的单一实现 — 原子写 + 损坏跳过告警 + 目录 mtime 签名。
+    批次) 的单一实现 — 原子写 + 损坏跳过告警 + 文件签名。
     失效广播/文件锁按架构路线 (docs/ext-architecture-plan.md) 在 P2
     物化阶段叠加, 此处不预建。
   - DefinitionKind + register_kind: 每种定义声明 id 规则/校验/依赖提取/
@@ -61,11 +61,13 @@ class JsonDefinitionStore:
         return self.dir(data_dir) / f"{def_id}.json"
 
     def fingerprint(self, data_dir: Path) -> tuple:
-        """目录内匹配文件的 (文件名, mtime) 签名 — 创建/删除/编辑都会变化。"""
+        """定义文件的名称、身份、大小和时间签名。"""
         try:
-            return tuple(
-                sorted((f.name, f.stat().st_mtime_ns) for f in self.dir(data_dir).glob(self.glob_pattern))
-            )
+            signature = []
+            for file in sorted(self.dir(data_dir).glob(self.glob_pattern)):
+                stat = file.stat()
+                signature.append((file.name, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+            return tuple(signature)
         except OSError:
             return ()
 

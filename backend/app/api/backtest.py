@@ -705,6 +705,29 @@ async def strategy_stream(
         if days > BACKTEST_MAX_SERVER_DAYS:
             guard_violated = True
 
+    # Reject before caching a job: an unstarted entry prevents an identical
+    # request from starting after the capability or historical coverage recovers.
+    rejection = BACKTEST_SERVER_GUARD_MESSAGE if guard_violated else None
+    if minute_fill and rejection is None:
+        from app.tickflow.capabilities import Cap
+
+        capset = request.app.state.capabilities
+        if not capset.has(Cap.KLINE_MINUTE_BATCH):
+            rejection = "分钟K精确回测当前没有可用的分钟数据源，请到数据源配置检查分钟K能力"
+        else:
+            repo = request.app.state.repo
+            earliest_minute = repo.earliest_minute_date() if hasattr(repo, "earliest_minute_date") else None
+            if earliest_minute is not None and start_date < earliest_minute:
+                rejection = (
+                    f"本地分钟K历史最早到 {earliest_minute}, 无法覆盖回测起始日 {start_date}。"
+                    "请先用「扩展分钟K历史」功能拉取更多数据, 或缩小回测区间。"
+                )
+    if rejection is not None:
+        async def rejected_stream():
+            yield f"event: error\ndata: {json.dumps({'message': rejection}, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(rejected_stream(), media_type="text/event-stream")
+
     job_key = _make_job_key(
         strategy_id, symbols, start, end,
         matching, entry_fill, exit_fill,
@@ -733,29 +756,6 @@ async def strategy_stream(
     )
 
     async def event_generator():
-        # 范围保护: 直接报错
-        if guard_violated:
-            yield f"event: error\ndata: {json.dumps({'message': BACKTEST_SERVER_GUARD_MESSAGE}, ensure_ascii=False)}\n\n"
-            return
-
-        # 分钟K精确回测: Pro+ 门控 + 数据范围检查
-        if minute_fill:
-            capset = request.app.state.capabilities
-            from app.tickflow.capabilities import Cap
-            if not capset.has(Cap.KLINE_MINUTE_BATCH):
-                _discard_unstarted_job(job)
-                yield f"event: error\ndata: {json.dumps({'message': '分钟K精确回测需要 Pro+ 权限 (kline.minute.batch)'}, ensure_ascii=False)}\n\n"
-                return
-            # 检查本地分钟K历史是否覆盖回测区间
-            repo = request.app.state.repo
-            earliest_minute = repo.earliest_minute_date() if hasattr(repo, "earliest_minute_date") else None
-            if earliest_minute is not None and start_date < earliest_minute:
-                msg = (f"本地分钟K历史最早到 {earliest_minute}, 无法覆盖回测起始日 {start_date}。"
-                       f"请先用「扩展分钟K历史」功能拉取更多数据, 或缩小回测区间。")
-                _discard_unstarted_job(job)
-                yield f"event: error\ndata: {json.dumps({'message': msg}, ensure_ascii=False)}\n\n"
-                return
-
         # 如果是新任务, 启动回测线程
         if _claim_job_start(job):
             cfg = StrategyBacktestConfig(
@@ -873,7 +873,12 @@ async def strategy_cancel(request: Request):
     def _get_opt_bool(key: str) -> bool:
         # 与 FastAPI/pydantic v2 查询参数 bool 解析口径一致 (真值别名集合),
         # 否则 stream/cancel 两端算出不同 job_key, 停止按钮失效
-        return _get(key).lower() in ("1", "true", "on", "yes", "t", "y")
+        value = _get(key, "false").lower()
+        if value in {"1", "true", "on", "yes", "t", "y"}:
+            return True
+        if value in {"0", "false", "off", "no", "f", "n"}:
+            return False
+        raise HTTPException(status_code=400, detail=f"{key} 必须为布尔值")
     job_key = _make_job_key(
         _get("strategy_id"),
         _get("symbols") or None,

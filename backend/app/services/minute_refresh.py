@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -134,13 +135,15 @@ class MinuteRefreshService:
     # ------------------------------------------------------------------
 
     def capability_ok(self) -> bool:
-        """Cap.INTRADAY_UNIVERSE (全量分钟) 存在。能力探测结果缓存在 app.state。
+        """分钟增量刷新可用。
 
         门控挂在稳态增量的主能力上; TickFlow 路径全天修复轮用的 intraday.batch
         与其同属 Expert 档 (tiers.yaml), 两者必然同时持有。自定义源声明
         full_minute 数据集且被路由时, 由 policy._augment_custom_sources 补授
         同一能力键 — 门控口径对两类源统一。
         """
+        if self.custom_provider_active():
+            return True
         capset = getattr(self._app_state, "capabilities", None) if self._app_state else None
         if capset is None:
             return False
@@ -151,6 +154,16 @@ class MinuteRefreshService:
         except Exception:
             return False
 
+    def custom_provider_active(self) -> bool:
+        """当前分钟源是否为可用的自定义 provider。"""
+        try:
+            from app.services import kline_sync
+
+            provider_name = preferences.get_minute_data_provider()
+            _, fallback, _ = kline_sync._resolve_minute_provider(provider_name)
+            return not fallback
+        except Exception:
+            return False
     def active_provider(self) -> str:
         """全量分钟生效源名；失效的自定义源不得静默伪装成 TickFlow。"""
         try:
@@ -225,15 +238,26 @@ class MinuteRefreshService:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
+            interval = REFRESH_INTERVAL_MIN
             try:
                 reason = self._gate_reason()
                 if reason is None:
+                    next_round = self._state.next_round_at
+                    now = time.time()
+                    if next_round is not None and now < next_round:
+                        self._stop.wait(min(_LOOP_STEP_S, next_round - now))
+                        continue
                     interval = self._effective_interval()
                     started = time.time()
                     self._run_round()
-                    # 固定节奏: 下一轮 = max(本轮起点+间隔, 本轮完成), 不补跑
                     finish = time.time()
-                    self._state.next_round_at = max(started + interval, finish)
+                    if self.custom_provider_active():
+                        # 自定义分钟源通常是逐标的请求。若一轮耗时超过 interval,
+                        # 旧逻辑会在完成后立刻进入下一轮, 盘中容易把网关打到 503。
+                        self._state.next_round_at = finish + max(interval, 120)
+                    else:
+                        # TickFlow universe 增量可按固定节奏跑, 且不补跑。
+                        self._state.next_round_at = max(started + interval, finish)
                     # 等到下一轮 (小步睡眠保持可停/偏好热切换)
                     while not self._stop.is_set():
                         now = time.time()
@@ -245,8 +269,15 @@ class MinuteRefreshService:
                             break
                         self._stop.wait(min(_LOOP_STEP_S, max(0.0, self._state.next_round_at - now)))
                     continue
-            except Exception as e:
+                self._state.next_round_at = None
+            except Exception as e:  # noqa: BLE001 — provider failure must keep the refresh worker alive
                 self._state.last_error = f"round failed: {e}"
+                retries = [getattr(e, "retry_after_seconds", None)]
+                retries.extend(item.get("retry_after_seconds") for item in (getattr(e, "issues", None) or [])
+                               if isinstance(item, dict))
+                delay = max(interval, 60, *(value for value in retries
+                            if isinstance(value, (int, float)) and math.isfinite(value)))
+                self._state.next_round_at = time.time() + delay
                 logger.warning("全量分钟轮次异常: %s", e)
             self._stop.wait(_LOOP_STEP_S)
 
@@ -280,6 +311,8 @@ class MinuteRefreshService:
         当日已有数据且覆盖滞后 ≤ _REPAIR_LAG_MINUTES (≈ 3 根余量) → 增量;
         冷启动 / 断档超阈值 / 连续空轮 → 全天修复。
         """
+        if self.custom_provider_active():
+            return "increment"
         if self._empty_rounds >= _EMPTY_ROUNDS_TO_REPAIR:
             return "full"
         lag = self._today_coverage_lag_minutes()
@@ -302,9 +335,29 @@ class MinuteRefreshService:
             # 无廉价增量端点的源: 增量轮退化为修复轮 (全天批量幂等覆盖, 数据不丢)
             mode = "full"
         mode_label = "增量" if mode == "increment" else "全天修复"
+        self._state.last_mode = mode
+        self._state.last_error = f"{mode_label}取数中"
         with self._round_lock:
-            if mode == "increment":
+            scoped_custom = self.custom_provider_active() and custom is None
+            capset = getattr(self._app_state, "capabilities", None) if self._app_state else None
+            if scoped_custom:
+                symbols, scope_label = self._custom_universe()
+                self._state.last_symbols = len(symbols)
+                self._state.extra = {"route": "custom_minute", "scope": scope_label}
+                if not symbols:
+                    self._state.last_error = "empty custom minute universe"
+                    logger.warning("分钟自定义源[%s] 本轮中止: %s 为空", mode_label, scope_label)
+                    return
+                fetch_started = time.perf_counter()
+                df, requests = kline_sync.fetch_custom_intraday_increment(
+                    symbols,
+                    self._repo,
+                    capset,
+                    full_day=(mode == "full"),
+                )
+            elif mode == "increment":
                 # fetch 计时只覆盖网络取数; full 分支的 universe 维表读取不计入
+                self._state.extra = {"route": "tickflow_universe", "scope": "全市场A股"}
                 fetch_started = time.perf_counter()
                 if custom is not None:
                     latest = kline_sync.fetch_intraday_custom_latest(custom, provider_name)
@@ -321,6 +374,7 @@ class MinuteRefreshService:
                     self._state.last_error = "empty universe (instruments 未加载)"
                     logger.warning("全量分钟[%s] 本轮中止: 标的池为空 (instruments 未加载)", mode_label)
                     return
+                self._state.extra = {"route": "tickflow_universe", "scope": "全市场A股"}
                 fetch_started = time.perf_counter()
                 if custom is not None:
                     df, requests = kline_sync.fetch_intraday_custom_batch(
@@ -357,7 +411,7 @@ class MinuteRefreshService:
             # 且会共用同一 tmp 文件交错损坏。实测增量轮落盘 ~10ms, 锁占用可忽略。
             with self._repo._write_lock:
                 written = kline_sync._write_minute_partition(
-                    df, self._repo.store.data_dir / "kline_minute",
+                    df, self._repo.store.data_dir / "kline_minute", asset_type="stock",
                 )
             write_ms = (time.perf_counter() - write_started) * 1000
 
@@ -380,6 +434,26 @@ class MinuteRefreshService:
         if inst.is_empty() or "symbol" not in inst.columns:
             return []
         return inst["symbol"].cast(pl.Utf8).unique().sort().to_list()
+
+    def _custom_universe(self) -> tuple[list[str], str]:
+        """自定义分钟源盘中增量范围。
+
+        scope=all 在盘中高频自定义源下风险太高, 自动降级为 StockFormer TopN;
+        全市场分钟适合通过数据页手动/定时批量同步。
+        """
+        from app.services import kline_sync
+
+        capset = getattr(self._app_state, "capabilities", None) if self._app_state else None
+        scope = preferences.get_minute_sync_scope()
+        if scope == "all":
+            symbols, label = kline_sync.resolve_minute_sync_universe(
+                self._repo,
+                capset,
+                scope="stockformer_top",
+                top_n=preferences.get_minute_sync_top_n(),
+            )
+            return symbols, f"{label}（盘中自定义源保护）"
+        return kline_sync.resolve_minute_sync_universe(self._repo, capset)
 
     # ------------------------------------------------------------------
     # 状态
@@ -420,12 +494,17 @@ class MinuteRefreshService:
         interval_seconds = 0.0
         with contextlib.suppress(Exception):
             interval_seconds = preferences.get_minute_refresh_interval()
+        custom, effective = self._resolve_custom()
+        provider = self.active_provider()
+        if custom is None and self.custom_provider_active():
+            provider = effective = preferences.get_minute_data_provider()
         return {
             "enabled": enabled,
             "running": running,
             "healthy": self.is_healthy(),
-            "provider": self.active_provider(),
-            "provider_effective": self._resolve_custom()[1],
+            "provider": provider,
+            "provider_effective": effective,
+            "custom_provider_active": self.custom_provider_active(),
             "repair_only": self.repair_only(),
             "interval_seconds": interval_seconds,
             "capability_ok": self.capability_ok(),
@@ -441,11 +520,15 @@ class MinuteRefreshService:
             "minute_basis_raw": self._state.minute_basis_raw,
             "next_round_at": self._state.next_round_at,
             "last_error": self._state.last_error,
+            "route": self._state.extra.get("route"),
+            "scope": self._state.extra.get("scope"),
         }
 
     def trigger_manual_round(self) -> dict[str, Any]:
         """手动触发一轮 (无视时段门控, 但仍受能力门控); 供状态页「立即刷新」。"""
         if not self.capability_ok():
             return {"ok": False, "reason": self._gate_reason() or "capability"}
+        if self._round_lock.locked():
+            return {"ok": False, "reason": "上一轮分钟增量刷新仍在运行"}
         threading.Thread(target=self._run_round, daemon=True, name="minute-refresh-manual").start()
         return {"ok": True}

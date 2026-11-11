@@ -577,6 +577,9 @@ def test_build_overview_rt_overlay_uses_board_benchmark(monkeypatch) -> None:
         _hist_cache.clear()
 
     class _GemQuotes:
+        def get_enriched_today(self):
+            return df, date(2026, 9, 18)
+
         def get_index_quotes(self):
             # 百分数口径: 创业板综指 +2%, 其余基准无行情 → 0
             return pl.DataFrame({"symbol": ["399102.SZ"], "change_pct": [2.0]})

@@ -781,6 +781,7 @@ def test_resolve_macos_codex_command_finds_bundled_cli(tmp_path, monkeypatch):
     cli.chmod(0o755)
 
     monkeypatch.setattr(ai_provider, "_MACOS_SYSTEM_APPLICATIONS", tmp_path)
+    monkeypatch.setattr(ai_provider, "_MACOS_CODEX_BIN_DIRS", ())
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
 
     assert ai_provider._resolve_macos_codex_command() == str(cli)
@@ -803,10 +804,14 @@ def test_resolve_macos_codex_command_scans_user_locations(tmp_path, monkeypatch)
 def test_resolve_macos_codex_command_skips_non_executable_file(tmp_path, monkeypatch):
     """同名但无可执行位的文件不是可用 CLI: 只查 is_file 会解析到它, 运行时报错不直观。"""
     monkeypatch.setattr(ai_provider, "_MACOS_SYSTEM_APPLICATIONS", tmp_path / "no-such-apps")
+    monkeypatch.setattr(ai_provider, "_MACOS_CODEX_BIN_DIRS", ())
     home = tmp_path / "home"
     local_bin = home / ".local" / "bin" / "codex"
     local_bin.parent.mkdir(parents=True)
     local_bin.write_bytes(b"not-a-binary\n")  # 0644, 无执行位
+    if os.name == "nt":
+        # Windows 没有 POSIX 执行权限位，模拟 macOS 的权限检查结果。
+        monkeypatch.setattr(ai_provider.os, "access", lambda path, mode: False)
 
     monkeypatch.setattr(Path, "home", lambda: home)
     assert ai_provider._resolve_macos_codex_command() is None

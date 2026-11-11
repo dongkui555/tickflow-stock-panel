@@ -43,7 +43,7 @@ def route(monkeypatch, tmp_path):
         "close": [1.0], "volume": [100.0], "amount": [100.0],
     })
     repo = KlineRepository(DataStore(tmp_path))
-    repo.save_etf_instruments(pl.DataFrame({"symbol": [ETF], "name": ["test"]}))
+    repo.save_etf_instruments(pl.DataFrame({"symbol": [ETF], "code": [ETF[:6]], "name": ["test"]}))
     monkeypatch.setattr(repo, "get_daily_asset", lambda *a: pl.DataFrame())
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(repo=repo, capabilities=CapabilitySet())), headers={})
     calls = []

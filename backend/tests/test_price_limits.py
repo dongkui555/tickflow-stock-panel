@@ -390,6 +390,56 @@ def test_limit_down_recovery_uses_raw_low_under_later_ex_div():
     assert day3["signal_limit_down_recovery"][0] is True
 
 
+def test_cumulative_daily_adj_factor_is_not_compounded():
+    """Tushare/Fuyao daily adj_factor is already cumulative, not an event ratio."""
+    raw = pl.DataFrame({
+        "symbol": ["000001"] * 3,
+        "date": [date(2026, 8, 28), date(2026, 8, 31), date(2026, 9, 1)],
+        "open": [11.20, 11.40, 11.68],
+        "high": [11.60, 11.80, 11.96],
+        "low": [11.10, 11.30, 11.65],
+        "close": [11.50, 11.72, 11.92],
+        "volume": [10000.0, 10000.0, 10000.0],
+        "amount": [1.0e7, 1.0e7, 1.0e7],
+    })
+    factors = pl.DataFrame({
+        "symbol": ["000001"] * 3,
+        "trade_date": [date(2026, 8, 28), date(2026, 8, 31), date(2026, 9, 1)],
+        "ex_factor": [139.008, 139.008, 139.008],
+    })
+
+    df = pipeline.compute_enriched(raw, factors=factors)
+    latest = df.filter(pl.col("date") == date(2026, 9, 1)).row(0, named=True)
+
+    assert latest["close"] == pytest.approx(11.92)
+    assert latest["prev_close"] == pytest.approx(11.72)
+    assert latest["change_pct"] == pytest.approx(11.92 / 11.72 - 1.0)
+
+
+def test_adj_factor_accepts_external_date_and_adj_factor_columns():
+    raw = pl.DataFrame({
+        "symbol": ["000001"] * 2,
+        "date": [date(2026, 8, 31), date(2026, 9, 1)],
+        "open": [11.40, 11.68],
+        "high": [11.80, 11.96],
+        "low": [11.30, 11.65],
+        "close": [11.72, 11.92],
+        "volume": [10000.0, 10000.0],
+        "amount": [1.0e7, 1.0e7],
+    })
+    factors = pl.DataFrame({
+        "symbol": ["000001"] * 2,
+        "date": [date(2026, 8, 31), date(2026, 9, 1)],
+        "adj_factor": [139.008, 139.008],
+    })
+
+    df = pipeline.compute_enriched(raw, factors=factors)
+    latest = df.filter(pl.col("date") == date(2026, 9, 1)).row(0, named=True)
+
+    assert latest["prev_close"] == pytest.approx(11.72)
+    assert latest["change_pct"] == pytest.approx(11.92 / 11.72 - 1.0)
+
+
 def test_matrix_limit_lock_uses_exchange_reference_on_ex_div_with_later_event(tmp_path):
     """除权日涨跌停判定价必须用交易所除权参考价, 不能直接用前复权昨收。
 

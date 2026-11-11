@@ -67,7 +67,8 @@ def _service_with_provider(
     monkeypatch.setattr(custom_mod, "get_provider", lambda name: provider)
     monkeypatch.setattr(
         service, "_process_full_market_records",
-        lambda records, *, t0, now_ts, replace_index_cache=True, final_boundary_ms=None: (
+        lambda records, *, t0, now_ts, replace_index_cache=True, final_boundary_ms=None,
+        partial=False, memory_only=False, require_stock=True: (
             captured.append(records),
             index_cache_replacements.append(replace_index_cache),
         ),

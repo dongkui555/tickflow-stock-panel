@@ -198,6 +198,9 @@ def test_dated_job_rechecks_real_partitions_and_exposes_partial_source(repair_en
     monkeypatch.setattr(kline.kline_sync, "sync_and_persist_minute", sync_and_persist_minute)
     monkeypatch.setattr(kline.kline_sync, "_selected_minute_provider_name", lambda: "test")
     monkeypatch.setattr(kline.kline_sync, "_resolve_minute_provider", lambda _: (Source(), False, None))
+    path = root / "instruments" / "instruments.parquet"
+    path.parent.mkdir(exist_ok=True)
+    pl.DataFrame({"symbol": [symbol], "code": [symbol[:6]]}).write_parquet(path)
     for day in days:
         kline.kline_sync._write_minute_partition(bars(day).tail(120), root / "kline_minute")
     targets = [{"symbol": symbol, "date": d.isoformat()} for d in days]

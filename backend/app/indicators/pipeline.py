@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import time
 import uuid
@@ -244,18 +245,228 @@ def _math_half_up(expr: pl.Expr, decimals: int = 2) -> pl.Expr:
     return (expr * factor + 0.5).floor() / factor
 
 
+def _factor_symbol_key_expr(column: str = "symbol", alias: str = "_factor_symbol_key") -> pl.Expr:
+    text = pl.col(column).cast(pl.Utf8, strict=False).str.to_uppercase()
+    return text.str.extract(r"(\d{6})", 1).fill_null(text).alias(alias)
+
+
+def _symbol_key_value(symbol: str) -> str:
+    match = re.search(r"(\d{6})", str(symbol or "").upper())
+    return match.group(1) if match else str(symbol or "").upper()
+
+
+def _filter_by_symbol_keys(df: pl.DataFrame, symbols: list[str]) -> pl.DataFrame:
+    if df.is_empty() or "symbol" not in df.columns:
+        return df
+    keys = {_symbol_key_value(s) for s in symbols}
+    return (
+        df.with_columns(_factor_symbol_key_expr("symbol", "_filter_symbol_key"))
+        .filter(pl.col("_filter_symbol_key").is_in(list(keys)))
+        .drop("_filter_symbol_key")
+    )
+
+
+def _exclude_by_symbol_keys(df: pl.DataFrame, symbols: list[str]) -> pl.DataFrame:
+    if df.is_empty() or "symbol" not in df.columns:
+        return df
+    keys = {_symbol_key_value(s) for s in symbols}
+    return (
+        df.with_columns(_factor_symbol_key_expr("symbol", "_filter_symbol_key"))
+        .filter(~pl.col("_filter_symbol_key").is_in(list(keys)))
+        .drop("_filter_symbol_key")
+    )
+
+
+def _filter_lazy_by_symbol_keys(lf: pl.LazyFrame, symbols: list[str]) -> pl.LazyFrame:
+    keys = {_symbol_key_value(s) for s in symbols}
+    return (
+        lf.with_columns(_factor_symbol_key_expr("symbol", "_filter_symbol_key"))
+        .filter(pl.col("_filter_symbol_key").is_in(list(keys)))
+        .drop("_filter_symbol_key")
+    )
+
+
+def restore_daily_symbol_identity(computed: pl.DataFrame, source: pl.DataFrame) -> pl.DataFrame:
+    """Restore the input symbol spelling for callers that store exact identities."""
+    if computed.is_empty():
+        return computed
+    identities = (
+        source.select(_factor_symbol_key_expr(alias="_daily_code"), "date", "symbol")
+        .sort("symbol")
+        .unique(subset=["_daily_code", "date"], keep="last")
+    )
+    return computed.rename({"symbol": "_daily_code"}).join(
+        identities, on=["_daily_code", "date"], how="inner", maintain_order="left",
+    ).select(computed.columns)
+
+
+def _normalize_raw_volume_unit(raw: pl.DataFrame) -> pl.DataFrame:
+    """统一日K成交量单位为股。"""
+    required = {"volume", "amount", "close"}
+    if raw.is_empty() or not required <= set(raw.columns):
+        return raw
+    turnover_estimate = pl.col("close") * pl.col("volume")
+    hand_volume = (
+        (pl.col("volume") > 0)
+        & (pl.col("amount") > 0)
+        & (pl.col("close") > 0)
+        & ((pl.col("amount") / turnover_estimate) >= 50.0)
+        & ((pl.col("amount") / turnover_estimate) <= 150.0)
+    ).fill_null(False)
+    return raw.with_columns(
+        pl.when(hand_volume)
+        .then(pl.col("volume") * 100.0)
+        .otherwise(pl.col("volume"))
+        .alias("volume")
+    )
+
+
+def _canonicalize_and_dedupe_daily(raw: pl.DataFrame) -> pl.DataFrame:
+    """统一 symbol 口径,并合并同一股票同一日期的多源重复日K。"""
+    if raw.is_empty() or "symbol" not in raw.columns or "date" not in raw.columns:
+        return raw
+    helper_cols = ["_canonical_symbol", "_symbol_priority", "_quote_ts_sort", "_volume_sort"]
+    exprs: list[pl.Expr] = [
+        _factor_symbol_key_expr("symbol", "_canonical_symbol"),
+        pl.when(pl.col("symbol").cast(pl.Utf8, strict=False).str.contains(r"^\d{6}$"))
+        .then(2)
+        .otherwise(1)
+        .alias("_symbol_priority"),
+        (
+            pl.col("quote_ts").cast(pl.Int64, strict=False).fill_null(0)
+            if "quote_ts" in raw.columns
+            else pl.lit(0)
+        ).alias("_quote_ts_sort"),
+        (
+            pl.col("volume").cast(pl.Float64, strict=False).fill_null(0.0)
+            if "volume" in raw.columns
+            else pl.lit(0.0)
+        ).alias("_volume_sort"),
+    ]
+    out = (
+        raw.with_columns(exprs)
+        .sort(["_canonical_symbol", "date", "_symbol_priority", "_quote_ts_sort", "_volume_sort"])
+        .unique(subset=["_canonical_symbol", "date"], keep="last")
+        .with_columns(pl.col("_canonical_symbol").alias("symbol"))
+    )
+    return out.drop([c for c in helper_cols if c in out.columns])
+
+
+def _looks_like_cumulative_factor_series(raw: pl.DataFrame, factors: pl.DataFrame) -> bool:
+    """判断 ex_factor 是否为每日累计因子。
+
+    TickFlow 旧契约是稀疏的除权事件比值；Tushare/Fuyao/部分 SDK 常见契约是
+    每个交易日一条累计复权因子。后者若继续 cum_prod 会把价格压到接近 0。
+    """
+    try:
+        raw_for_match = raw.with_columns(_factor_symbol_key_expr())
+        factors_for_match = factors.with_columns(_factor_symbol_key_expr()).select(
+            "_factor_symbol_key", "trade_date", "ex_factor",
+        )
+        raw_counts = (
+            raw_for_match.select("_factor_symbol_key", "date")
+            .drop_nulls()
+            .group_by("_factor_symbol_key")
+            .agg([
+                pl.col("date").min().alias("_raw_start"),
+                pl.col("date").max().alias("_raw_end"),
+                pl.len().alias("_raw_n"),
+            ])
+        )
+        if raw_counts.is_empty():
+            return False
+        overlap = (
+            factors_for_match.join(raw_counts, on="_factor_symbol_key", how="inner")
+            .filter(
+                (pl.col("trade_date") >= pl.col("_raw_start"))
+                & (pl.col("trade_date") <= pl.col("_raw_end"))
+            )
+        )
+        if overlap.is_empty():
+            return False
+        value_stats = overlap.select([
+            pl.len().alias("_factor_rows"),
+            pl.col("ex_factor").median().alias("_median_factor"),
+            pl.col("ex_factor").n_unique().alias("_unique_factors"),
+        ]).row(0, named=True)
+        factor_rows = float(value_stats.get("_factor_rows") or 0.0)
+        median_factor = float(value_stats.get("_median_factor") or 0.0)
+        unique_ratio = (
+            float(value_stats.get("_unique_factors") or 0.0) / factor_rows
+            if factor_rows > 0
+            else 1.0
+        )
+        dates = overlap.select("trade_date").drop_nulls().to_series()
+        calendar_density = 0.0
+        if factor_rows > 0 and not dates.is_empty():
+            min_date = dates.min()
+            max_date = dates.max()
+            if min_date is not None and max_date is not None:
+                calendar_days = max((max_date - min_date).days + 1, 1)
+                calendar_density = factor_rows / calendar_days
+        # Tushare/Fuyao 的 adj_factor 是累计因子。某些增量同步只覆盖近期几十天,
+        # 覆盖率不高但值会是稳定的累计倍率(如 18.0875)。这种数据再 cum_prod
+        # 会把历史价格压到接近 0, 因此先按数值形态识别。
+        if factor_rows >= 3.0 and median_factor >= 3.0:
+            return True
+        if factor_rows >= 5.0 and median_factor > 1.05 and unique_ratio <= 0.25:
+            return True
+        # 小额分红/除权后的累计因子可能长期稳定在 1 附近, 例如 1.0286。
+        # 这类数据虽然相对 raw K 覆盖率不高, 但在自身日期跨度内接近日更;
+        # 稀疏事件因子则通常只有除权日零散记录, 不会满足该密度。
+        if factor_rows >= 5.0 and median_factor > 0.0 and unique_ratio <= 0.25 and calendar_density >= 0.45:
+            return True
+        coverage = (
+            overlap.group_by("_factor_symbol_key")
+            .agg(pl.len().alias("_factor_n"))
+            .join(raw_counts.select("_factor_symbol_key", "_raw_n"), on="_factor_symbol_key", how="inner")
+            .with_columns(
+                (pl.col("_factor_n") / pl.col("_raw_n")).alias("_coverage")
+            )
+        )
+        stats = coverage.select([
+            pl.col("_factor_n").median().alias("_median_factor_rows"),
+            pl.col("_coverage").median().alias("_median_coverage"),
+            (pl.col("_coverage") >= 0.35).mean().alias("_dense_share"),
+        ]).row(0, named=True)
+        return (
+            float(stats.get("_median_factor_rows") or 0.0) >= 3.0
+            and (
+                float(stats.get("_median_coverage") or 0.0) >= 0.35
+                or float(stats.get("_dense_share") or 0.0) >= 0.5
+            )
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("复权因子形态识别失败, 使用事件因子口径: %s", e)
+        return False
+
+
 def _apply_adj_factor(raw: pl.DataFrame, factors: pl.DataFrame) -> pl.DataFrame:
     """对 raw K 线应用前复权 (forward adjustment)。
 
     adj_factor 结构: symbol, trade_date, ex_factor
-    ex_factor 含义: 每次除权事件的 pre/post 比值(个股级,非累积)。
+    ex_factor 可为两种来源:
+      1. 稀疏事件因子: 每次除权事件的 pre/post 比值(个股级,非累积);
+      2. 每日累计因子: Tushare/Fuyao 等返回的逐交易日 adj_factor。
 
     前复权原理:
       - 保持最新价格不变,将历史价格向下调整以消除除权缺口
-      - adjusted = raw × cumprod_at_D / total_cumprod
-      - 等价于: adjusted = raw / (该日期之后所有事件的 ex_factor 乘积)
+      - 事件因子: adjusted = raw × cumprod_at_D / total_cumprod
+      - 累计因子: adjusted = raw × factor_at_D / latest_factor
     """
     if factors.is_empty():
+        return raw
+
+    # Preserve the explicit cumulative contract before normalizing column names.
+    explicit_cumulative = "adj_factor" in factors.columns and "ex_factor" not in factors.columns
+    rename: dict[str, str] = {}
+    if "trade_date" not in factors.columns and "date" in factors.columns:
+        rename["date"] = "trade_date"
+    if "ex_factor" not in factors.columns and "adj_factor" in factors.columns:
+        rename["adj_factor"] = "ex_factor"
+    if rename:
+        factors = factors.rename(rename)
+    if not {"symbol", "trade_date", "ex_factor"} <= set(factors.columns):
         return raw
 
     # 确保类型一致
@@ -267,37 +478,114 @@ def _apply_adj_factor(raw: pl.DataFrame, factors: pl.DataFrame) -> pl.DataFrame:
     if factors.is_empty():
         return raw
 
+    # Tushare/Fuyao 常见为每日累计复权因子, 不能再次 cum_prod。
+    if explicit_cumulative or _looks_like_cumulative_factor_series(raw, factors):
+        factor_points = (
+            factors.with_columns(_factor_symbol_key_expr())
+            .select("_factor_symbol_key", "trade_date", "ex_factor")
+            .sort(["_factor_symbol_key", "trade_date"])
+            .unique(subset=["_factor_symbol_key", "trade_date"], keep="last")
+            .sort(["_factor_symbol_key", "trade_date"])
+        )
+        raw_sorted = raw.with_columns(_factor_symbol_key_expr()).sort(["_factor_symbol_key", "date"])
+        first_factors = factor_points.group_by("_factor_symbol_key").agg(
+            pl.col("ex_factor").first().alias("_first_factor")
+        )
+        latest_dates = raw_sorted.group_by("_factor_symbol_key").agg(
+            pl.col("date").max().alias("_latest_raw_date")
+        )
+        latest_factors = (
+            latest_dates.sort(["_factor_symbol_key", "_latest_raw_date"])
+            .join_asof(
+                factor_points,
+                left_on="_latest_raw_date",
+                right_on="trade_date",
+                by="_factor_symbol_key",
+                strategy="backward",
+            )
+            .join(first_factors, on="_factor_symbol_key", how="left")
+            .with_columns(
+                pl.coalesce([pl.col("ex_factor"), pl.col("_first_factor")])
+                .alias("_latest_factor")
+            )
+            .select("_factor_symbol_key", "_latest_factor")
+        )
+        df = (
+            raw_sorted.join_asof(
+                factor_points,
+                left_on="date",
+                right_on="trade_date",
+                by="_factor_symbol_key",
+                strategy="backward",
+            )
+            .join(first_factors, on="_factor_symbol_key", how="left")
+            .with_columns(
+                pl.coalesce([pl.col("ex_factor"), pl.col("_first_factor")])
+                .alias("_factor_at_date")
+            )
+            .join(latest_factors, on="_factor_symbol_key", how="left")
+        )
+        ratio = (
+            pl.when((pl.col("_factor_at_date") > 0) & (pl.col("_latest_factor") > 0))
+            .then(pl.col("_factor_at_date") / pl.col("_latest_factor"))
+            .otherwise(1.0)
+        )
+        price_cols = [c for c in ("open", "high", "low", "close") if c in df.columns]
+        factor_changed = (
+            (pl.col("_factor_at_date") != pl.col("_factor_at_date").shift(1).over("_factor_symbol_key"))
+            .fill_null(False)
+        )
+        return (
+            df.with_columns(
+                [pl.col(c) * ratio for c in price_cols]
+                + [factor_changed.alias("ex_rights")]
+            )
+            .drop([
+                c for c in (
+                    "trade_date",
+                    "ex_factor",
+                    "_first_factor",
+                    "_factor_at_date",
+                    "_latest_factor",
+                    "_factor_symbol_key",
+                )
+                if c in df.columns
+            ])
+        )
+
     # 去重 + 排序 + 累积乘积 (一趟完成)
     factors_sorted = (
-        factors.sort(["symbol", "trade_date"])
-        .unique(subset=["symbol", "trade_date"])
-        .sort(["symbol", "trade_date"])
+        factors.with_columns(_factor_symbol_key_expr())
+        .select("_factor_symbol_key", "trade_date", "ex_factor")
+        .sort(["_factor_symbol_key", "trade_date"])
+        .unique(subset=["_factor_symbol_key", "trade_date"])
+        .sort(["_factor_symbol_key", "trade_date"])
         .with_columns(
-            pl.col("ex_factor").cum_prod().over("symbol").alias("cum_factor"),
+            pl.col("ex_factor").cum_prod().over("_factor_symbol_key").alias("cum_factor"),
         )
     )
 
     # 每个 symbol 的总累积因子
     total_factors = (
         factors_sorted
-        .group_by("symbol")
+        .group_by("_factor_symbol_key")
         .agg(pl.col("cum_factor").last().alias("total_factor"))
     )
 
-    raw_sorted = raw.sort(["symbol", "date"])
+    raw_sorted = raw.with_columns(_factor_symbol_key_expr()).sort(["_factor_symbol_key", "date"])
 
     # join_asof backward: 每根 K 线取 <= 其 date 的最新累积因子
     # 同时带 trade_date 列用于判断除权日标记
     df = raw_sorted.join_asof(
-        factors_sorted.select("symbol", "trade_date", "cum_factor"),
+        factors_sorted.select("_factor_symbol_key", "trade_date", "cum_factor"),
         left_on="date",
         right_on="trade_date",
-        by="symbol",
+        by="_factor_symbol_key",
         strategy="backward",
     )
 
     # 补充 total_factor + 前复权 + 除权标记,一次 with_columns 完成
-    df = df.join(total_factors, on="symbol", how="left")
+    df = df.join(total_factors, on="_factor_symbol_key", how="left")
 
     is_ex = pl.col("trade_date") == pl.col("date")
     ratio = pl.col("cum_factor").fill_null(1.0) / pl.col("total_factor").fill_null(1.0)
@@ -308,7 +596,7 @@ def _apply_adj_factor(raw: pl.DataFrame, factors: pl.DataFrame) -> pl.DataFrame:
         + [
             is_ex.alias("ex_rights"),
         ]
-    ).drop(["trade_date", "cum_factor", "total_factor"])
+    ).drop(["trade_date", "cum_factor", "total_factor", "_factor_symbol_key"])
 
     return df
 
@@ -404,7 +692,9 @@ def compute_indicators(
     if "ma10" in want:
         _p1.append(pl.col("close").rolling_mean(10).over("symbol").alias("ma10"))
     if "ma20" in want:
-        _p1.append(pl.col("close").rolling_mean(20).over("symbol").alias("ma20"))
+        # Remove accumulation noise below 1e-12 yuan before strict comparisons.
+        # Different warmup prefixes must agree when price equals its MA20.
+        _p1.append(pl.col("close").rolling_mean(20).over("symbol").round(12).alias("ma20"))
     if "ma30" in want:
         _p1.append(pl.col("close").rolling_mean(30).over("symbol").alias("ma30"))
     if "ma60" in want:
@@ -797,11 +1087,11 @@ def compute_limit_signals(
     if "turnover_rate" in want:
         df = apply_historical_float_shares(df, historical_shares, today=cn_today())
 
-    # 计算换手率(%) = volume(手) * 10000 / float_shares(股)
+    # 计算换手率(%) = volume(股) / float_shares(股) * 100
     if "turnover_rate" in want and "float_shares" in df.columns and "volume" in df.columns:
         df = df.with_columns(
             pl.when(pl.col("float_shares") > 0)
-              .then(pl.col("volume") * 10000.0 / pl.col("float_shares"))
+              .then(pl.col("volume") * 100.0 / pl.col("float_shares"))
               .otherwise(None)
               .alias("turnover_rate")
         )
@@ -1082,6 +1372,9 @@ def compute_enriched(
     if raw.is_empty():
         return raw
 
+    raw = _normalize_raw_volume_unit(raw)
+    raw = _canonicalize_and_dedupe_daily(raw)
+
     # 保留不复权原始价格（涨停/炸板/跌停判断需用不复权价格）
     raw = raw.with_columns(
         pl.col("close").alias("raw_close"),
@@ -1294,6 +1587,8 @@ def _bench_rt_pct_of(index_quotes: pl.DataFrame | None, candidates: list[str]) -
         row = by_sym.get(sym)
         if row is None:
             continue
+        if row.get("close") is not None and row.get("prev_close") is not None and row["prev_close"]:
+            return float(row["close"] / row["prev_close"] - 1)
         for col in ("change_pct", "pct", "pct_change"):
             v = row.get(col)
             if v is not None:
@@ -1388,6 +1683,41 @@ def attach_deviation_columns_today(
     )
 
 
+def _publish_storage_if_changed(publication, frame, out, *, force=False):
+    # Rewriting identical inputs must not invalidate historical consumers by mtime alone.
+    if not force and out.exists():
+        old = pl.read_parquet(out)
+        if old.schema == frame.schema and old.equals(frame):
+            return False
+    publication.write_parquet(frame, out)
+    return True
+
+
+def run_date_pipeline(data_dir: Path, day) -> int:
+    """Rebuild one close from a bounded raw window; never rewrite old dates."""
+    d = Path(data_dir)
+    if enriched_publication_incomplete(d, "stock"):
+        raise RuntimeError("技术数据存在未完成发布, 请先修复原任务")
+    folders = sorted(p for p in (d / "kline_daily").glob("date=????-??-??")
+                     if p.name[5:] <= str(day))[-121:]
+    if not folders or folders[-1].name != f"date={day}":
+        return 0
+    frames = [scan_daily_parquet(p / "*.parquet") for p in folders]
+    raw = pl.concat(frames, how="diagonal_relaxed").filter(pl.col("date").cast(pl.Date) <= day).collect()
+    factors = _load_factors(d / "adj_factor" / "all.parquet")
+    instruments = pl.DataFrame()
+    files = list((d / "instruments").rglob("*.parquet"))
+    if files:
+        instruments = scan_parquet_compat(files).collect()
+    enriched = compute_enriched(raw, factors=factors, instruments=instruments,
+                                historical_shares=load_share_history(d))
+    target = _select_storage_cols(enriched.filter(pl.col("date").cast(pl.Date) == day)).sort("symbol")
+    if target.is_empty():
+        return 0
+    publication = EnrichedPublication(d, "stock")
+    _publish_storage_if_changed(publication, target, d / "kline_daily_enriched" / f"date={day}" / "part.parquet")
+    publication.commit()
+    return target.height
 # ================================================================
 # 全量重建流式暂存 + 自适应批次 (#208/#174)
 #
@@ -1404,7 +1734,7 @@ def attach_deviation_columns_today(
 
 _STAGING_ROOT = Path(".staging") / "enriched_rebuild"
 _STALE_STAGING_MAX_AGE_S = 24 * 3600
-_RAM_LARGE_BYTES = 8 * 1024 ** 3      # ≥8GB 视为内存充裕, 批次保持用户设置
+_RAM_LARGE_BYTES = 8 * 1024 ** 3      # >8GB 视为内存充裕, 批次保持用户设置
 _BATCH_TARGET_ROWS = 150_000          # 小内存单批目标行数 (宽表 ~60-80MB)
 _BATCH_MIN_SYMBOLS = 50
 _MERGE_DATE_CHUNKS = 15               # 最终合并按日期切 15 块流式执行
@@ -1420,7 +1750,7 @@ def _total_ram_bytes() -> int | None:
 
 def _adaptive_sym_batch(default_batch: int, rows_per_symbol: int) -> int:
     """小内存机器按单批目标行数收缩批次; 大内存机器保持原值 (#208)。"""
-    if (_total_ram_bytes() or 0) >= _RAM_LARGE_BYTES:
+    if (_total_ram_bytes() or 0) > _RAM_LARGE_BYTES:
         return default_batch
     return max(
         _BATCH_MIN_SYMBOLS,
@@ -1450,11 +1780,13 @@ def compute_enriched_history_window(
     sym_batch: int | None = None,
     *,
     include_instrument_metadata: bool = False,
+    spill_directory: Path | None = None,
 ) -> pl.DataFrame:
     """按 symbol 分批执行历史窗口计算: 指标 → 偏离列 → 信号 → 涨跌停。
 
-    分批约束计算中间表, 最终完整历史仍常驻内存。排序和可选元数据关联
-    均在单批完成, 避免合并后再复制整张宽表。
+    分批约束计算中间表。可选 IPC 暂存使完整历史使用只读文件映射,
+    避免已完成的宽表批次与后续计算临时表同时占用不可回收内存。
+    排序和可选元数据关联均在单批完成。
     sym_batch 显式传入时跳过自适应 (测试用)。
     """
     if df_hist.is_empty() or "symbol" not in df_hist.columns:
@@ -1487,7 +1819,15 @@ def compute_enriched_history_window(
                         on="symbol", how="left",
                     )
         # 连续、互不重叠的已排序 symbol 批次, 拼接后天然有序。
-        parts.append(part.sort(["symbol", "date"]))
+        part = part.sort(["symbol", "date"])
+        if spill_directory is not None:
+            path = spill_directory / f"batch-{bs:06d}.arrow"
+            if path.exists():
+                raise FileExistsError(path)
+            part.write_ipc(path, compression="uncompressed")
+            del part
+            part = pl.read_ipc(path, memory_map=True, rechunk=False)
+        parts.append(part)
     return parts[0] if len(parts) == 1 else pl.concat(parts, how="diagonal_relaxed", rechunk=False)
 
 
@@ -1543,7 +1883,11 @@ def recompute_daily_symbols(
     if not files:
         raise ValueError("没有可用于重算的原始日K")
     raw_scan = scan_daily_parquet(files, cast_options=pl.ScanCastOptions(integer_cast="allow-float"))
-    selected = sorted(set(symbols)) if symbols is not None else raw_scan.select("symbol").unique().collect()["symbol"].to_list()
+    selected = (
+        sorted({_symbol_key_value(symbol) for symbol in symbols})
+        if symbols is not None
+        else raw_scan.select(_factor_symbol_key_expr()).unique().collect()["_factor_symbol_key"].to_list()
+    )
     if not selected:
         raise ValueError("没有可用于重算的股票")
     factors = _load_factors(root / ("adj_factor_etf" if asset_type == "etf" else "adj_factor") / "all.parquet") if asset_type != "index" else pl.DataFrame()
@@ -1557,7 +1901,7 @@ def recompute_daily_symbols(
     try:
         for offset in range(0, len(selected), batch_size):
             batch = selected[offset:offset + batch_size]
-            raw = raw_scan.filter(pl.col("symbol").is_in(batch)).sort(["symbol", "date"]).collect(engine="streaming")
+            raw = _filter_lazy_by_symbol_keys(raw_scan, batch).sort(["symbol", "date"]).collect(engine="streaming")
             bad = data_integrity.invalid_daily_rows(raw)
             if not bad.is_empty():
                 issues = data_integrity.inspect_invalid_history(root, daily_dirname(asset_type), files, bad)
@@ -1573,11 +1917,13 @@ def recompute_daily_symbols(
                 raise ValueError("原始日K未通过校验或在检查期间发生变化，请重新自检或完成当日日K同步后重试，未发布指标")
             enriched = compute_enriched(
                 raw,
-                factors=factors.filter(pl.col("symbol").is_in(batch)) if not factors.is_empty() else factors,
-                instruments=instruments.filter(pl.col("symbol").is_in(batch)) if not instruments.is_empty() else instruments,
-                historical_shares=shares.filter(pl.col("symbol").is_in(batch)) if not shares.is_empty() else shares,
+                factors=_filter_by_symbol_keys(factors, batch),
+                instruments=_filter_by_symbol_keys(instruments, batch),
+                historical_shares=_filter_by_symbol_keys(shares, batch),
             )
             output = _select_storage_cols(enriched.filter(pl.col("date") >= start))
+            if asset_type != "stock":
+                output = restore_daily_symbol_identity(output, raw.filter(pl.col("date") >= start))
             written += repo.replace_enriched_rows(asset_type, output, start=start, symbols=batch, publication=publication)
             publication.heartbeat()
             if on_batch_done:
@@ -1595,7 +1941,8 @@ def recompute_daily_symbols(
 def run_pipeline(data_dir: Path | None = None,
                  symbols: list[str] | None = None,
                  new_dates_only: bool = False,
-                 on_batch_done: Callable[[int, int], None] | None = None) -> int:
+                 on_batch_done: Callable[[int, int], None] | None = None,
+                 on_before_symbol_publish: Callable[[pl.DataFrame], None] | None = None) -> int:
     """运行盘后管道; 异常中断时释放尚未写入的发布认领。
 
     真正实现见 _run_pipeline_impl。包装层单独存在, 是为了保证任何异常都
@@ -1615,6 +1962,7 @@ def run_pipeline(data_dir: Path | None = None,
             new_dates_only=new_dates_only,
             on_batch_done=on_batch_done,
             publication=publication,
+            on_before_symbol_publish=on_before_symbol_publish,
         )
     except BaseException:
         publication.abandon()
@@ -1625,6 +1973,7 @@ def _run_pipeline_impl(data_dir: Path | None = None,
                        symbols: list[str] | None = None,
                        new_dates_only: bool = False,
                        on_batch_done: Callable[[int, int], None] | None = None,
+                       on_before_symbol_publish: Callable[[pl.DataFrame], None] | None = None,
                        *,
                        publication: EnrichedPublication) -> int:
     """运行盘后管道:读 kline_daily + adj_factor → 前复权 + 计算存储列 → 写 enriched。
@@ -1649,10 +1998,13 @@ def _run_pipeline_impl(data_dir: Path | None = None,
     t0 = _t.perf_counter()
 
     d = Path(data_dir or settings.data_dir)
-    if enriched_publication_incomplete(d, "stock"):
+    recovering = enriched_publication_incomplete(d, "stock")
+    if recovering:
         logger.warning("检测到未完成的 enriched 发布,改为全量重建")
         symbols = None
         new_dates_only = False
+    if recovering:
+        publication.begin()
     daily_dir = d / "kline_daily"
     enriched_base = d / "kline_daily_enriched"
     factor_path = d / "adj_factor" / "all.parquet"
@@ -1744,7 +2096,7 @@ def _run_pipeline_impl(data_dir: Path | None = None,
                     out = enriched_base / f"date={ds}" / "part.parquet"
                     out.parent.mkdir(parents=True, exist_ok=True)
                     date_df = _select_storage_cols(date_df).sort(["symbol"])
-                    publication.write_parquet(date_df, out)
+                    _publish_storage_if_changed(publication, date_df, out)
                     written += date_df.height
                 t_write_new = _t.perf_counter()
                 logger.info("增量写入: %.2fs, %d 行", t_write_new - t_new, written)
@@ -1752,20 +2104,22 @@ def _run_pipeline_impl(data_dir: Path | None = None,
 
         # 3. 受除权因子影响的个股: 重算全部已有日期 (累积因子链变了)
         if symbols:
-            sym_set = set(symbols)
+            sym_set = {_symbol_key_value(s) for s in symbols}
             raw_sym = scan_daily_parquet(daily_glob, cast_options=_cast).sort(["symbol", "date"])
-            raw_sym = raw_sym.filter(pl.col("symbol").is_in(list(sym_set)))
+            raw_sym = _filter_lazy_by_symbol_keys(raw_sym, list(sym_set))
             raw_sym = raw_sym.collect(streaming=True)
             if not raw_sym.is_empty():
-                factors_sym = factors.filter(pl.col("symbol").is_in(list(sym_set))) if not factors.is_empty() else factors
-                inst_sym = instruments.filter(pl.col("symbol").is_in(list(sym_set))) if not instruments.is_empty() else instruments
-                shares_sym = historical_shares.filter(pl.col("symbol").is_in(list(sym_set))) if not historical_shares.is_empty() else historical_shares
+                factors_sym = _filter_by_symbol_keys(factors, list(sym_set)) if not factors.is_empty() else factors
+                inst_sym = _filter_by_symbol_keys(instruments, list(sym_set)) if not instruments.is_empty() else instruments
+                shares_sym = _filter_by_symbol_keys(historical_shares, list(sym_set)) if not historical_shares.is_empty() else historical_shares
                 enriched_sym = _compute_storage_batches(
                     raw_sym,
                     factors=factors_sym,
                     instruments=inst_sym,
                     historical_shares=shares_sym,
                 )
+                if on_before_symbol_publish:
+                    on_before_symbol_publish(enriched_sym)
                 for date_df in enriched_sym.partition_by("date"):
                     dt = date_df["date"][0]
                     ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
@@ -1774,10 +2128,10 @@ def _run_pipeline_impl(data_dir: Path | None = None,
                     date_df_storage = _select_storage_cols(date_df)
                     if out.exists():
                         existing = pl.read_parquet(out)
-                        existing = existing.filter(~pl.col("symbol").is_in(list(sym_set)))
+                        existing = _exclude_by_symbol_keys(existing, list(sym_set))
                         date_df_storage = pl.concat([existing, date_df_storage], how="diagonal_relaxed")
                     date_df_storage = date_df_storage.sort(["symbol"])
-                    publication.write_parquet(date_df_storage, out)
+                    _publish_storage_if_changed(publication, date_df_storage, out)
                     written += date_df.height
                 logger.info("除权重算: %d 只, 共写入 %d 行", len(sym_set), written)
         publication.commit()
@@ -1802,12 +2156,15 @@ def _run_pipeline_impl(data_dir: Path | None = None,
     daily_files = sorted(str(p) for p in daily_dir.rglob("*.parquet"))
     lf_all = scan_daily_parquet(daily_files, cast_options=_cast)
     if symbols:
-        sym_set = set(symbols)
-        lf_all = lf_all.filter(pl.col("symbol").is_in(list(sym_set)))
+        sym_set = {_symbol_key_value(s) for s in symbols}
+        lf_all = _filter_lazy_by_symbol_keys(lf_all, list(sym_set))
 
     all_symbols = (
-        lf_all.select("symbol").unique().sort("symbol")
-        .collect(streaming=True)["symbol"].to_list()
+        lf_all.with_columns(_factor_symbol_key_expr("symbol", "_canonical_symbol"))
+        .select("_canonical_symbol")
+        .unique()
+        .sort("_canonical_symbol")
+        .collect(streaming=True)["_canonical_symbol"].to_list()
     )
     if not all_symbols:
         logger.info("无日K数据, 跳过管道")
@@ -1816,11 +2173,11 @@ def _run_pipeline_impl(data_dir: Path | None = None,
     total_syms = len(all_symbols)
 
     if not factors.is_empty() and symbols:
-        factors = factors.filter(pl.col("symbol").is_in(list(sym_set)))
+        factors = _filter_by_symbol_keys(factors, list(sym_set))
     if not factors.is_empty():
         logger.info("读取复权因子: %d 行", factors.height)
     if not instruments.is_empty() and symbols:
-        inst_use = instruments.filter(pl.col("symbol").is_in(list(sym_set)))
+        inst_use = _filter_by_symbol_keys(instruments, list(sym_set))
 
     from app.services import preferences as prefs_mod
     # 自适应批次 (#208): 单批体积按目标行数恒定, 与总历史长度解耦;
@@ -1848,7 +2205,7 @@ def _run_pipeline_impl(data_dir: Path | None = None,
 
             # 只读取本批 symbol 的数据
             lf_batch = scan_daily_parquet(daily_files, cast_options=_cast)
-            lf_batch = lf_batch.filter(pl.col("symbol").is_in(batch_syms))
+            lf_batch = _filter_lazy_by_symbol_keys(lf_batch, batch_syms)
             raw = lf_batch.sort(["symbol", "date"]).collect(streaming=True)
 
             if raw.is_empty():
@@ -1856,15 +2213,15 @@ def _run_pipeline_impl(data_dir: Path | None = None,
 
             # 本批的 factors / instruments
             batch_factors = (
-                factors.filter(pl.col("symbol").is_in(batch_syms))
+                _filter_by_symbol_keys(factors, batch_syms)
                 if not factors.is_empty() else factors
             )
             batch_inst = (
-                inst_use.filter(pl.col("symbol").is_in(batch_syms))
+                _filter_by_symbol_keys(inst_use, batch_syms)
                 if not inst_use.is_empty() else inst_use
             )
             batch_shares = (
-                historical_shares.filter(pl.col("symbol").is_in(batch_syms))
+                _filter_by_symbol_keys(historical_shares, batch_syms)
                 if not historical_shares.is_empty() else historical_shares
             )
 
@@ -1878,6 +2235,8 @@ def _run_pipeline_impl(data_dir: Path | None = None,
 
             if not enriched.is_empty():
                 if symbols:
+                    if on_before_symbol_publish:
+                        on_before_symbol_publish(enriched)
                     # 局部模式: 直接按日期合并写入
                     for date_df in _select_storage_cols(enriched).partition_by("date"):
                         dt = date_df["date"][0]
@@ -1887,10 +2246,10 @@ def _run_pipeline_impl(data_dir: Path | None = None,
                         date_df_storage = _select_storage_cols(date_df)
                         if out.exists():
                             existing = pl.read_parquet(out)
-                            existing = existing.filter(~pl.col("symbol").is_in(batch_syms))
+                            existing = _exclude_by_symbol_keys(existing, batch_syms)
                             date_df_storage = pl.concat([existing, date_df_storage], how="diagonal_relaxed")
                         date_df_storage = date_df_storage.sort(["symbol"])
-                        publication.write_parquet(date_df_storage, out)
+                        _publish_storage_if_changed(publication, date_df_storage, out)
                         written += date_df_storage.height
                 else:
                     # 全量模式: 写单批暂存文件 (按 date,symbol 排序 →
@@ -1970,7 +2329,7 @@ def _run_pipeline_impl(data_dir: Path | None = None,
                     ds_str = ds.isoformat() if hasattr(ds, "isoformat") else str(ds)
                     out = base / f"date={ds_str}" / "part.parquet"
                     out.parent.mkdir(parents=True, exist_ok=True)
-                    publication.write_parquet(date_df.sort(["symbol"]), out)
+                    _publish_storage_if_changed(publication, date_df.sort(["symbol"]), out)
             gc.collect()
             logger.info("全量暂存合并完成: %d 个日期分区", len(unique_dates))
     finally:
@@ -2054,6 +2413,7 @@ def compute_enriched_today(
     today_ohlcv: pl.DataFrame,
     instruments: pl.DataFrame | None = None,
     elapsed_minutes: float | None = None,
+    historical_shares: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """用昨天的递推状态 + 今天的 OHLCV 增量计算今天的 enriched 数据。
 
@@ -2066,6 +2426,7 @@ def compute_enriched_today(
         instruments:    维表 (涨跌停/换手率需要)
         elapsed_minutes: 当日已交易分钟数(用于标准量比的时间折算)。
             None 或 0 表示不折算(盘后或时间不可用, 此时 volume 已是全天量)。
+        historical_shares: 历史股本表；实时源不提供换手率时用于按当日累计成交量回算。
 
     返回:
         今天的 enriched DataFrame (~5500 行, 64 列)
@@ -2125,6 +2486,41 @@ def compute_enriched_today(
               .otherwise(None)
               .alias("amplitude"),
         )
+
+    # 盘中涨跌停必须使用原始价口径。部分实时源会给 change_pct 但前收盘在
+    # 合并历史状态时缺失/被复权列遮蔽, 此时用 raw_close 与同源涨跌幅反推原始昨收。
+    if {"raw_close", "change_pct"} <= set(df.columns):
+        df = df.with_columns(
+            pl.when(
+                pl.col("raw_close").is_not_null()
+                & pl.col("change_pct").is_not_null()
+                & (pl.col("change_pct") > -0.99)
+            )
+            .then(pl.col("raw_close") / (1.0 + pl.col("change_pct")))
+            .otherwise(None)
+            .alias("_derived_prev_close_raw")
+        )
+        if "_prev_close_raw" in df.columns:
+            df = df.with_columns(
+                pl.when(
+                    pl.col("_derived_prev_close_raw").is_not_null()
+                    & (
+                        pl.col("_prev_close_raw").is_null()
+                        | (
+                            (
+                                pl.col("_prev_close_raw")
+                                / pl.col("_derived_prev_close_raw")
+                                - 1.0
+                            ).abs() > 0.03
+                        )
+                    )
+                )
+                .then(pl.col("_derived_prev_close_raw"))
+                .otherwise(pl.col("_prev_close_raw"))
+                .alias("_prev_close_raw")
+            )
+        else:
+            df = df.with_columns(pl.col("_derived_prev_close_raw").alias("_prev_close_raw"))
 
     # ---- EMA (递推) ----
     df = df.with_columns([
@@ -2295,11 +2691,17 @@ def compute_enriched_today(
 
     # ---- 涨跌停判定价 + 换手率 + 连板 (信号布尔列由定义注入) ----
     if instruments is not None and not instruments.is_empty():
-        df = _compute_limit_signals_today(df, instruments)
+        df = _compute_limit_signals_today(
+            df,
+            instruments,
+            historical_shares=historical_shares,
+            volume_unit="lots",
+        )
 
     # ---- 清理内部列 ----
     drop_cols = [
         "close_right", "high_right", "low_right", "_prev_close_raw",
+        "_derived_prev_close_raw",
         "_ma5_partial_sum", "_ma10_partial_sum", "_ma20_partial_sum",
         "_ma30_partial_sum", "_ma60_partial_sum",
         "_boll_partial_sum", "_boll_partial_sq_sum",
@@ -2351,7 +2753,13 @@ def compute_enriched_today(
     return df
 
 
-def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) -> pl.DataFrame:
+def _compute_limit_signals_today(
+    df: pl.DataFrame,
+    instruments: pl.DataFrame,
+    historical_shares: pl.DataFrame | None = None,
+    *,
+    volume_unit: str = "shares",
+) -> pl.DataFrame:
     """盘中增量版的涨跌停/换手率/炸板/连板计算。"""
     inst_cols = ["symbol"]
     for c in ["float_shares", "limit_up", "limit_down", "listing_date"]:
@@ -2376,16 +2784,30 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
     inst_subset = _attach_no_limit_window(inst_subset)
 
     df = df.join(inst_subset, on="symbol", how="left", suffix="_inst")
+    df = apply_historical_float_shares(df, historical_shares, today=cn_today())
 
-    # 换手率: API 有则直接用, 无则从 float_shares 计算
-    if "turnover_rate" not in df.columns:
-        if "float_shares" in df.columns and "volume" in df.columns:
+    # 换手率: API 有则直接用；API 缺失/为 null 时从有效流通股本回算。
+    # 扶摇等实时源只给成交量和成交额，不给换手率；股本维表可能为空，
+    # 因此这里同时支持 financials/shares 的历史股本。
+    if "float_shares" in df.columns and "volume" in df.columns:
+        volume_multiplier = 10000.0 if volume_unit == "lots" else 100.0
+        computed_turnover = (
+            pl.when(pl.col("float_shares") > 0)
+              # 历史日 K 统一为股；实时快照沿用交易所的手。
+              .then(pl.col("volume") * volume_multiplier / pl.col("float_shares"))
+              .otherwise(None)
+        )
+        if "turnover_rate" in df.columns:
             df = df.with_columns(
-                pl.when(pl.col("float_shares") > 0)
-                  .then(pl.col("volume") * 10000.0 / pl.col("float_shares"))
-                  .otherwise(None)
+                pl.when(pl.col("turnover_rate").is_not_null())
+                  .then(pl.col("turnover_rate"))
+                  .otherwise(computed_turnover)
                   .alias("turnover_rate")
             )
+        else:
+            df = df.with_columns(computed_turnover.alias("turnover_rate"))
+    elif "turnover_rate" not in df.columns:
+        df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("turnover_rate"))
 
     # 涨跌停 (用 raw_close / raw_high 和前一日原始收盘价)
     # 优先用 API 原始前收盘价, 回退到 close_right, 最后回退到 raw_close

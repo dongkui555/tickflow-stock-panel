@@ -723,7 +723,12 @@ class MiningCandidateService:
         signature: str,
         asset_type: str,
     ) -> bool:
-        validation = AIStrategyGenerator().validate_code(source)
+        from app.strategy.research.factor_rank_research import ENTRY_SIGNALS, EXIT_SIGNALS
+
+        # 固定发布模板的排名信号由矩阵策略执行时产生。
+        validation = AIStrategyGenerator(data_dir=self.data_dir).validate_code(
+            source, provided_signals=(*ENTRY_SIGNALS, *EXIT_SIGNALS),
+        )
         if not validation.get("valid"):
             raise ValueError(
                 f"rendered strategy failed validation: {validation.get('error')}"

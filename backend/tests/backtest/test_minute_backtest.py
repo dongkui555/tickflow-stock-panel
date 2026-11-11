@@ -113,13 +113,13 @@ def _daily_panel(days: list[date], symbols: list[str]) -> pl.DataFrame:
 
 
 def _minute_frame(day: date, bars: list[tuple[str, str, float]]) -> pl.DataFrame:
-    """bars: (symbol, "HH:MM"(北京), close)。分区 datetime 为 naive-UTC 存储 (北京 - 8h)。"""
+    """Build complete synthetic sessions in Beijing wallclock with specified hits."""
     rows = []
     for sym, hm, close in bars:
         local = datetime(day.year, day.month, day.day, int(hm[:2]), int(hm[3:]))
         rows.append({
             "symbol": sym,
-            "datetime": local - timedelta(hours=8),
+            "datetime": local,
             "open": close - 0.01,
             "high": close + 0.01,
             "low": close - 0.02,
@@ -127,6 +127,20 @@ def _minute_frame(day: date, bars: list[tuple[str, str, float]]) -> pl.DataFrame
             "volume": 1000.0,
             "amount": close * 1000.0,
         })
+    # Fill only test fixtures, never production gaps. Before the first configured
+    # hit use a sub-threshold price, preserving the original causal assertions.
+    for sym in sorted({r['symbol'] for r in rows}):
+        configured = {r['datetime']: r for r in rows if r['symbol'] == sym}
+        first = min(configured)
+        price = configured[first]['close'] * (0.90 if first.hour > 9 or first.minute > 31 else 1.0)
+        stamps = [datetime.combine(day, datetime.min.time()).replace(hour=9, minute=31) + timedelta(minutes=i) for i in range(120)]
+        stamps += [datetime.combine(day, datetime.min.time()).replace(hour=13, minute=1) + timedelta(minutes=i) for i in range(120)]
+        for stamp in stamps:
+            if stamp in configured:
+                price = configured[stamp]['close']
+            else:
+                rows.append({'symbol': sym, 'datetime': stamp, 'open': price, 'high': price,
+                             'low': price, 'close': price, 'volume': 1., 'amount': price * 100.})
     return pl.DataFrame(rows).sort(["symbol", "datetime"]).with_columns(
         pl.col("datetime").cast(pl.Datetime("us")),
     )
@@ -319,6 +333,18 @@ def test_exit_reuses_daily_next_open(scenario):
         (pl.col("symbol") == "000001.SZ") & (pl.col("date") == exit_day)
     ).get_column("open")[0]
     assert trade["exit_price"] == pytest.approx(next_open, abs=1e-6)
+
+
+def test_partial_stock_day_is_excluded_and_reported(scenario):
+    service, _, days, frames = scenario
+    first = frames[days['t1']]
+    frames[days['t1']] = first.filter(~((pl.col('symbol') == '000001.SZ') & (pl.col('datetime').dt.strftime('%H:%M') == '14:59')))
+    result = service.run(_config(days['t1'], days['t3']))
+    assert not result.error
+    assert all(t['symbol'] != '000001.SZ' for t in result.trades)
+    quality = result.stats['minute_replay']
+    assert quality['excluded_stock_days'] == 1
+    assert quality['quality_issues'][0]['reason'] == 'incomplete_session'
 
 
 def test_guards(scenario, tmp_path):

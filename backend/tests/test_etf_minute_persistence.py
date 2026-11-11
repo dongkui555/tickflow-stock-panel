@@ -31,6 +31,10 @@ def _bars(symbol: str, day: date = DAY) -> pl.DataFrame:
 
 @pytest.fixture
 def market(tmp_path, monkeypatch):
+    for dirname, symbol in (("instruments", STOCK), ("instruments_etf", ETF)):
+        path = tmp_path / dirname / f"{dirname}.parquet"
+        path.parent.mkdir()
+        pl.DataFrame({"symbol": [symbol], "code": [symbol[:6]]}).write_parquet(path)
     repo = KlineRepository(DataStore(tmp_path))
     monkeypatch.setattr(repo, "get_etf_symbol_set", lambda: {ETF})
     monkeypatch.setattr(repo, "get_index_symbol_set", lambda: set())
@@ -41,6 +45,7 @@ def market(tmp_path, monkeypatch):
     monkeypatch.setattr(kline_api, "cn_today", lambda: DAY)
     monkeypatch.setattr(kline_api, "cn_now", lambda: datetime(2026, 11, 5, 9, 32))
     monkeypatch.setattr(kline_api.trading_day, "is_trading_day", lambda: True)
+    monkeypatch.setattr(kline_sync, "cn_now", lambda: datetime(2026, 11, 5, 10, 0))
     monkeypatch.setattr(kline_sync, "_selected_minute_provider_name", lambda: "test")
     monkeypatch.setattr(kline_sync, "_resolve_minute_provider", lambda _: (object(), False, None))
     monkeypatch.setattr(kline_sync.preferences, "get_minute_sync_segment_days", lambda: 20)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -254,8 +255,10 @@ def test_concurrent_event_appends_have_unique_contiguous_ids(tmp_path: Path) -> 
     for thread in threads:
         thread.start()
     barrier.wait()
+    # Each event fsyncs; this verifies correctness, not filesystem throughput.
+    deadline = time.monotonic() + 30
     for thread in threads:
-        thread.join(timeout=3)
+        thread.join(timeout=max(0, deadline - time.monotonic()))
 
     assert all(not thread.is_alive() for thread in threads)
     assert failures == []

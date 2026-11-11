@@ -253,12 +253,18 @@ def test_tdx_minute_window_flows_through_service_to_parquet(monkeypatch, tmp_pat
     monkeypatch.setattr(kline_sync, "_selected_minute_provider_name", lambda: "tdxquant")
     monkeypatch.setattr(kline_sync, "_resolve_minute_provider", lambda name: (provider, False, None))
     monkeypatch.setattr(kline_sync, "get_client", lambda: pytest.fail("不得跨源请求"))
+    minute_dir = tmp_path / "kline_minute"
+    instruments = tmp_path / "instruments"
+    instruments.mkdir()
+    pl.DataFrame({"symbol": ["600519.SH"], "code": ["600519"]}).write_parquet(
+        instruments / "instruments.parquet",
+    )
     kline_sync.sync_minute_batch(
         ["600519.SH"], datetime(2026, 10, 9, 9, 30, tzinfo=_BEIJING),
         datetime(2026, 10, 9, 9, 32, tzinfo=_BEIJING),
-        on_segment=lambda frame: kline_sync._write_minute_partition(frame, tmp_path),
+        on_segment=lambda frame: kline_sync._write_minute_partition(frame, minute_dir),
     )
-    stored = pl.read_parquet(tmp_path / "date=2026-10-09/part.parquet")
+    stored = pl.read_parquet(minute_dir / "date=2026-10-09/part.parquet")
     assert stored.height == 1
     assert stored["datetime"][0] == datetime(2026, 10, 9, 9, 31)
     assert stored["volume"][0] == 10.0

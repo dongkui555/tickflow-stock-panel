@@ -9,6 +9,7 @@ import { useListNav } from '@/lib/useListNav'
 import { tradeNavKey, type TradeNavItem } from '../tradeNav'
 import { fmtPct, fmtPrice, priceColorClass, pricePrecision } from '@/lib/format'
 import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
+import { StockIdentity } from '@/lib/stockDisplay'
 
 /** 单笔回放来自哪个入口: 决定切交易时同步翻哪张表的页 */
 export type TradeNavSource = 'daily' | 'trades'
@@ -171,8 +172,7 @@ export function TradeKlineModal({ trade, assetType, navItems, currentKey, onNavi
             <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3 border-b border-border px-4 py-3 sm:px-5">
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                  <span className="font-mono text-sm font-semibold text-foreground">{trade.symbol}</span>
-                  <span className="truncate text-sm text-foreground">{trade.name || '交易回放'}</span>
+                  <StockIdentity symbol={trade.symbol} name={trade.name} compact />
                   <span className="rounded border border-accent/30 bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">交易回放</span>
 
                   {/* 切交易: 上一笔 / n·N / 下一笔 */}

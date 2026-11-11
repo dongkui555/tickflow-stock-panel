@@ -11,12 +11,13 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import shutil
 import time
 import uuid
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
-from datetime import time as clock_time
+from datetime import time as dt_time
 from pathlib import Path
 from typing import NamedTuple
 
@@ -36,7 +37,7 @@ from app.data_providers.minute_normalizer import (
 from app.data_providers.minute_stream import iter_minute_frames
 from app.indicators.pipeline import filter_halt_days
 from app.market_time import CN_TZ, cn_now, cn_today
-from app.parquet import scan_daily_parquet
+from app.parquet import read_parquet_safe, scan_daily_parquet
 from app.services import minute_adjust, preferences
 from app.services.shared_work import SharedWork, WorkBusyError
 from app.tickflow.capabilities import Cap, CapabilitySet
@@ -86,10 +87,166 @@ def _atomic_write_parquet(df: pl.DataFrame, out) -> None:
     replace_with_retry(tmp, out)
 
 
+def _daily_dates(df: pl.DataFrame) -> list[date]:
+    if df.is_empty() or "date" not in df.columns:
+        return []
+    out: list[date] = []
+    for value in df["date"].unique().to_list():
+        if isinstance(value, datetime):
+            out.append(value.date())
+        elif isinstance(value, date):
+            out.append(value)
+        else:
+            try:
+                out.append(date.fromisoformat(str(value)[:10]))
+            except ValueError:
+                continue
+    return sorted(set(out))
+
+
+def _replace_existing_daily_partitions(repo: KlineRepository, df: pl.DataFrame, table: str = "kline_daily") -> None:
+    days = _daily_dates(df)
+    if not days:
+        return
+    from app.services.data_integrity import prune_table_partition_dates
+
+    removed = prune_table_partition_dates(repo.store.data_dir, table, days)
+    if removed:
+        logger.info("%s 覆盖修复: 已删除 %d 个旧日期分区", table, removed)
+
+
 # 标准列(无论 SDK 返回什么形状,我们把它规范成这套)
 CANONICAL_DAILY_COLS = [
     "symbol", "date", "open", "high", "low", "close", "volume", "amount",
 ]
+
+
+def _normalize_sync_symbol(value: object) -> str:
+    symbol = str(value or "").strip().upper()
+    if not symbol:
+        return ""
+    explicit_exchange = None
+    if "." in symbol and symbol.rsplit(".", 1)[-1] in {"SH", "SZ", "BJ"}:
+        explicit_exchange = symbol.rsplit(".", 1)[-1]
+    for prefix in ("SH", "SZ", "BJ"):
+        if symbol.startswith(prefix) and len(symbol) >= 8:
+            explicit_exchange = prefix
+            symbol = symbol[len(prefix):]
+            break
+    if "." in symbol:
+        symbol = symbol.split(".", 1)[0]
+    code = symbol.zfill(6) if symbol.isdigit() else symbol
+    return f"{code}.{explicit_exchange}" if explicit_exchange else code
+
+
+def _dedupe_symbols(symbols: list[object]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in symbols:
+        symbol = _normalize_sync_symbol(value)
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        out.append(symbol)
+    return out
+
+
+def _stockformer_top_symbols(repo: KlineRepository, top_n: int) -> list[str]:
+    try:
+        from app.services.stockformer import multifactor_select, predict
+
+        result = multifactor_select(repo.store.data_dir, limit=top_n)
+        rows = result.get("rows") or []
+        if not rows:
+            result = predict(repo.store.data_dir, limit=top_n)
+            rows = result.get("rows") or []
+        return _dedupe_symbols([row.get("symbol") for row in rows[:top_n] if isinstance(row, dict)])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("resolve stockformer minute universe failed: %s", exc)
+        return []
+
+
+def _holding_symbols() -> list[str]:
+    try:
+        from app.services.aiagents_bridge import legacy_holdings
+
+        data = legacy_holdings()
+        rows = data.get("positions") or []
+        return _dedupe_symbols([row.get("symbol") for row in rows if isinstance(row, dict)])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("resolve holdings minute universe failed: %s", exc)
+        return []
+
+
+def resolve_minute_sync_universe(
+    repo: KlineRepository,
+    capset: CapabilitySet | None = None,  # noqa: ARG001
+    *,
+    scope: str | None = None,
+    symbols: list[str] | str | None = None,
+    top_n: int | None = None,
+) -> tuple[list[str], str]:
+    """解析分钟K同步范围，避免默认全市场拉取导致超时。"""
+    scope_value = (scope or preferences.get_minute_sync_scope()).lower()
+    top_n_value = max(1, min(1000, int(top_n or preferences.get_minute_sync_top_n())))
+    if isinstance(symbols, str):
+        manual_symbols = _dedupe_symbols(symbols.replace("，", ",").replace("\n", ",").split(","))
+    elif symbols is not None:
+        manual_symbols = _dedupe_symbols(symbols)
+    else:
+        manual_symbols = preferences.get_minute_sync_symbols()
+
+    def _watchlist() -> list[str]:
+        try:
+            from app.tickflow.pools import get_pool
+
+            return _dedupe_symbols(get_pool("watchlist"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("resolve watchlist minute universe failed: %s", exc)
+            return []
+
+    def _all_a() -> list[str]:
+        all_symbols: list[str] = []
+        try:
+            from app.tickflow.pools import get_pool
+
+            all_symbols.extend(get_pool("CN_Equity_A"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("resolve CN_Equity_A minute universe failed: %s", exc)
+        try:
+            inst_path = repo.store.data_dir / "instruments" / "instruments.parquet"
+            if inst_path.exists():
+                inst = read_parquet_safe(inst_path, columns=["symbol"])
+                if inst is not None and "symbol" in inst.columns:
+                    all_symbols.extend(inst["symbol"].to_list())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("resolve instruments minute universe failed: %s", exc)
+        try:
+            index_set = repo.get_index_symbol_set()
+            return [s for s in _dedupe_symbols(all_symbols) if s not in index_set]
+        except Exception:
+            return _dedupe_symbols(all_symbols)
+
+    if scope_value == "manual":
+        return manual_symbols, "手动标的"
+    if scope_value == "watchlist":
+        return _watchlist(), "自选股"
+    if scope_value == "realtime_watchlist":
+        return _dedupe_symbols(preferences.get_realtime_watchlist_symbols()), "实时盯盘列表"
+    if scope_value == "holdings":
+        return _holding_symbols(), "持仓股"
+    if scope_value == "stockformer_top":
+        return _stockformer_top_symbols(repo, top_n_value), f"StockFormer Top{top_n_value}"
+    if scope_value == "all":
+        return _all_a(), "全市场A股"
+
+    combined = _dedupe_symbols([
+        *_holding_symbols(),
+        *_watchlist(),
+        *_stockformer_top_symbols(repo, top_n_value),
+        *manual_symbols,
+    ])
+    return combined, f"持仓+自选+推荐Top{top_n_value}"
 
 
 def _normalize_daily(df_in, default_symbol: str | None = None) -> pl.DataFrame:
@@ -226,7 +383,7 @@ def sync_daily_batch(symbols: list[str],
         sleep_between_batches(i, rpm)
         try:
             if start_time and end_time:
-                raw = _sdk_call_with_deadline(lambda: tf.klines.batch(
+                raw = _sdk_call_with_deadline(lambda chunk=chunk: tf.klines.batch(
                     chunk, period="1d", adjust="none",
                     start_time=_datetime_to_ms(start_time),
                     end_time=_datetime_to_ms(end_time),
@@ -234,7 +391,7 @@ def sync_daily_batch(symbols: list[str],
                     as_dataframe=False, show_progress=False,
                 ))
             else:
-                raw = _sdk_call_with_deadline(lambda: tf.klines.batch(
+                raw = _sdk_call_with_deadline(lambda chunk=chunk: tf.klines.batch(
                     chunk, period="1d", count=count or 250, adjust="none",
                     as_dataframe=False, show_progress=False))
         except SDKCallTimeoutError as e:
@@ -341,6 +498,7 @@ def sync_and_persist_daily_batch(
     start_date: datetime | None = None,
     end_date: datetime | None = None,
     on_chunk_done: Callable[[int, int], None] | None = None,
+    replace_existing: bool = False,
     zero_row_out: list[str] | None = None,
     failed_out: list[str] | None = None,
 ) -> int:
@@ -384,41 +542,70 @@ def sync_and_persist_daily_batch(
         return _finalize(0)
 
     provider_name = preferences.get_daily_data_provider()
+    custom_df = pl.DataFrame()
     if provider_name != "tickflow":
         from app.data_providers import custom as custom_sources
-        if custom_sources.provider_has_dataset(provider_name, "daily"):
-            provider = custom_sources.get_provider(provider_name)
-            end_time = end_date or datetime.now()
-            days = count or 365
-            start_time = start_date or (end_time - timedelta(days=days))
-            iter_daily = getattr(provider, "iter_daily", None)
-            if callable(iter_daily):
 
-                def _tracking_chunks(chunks):
-                    for df in chunks:
-                        if not df.is_empty() and "symbol" in df.columns:
-                            seen.update(df["symbol"].cast(pl.Utf8).unique().to_list())
-                        yield df
+        # 日K是可按批次替换的低频数据: 主自定义源明确失败/空结果时,
+        # 仅尝试雪球作为末级备源；主源已有有效结果时不混源覆盖。
+        candidates = [provider_name]
+        if provider_name != "xueqiu":
+            candidates.append("xueqiu")
+        end_time = end_date or datetime.now()
+        days = count or 365
+        start_time = start_date or (end_time - timedelta(days=days))
+        for candidate in candidates:
+            if not custom_sources.provider_has_dataset(candidate, "daily"):
+                continue
+            streaming_attempt = False
+            try:
+                provider = custom_sources.get_provider(candidate)
+                if candidate == "xueqiu" and not getattr(provider, "history_auth_configured", lambda: True)():
+                    logger.info("雪球未配置历史会话凭据，跳过日K备源")
+                    continue
+                iter_daily = getattr(provider, "iter_daily", None)
+                if callable(iter_daily) and not replace_existing:
+                    streaming_attempt = True
 
-                return _finalize(_persist_daily_chunks(
-                    _tracking_chunks(iter_daily(
-                        symbols,
-                        start_time=start_time,
-                        end_time=end_time,
-                        on_chunk_done=on_chunk_done,
-                    )),
-                    repo,
-                ))
-            df = provider.get_daily(
-                symbols,
-                start_time=start_time,
-                end_time=end_time,
-                on_chunk_done=on_chunk_done,
-            )
-            if df.is_empty():
-                return _finalize(0)
-            if "symbol" in df.columns:
-                seen.update(df["symbol"].cast(pl.Utf8).unique().to_list())
+                    def _tracking_chunks(chunks):
+                        for df in chunks:
+                            if not df.is_empty() and "symbol" in df.columns:
+                                seen.update(df["symbol"].cast(pl.Utf8).unique().to_list())
+                            yield df
+
+                    return _finalize(_persist_daily_chunks(
+                        _tracking_chunks(iter_daily(
+                            symbols,
+                            start_time=start_time,
+                            end_time=end_time,
+                            on_chunk_done=on_chunk_done,
+                        )),
+                        repo,
+                    ))
+                candidate_df = provider.get_daily(
+                    symbols,
+                    start_time=start_time,
+                    end_time=end_time,
+                    on_chunk_done=on_chunk_done,
+                )
+            except Exception as exc:
+                if streaming_attempt:
+                    raise
+                logger.warning("日K源 %s 请求失败，尝试下一源: %s", candidate, type(exc).__name__)
+                continue
+            if candidate_df is not None and not candidate_df.is_empty():
+                custom_df = candidate_df
+                if candidate != provider_name:
+                    logger.warning("日K主源 %s 无有效结果，已切换雪球末级备源", provider_name)
+                break
+
+        if not custom_df.is_empty():
+            df = custom_df
+            seen.update(df["symbol"].cast(pl.Utf8).unique().to_list())
+            if replace_existing:
+                if "quote_ts" in df.columns:
+                    df = df.drop("quote_ts")
+                _replace_existing_daily_partitions(repo, df)
             repo.append_daily(df)
             d = repo.store.data_dir.as_posix()
             repo.refresh_view("kline_daily", f"{d}/kline_daily/**/*.parquet")
@@ -447,6 +634,11 @@ def sync_and_persist_daily_batch(
     if df.is_empty():
         return _finalize(0)
 
+    if replace_existing:
+        if "quote_ts" in df.columns:
+            df = df.drop("quote_ts")
+        _replace_existing_daily_partitions(repo, df)
+
     repo.append_daily(df)
 
     d = repo.store.data_dir.as_posix()
@@ -465,6 +657,7 @@ def _persist_daily_chunks(chunks, repo: KlineRepository) -> int:
         for index, df in enumerate(chunks):
             if df.is_empty():
                 continue
+            df = repo._validate_asset_identity("stock", df)
             for date_df in df.partition_by("date"):
                 dt = date_df["date"][0]
                 ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
@@ -473,7 +666,8 @@ def _persist_daily_chunks(chunks, repo: KlineRepository) -> int:
                 date_df.write_parquet(out)
                 written += date_df.height
 
-        for date_dir in sorted(root.glob("date=*")):
+        date_dirs = sorted(root.glob("date=*"))
+        for date_dir in date_dirs:
             files = sorted(date_dir.glob("*.parquet"))
             if not files:
                 continue
@@ -678,6 +872,59 @@ def _merge_adj_factor_store(out: Path, new_data: pl.DataFrame) -> tuple[int, lis
     return merged.height - before, changed_symbols
 
 
+def _changed_factor_symbols(existing, incoming, *, cumulative=False) -> list[str]:
+    """Compare effective factors, not the list of symbols returned by the API."""
+    if incoming.is_empty():
+        return []
+    incoming = incoming.unique(["symbol", "trade_date"], keep="last").sort(["symbol", "trade_date"])
+    if existing.is_empty():
+        return sorted(incoming["symbol"].unique().to_list())
+    old = existing.select("symbol", "trade_date", "ex_factor").unique(
+        ["symbol", "trade_date"], keep="last").sort(["symbol", "trade_date"])
+    if cumulative:
+        reference = old.rename({"ex_factor": "_previous"})
+        compared = incoming.join_asof(reference, on="trade_date", by="symbol", strategy="backward",
+                                      check_sortedness=False)
+        first = old.group_by("symbol").agg(pl.col("ex_factor").first().alias("_first"))
+        compared = compared.join(first, on="symbol", how="left").with_columns(
+            pl.coalesce("_previous", "_first").alias("_previous"))
+    else:
+        compared = incoming.join(old.rename({"ex_factor": "_previous"}),
+                                 on=["symbol", "trade_date"], how="left").with_columns(
+                                     pl.col("_previous").fill_null(1.0))
+    changed = compared.filter(pl.col("_previous").is_null() | (
+        (pl.col("ex_factor") - pl.col("_previous")).abs()
+        > pl.col("_previous").abs().clip(lower_bound=1.0) * 1e-12))
+    return sorted(changed["symbol"].unique().to_list())
+
+
+def _persist_adj_factors(repo, new_data, *, asset_type, cumulative=False):
+    new_data = _normalize_adj_factor(new_data)
+    if not {"symbol", "trade_date", "ex_factor"} <= set(new_data.columns):
+        raise ValueError("Incomplete adjustment factor schema")
+    if new_data.filter(pl.col("ex_factor").is_null() | ~pl.col("ex_factor").is_finite()
+                       | (pl.col("ex_factor") <= 0)).height:
+        raise ValueError("Invalid adjustment factors")
+    new_data = new_data.unique(["symbol", "trade_date"], keep="last").sort(["symbol", "trade_date"])
+    factor_dir = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
+    out = repo.store.data_dir / factor_dir / "all.parquet"
+    existing = pl.read_parquet(out) if out.exists() else new_data.clear()
+    affected = _changed_factor_symbols(existing, new_data, cumulative=cumulative)
+    merged = pl.concat([existing, new_data], how="diagonal_relaxed").unique(
+        ["symbol", "trade_date"], keep="last").sort(["symbol", "trade_date"])
+    if merged.equals(existing.sort(["symbol", "trade_date"])):
+        return 0, []
+    # Persist invalidation before publishing factors: a crash must not lose required recomputation.
+    if affected and asset_type == "stock":
+        from app.services.maintenance_queue import enqueue
+        enqueue(repo.store.data_dir, "adjustment", affected)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_parquet(merged, out)
+    logger.info("adj_factor: %d new rows, %d genuinely changed symbols",
+                merged.height - existing.height, len(affected))
+    return merged.height - existing.height, affected
+
+
 def sync_adj_factor(symbols: list[str], repo: KlineRepository,
                     capset: CapabilitySet,
                     start_time: datetime | None = None,
@@ -717,11 +964,10 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
                 else:
                     return 0, []
             else:
-                factor_dir = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
-                added, affected = _merge_adj_factor_store(
-                    repo.store.data_dir / factor_dir / "all.parquet", new_data
+                return _persist_adj_factors(
+                    repo, new_data, asset_type=asset_type,
+                    cumulative=getattr(provider, "adj_factor_kind", "event") == "cumulative",
                 )
-                return added, affected
         # 自定义源未配置 adj_factor → 回退 TickFlow
 
     if not capset.has(Cap.ADJ_FACTOR):
@@ -751,7 +997,7 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
     for i, chunk in enumerate(chunks):
         sleep_between_batches(i, limit.rpm)
         try:
-            raw = _sdk_call_with_deadline(lambda: tf.klines.ex_factors(chunk, **sdk_kwargs))
+            raw = _sdk_call_with_deadline(lambda chunk=chunk: tf.klines.ex_factors(chunk, **sdk_kwargs))
             normalized = _normalize_adj_factor(raw)
             if not normalized.is_empty():
                 all_dfs.append(normalized)
@@ -778,19 +1024,116 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
 
     new_data = pl.concat(all_dfs, how="diagonal_relaxed") if len(all_dfs) > 1 else all_dfs[0]
 
-    factor_dir = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
-    added, affected = _merge_adj_factor_store(repo.store.data_dir / factor_dir / "all.parquet", new_data)
-    logger.info("adj_factor merged: +%d new rows, %d changed symbols, %d fetched / %d symbols",
-                added, len(affected), new_data.height, len(symbols))
-    return added, affected
+    return _persist_adj_factors(repo, new_data, asset_type=asset_type)
 
 
 # ===== 分钟 K 同步 =====
 
-def _write_minute_partition(df: pl.DataFrame, minute_dir: Path, *, missing_only: bool = False) -> int:
+def _minute_identity_lookup(minute_dir: Path, asset_type: str) -> dict[str, str]:
+    """Load the dimension used to validate a minute write."""
+    from app.services.security_identity import build_instrument_lookup
+
+    data_dir = Path(minute_dir).parent
+    if asset_type == "etf":
+        path = data_dir / "instruments_etf" / "instruments_etf.parquet"
+    elif asset_type == "index":
+        path = data_dir / "instruments_index" / "instruments_index.parquet"
+    else:
+        path = data_dir / "instruments" / "instruments.parquet"
+    paths = [path]
+    if asset_type == "stock":
+        # Delisted securities must remain outside the live instrument universe,
+        # but their historical bars still need a verified code/exchange identity.
+        paths.append(data_dir / "instruments_history" / "instruments_history.parquet")
+    frames = []
+    try:
+        for candidate in paths:
+            if candidate.exists():
+                frames.append(pl.read_parquet(candidate))
+        return build_instrument_lookup(frames)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+
+def _ensure_minute_identity_columns(
+    df: pl.DataFrame,
+    *,
+    asset_type: str,
+    identity_lookup: dict[str, str] | None,
+    allow_existing_identity: bool = False,
+) -> pl.DataFrame:
+    """Normalize minute rows to the storage identity schema before merging.
+
+    Online providers commonly return only the eight OHLCV columns while local
+    partitions also contain the four identity columns.  Keeping this
+    normalization at the write boundary prevents an 8-column delta from
+    colliding with an existing 12-column partition.
+    """
+    if df.is_empty():
+        return df
+    from app.services.security_identity import parse_identity
+
+    identities = []
+    for row in df.iter_rows(named=True):
+        value = row.get("symbol")
+        lookup = identity_lookup
+        # A scoped repair lookup only contains the current batch. Existing
+        # rows from the same partition already carry an independently
+        # validated identity and must not be revalidated against that scope.
+        if allow_existing_identity and row.get("code") and row.get("exchange"):
+            stored_symbol = f"{row['code']}.{row['exchange']}"
+            lookup = {str(row["code"]): stored_symbol}
+            value = stored_symbol
+        identities.append(
+            parse_identity(
+                value,
+                asset_type=asset_type,
+                lookup=lookup,
+                # Existing partitions may predate the identity schema and
+                # contain a qualified or structurally unambiguous symbol
+                # without a current dimension row. Incoming deltas remain
+                # fail-closed because this flag is only used for stored rows.
+                require_lookup=not allow_existing_identity,
+            )
+        )
+    identity_frame = pl.DataFrame(
+        {
+            "symbol": [item.symbol for item in identities],
+            "asset_type": [item.asset_type for item in identities],
+            "exchange": [item.exchange for item in identities],
+            "code": [item.code for item in identities],
+            "security_key": [item.security_key for item in identities],
+        },
+        schema={
+            "symbol": pl.String,
+            "asset_type": pl.String,
+            "exchange": pl.String,
+            "code": pl.String,
+            "security_key": pl.String,
+        },
+    )
+    # Replace identity fields in place so normalizing an existing partition
+    # retains its column order and repeated normalization is idempotent.
+    return df.with_columns(identity_frame.get_columns())
+
+
+
+def _write_minute_partition(
+    df: pl.DataFrame, minute_dir: Path, *, missing_only: bool = False,
+    asset_type: AssetType | None = None, identity_lookup: dict[str, str] | None = None,
+) -> int:
     """按日期原子合并。普通同步返回写入分区行数，定日修补与旧分区迁移只统计新增。"""
     if df.is_empty():
         return 0
+    minute_dir = Path(minute_dir)
+    if asset_type is None:
+        asset_type = "etf" if minute_dir.name == "kline_etf_minute" else "stock"
+    from app.services.security_identity import validate_frame_identity
+
+    lookup = identity_lookup if identity_lookup is not None else _minute_identity_lookup(minute_dir, asset_type)
+    validate_frame_identity(df, asset_type=asset_type, lookup=lookup, require_lookup=True)
+    df = _ensure_minute_identity_columns(df, asset_type=asset_type, identity_lookup=lookup)
     keys = ["symbol", "datetime"]
     df = df.drop_nulls(keys)
     if df.is_empty():
@@ -804,6 +1147,9 @@ def _write_minute_partition(df: pl.DataFrame, minute_dir: Path, *, missing_only:
             incoming = incoming.unique(subset=keys, keep="last")
         if out.exists():
             existing = pl.read_parquet(out).filter(pl.col("datetime").is_not_null())
+            existing = _ensure_minute_identity_columns(
+                existing, asset_type=asset_type, identity_lookup=lookup, allow_existing_identity=True,
+            )
             if missing_only:
                 # 老分区可能用毫秒，新数据用微秒。按北京墙钟对齐后仅插入缺失键。
                 incoming = incoming.with_columns(pl.col("datetime").cast(pl.Datetime("us")))
@@ -860,6 +1206,383 @@ def minute_source_stamp() -> MinuteSourceStamp:
     return MinuteSourceStamp(settings.data_dir, name, fingerprint)
 
 
+def _partition_dates(root: Path) -> list[date]:
+    """Return sorted date=YYYY-MM-DD partition dates without reading parquet data."""
+    if not root.exists():
+        return []
+    out: list[date] = []
+    for entry in root.iterdir():
+        if not (entry.is_dir() and entry.name.startswith("date=")):
+            continue
+        try:
+            out.append(date.fromisoformat(entry.name[5:]))
+        except ValueError:
+            continue
+    return sorted(set(out))
+
+
+def _parquet_row_count(path: Path) -> int | None:
+    """Read parquet row count from metadata; fall back to None when unavailable."""
+    try:
+        import pyarrow.parquet as pq
+
+        return int(pq.ParquetFile(path).metadata.num_rows)
+    except Exception:  # noqa: BLE001
+        try:
+            return int(pl.scan_parquet(str(path)).select(pl.len()).collect().item())
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def _symbol_counts_in_parquet(path: Path) -> dict[str, int]:
+    if not path.exists():
+        return {}
+    df = read_parquet_safe(path, columns=["symbol"])
+    if df is None or df.is_empty() or "symbol" not in df.columns:
+        return {}
+    counts: dict[str, int] = {}
+    for value in df["symbol"].to_list():
+        symbol = _normalize_sync_symbol(value)
+        if not symbol:
+            continue
+        counts[symbol] = counts.get(symbol, 0) + 1
+    return counts
+
+
+def _missing_minute_symbols(
+    repo: KlineRepository,
+    trade_day: date,
+    symbols: list[str],
+    *,
+    asset_type: AssetType = "stock",
+    min_symbol_rows: int = 1,
+) -> list[str]:
+    """Return tracked symbols that have daily rows but missing minute rows."""
+    tracked_symbols = set(_dedupe_symbols(symbols))
+    if not tracked_symbols:
+        return []
+    daily_root = repo.store.data_dir / ("kline_etf_daily" if asset_type == "etf" else "kline_daily")
+    daily_part = daily_root / f"date={trade_day.isoformat()}" / "part.parquet"
+    daily_symbols = set(_symbol_counts_in_parquet(daily_part))
+    required_symbols = tracked_symbols & daily_symbols if daily_symbols else tracked_symbols
+    if not required_symbols:
+        return []
+    minute_part = _minute_table_dir(repo, asset_type) / f"date={trade_day.isoformat()}" / "part.parquet"
+    minute_counts = _symbol_counts_in_parquet(minute_part)
+    min_symbol_rows = max(1, int(min_symbol_rows or 1))
+    return sorted(symbol for symbol in required_symbols if minute_counts.get(symbol, 0) < min_symbol_rows)
+
+
+def minute_gap_days(
+    repo: KlineRepository,
+    *,
+    start_date: date,
+    end_date: date,
+    min_rows: int = 0,
+    symbols: list[str] | None = None,
+    min_symbol_rows: int = 1,
+    newest_first: bool = False,
+    limit: int | None = None,
+    asset_type: AssetType = "stock",
+) -> list[date]:
+    """Find trading days with missing or obviously incomplete minute partitions.
+
+    Daily K partitions define the local trading calendar. For small universes,
+    pass ``symbols`` so a date partition is not considered complete merely
+    because some other symbol already wrote rows for that day. ``min_rows`` is
+    only a coarse full-market guard; keep it at 0 unless explicitly validating a
+    full-market partition.
+    """
+    data_dir = repo.store.data_dir
+    daily_root = data_dir / ("kline_etf_daily" if asset_type == "etf" else "kline_daily")
+    minute_root = _minute_table_dir(repo, asset_type)
+    expected = [d for d in _partition_dates(daily_root) if start_date <= d <= end_date]
+    if not expected:
+        return []
+    tracked_symbols = set(_dedupe_symbols(symbols or []))
+    min_symbol_rows = max(1, int(min_symbol_rows or 1))
+    scan_days = list(reversed(expected)) if newest_first else expected
+    limit_value = int(limit) if limit is not None else 0
+
+    # For a bounded universe, aggregate all relevant partitions in one
+    # DuckDB scan.  The previous implementation opened the daily and minute
+    # parquet file once per date and then counted rows in Python; that made a
+    # two-year Beijing repair spend several minutes before the first QMT
+    # request.  Codes are normalized here because local minute rows may carry
+    # an exchange suffix while daily rows usually do not.
+    if tracked_symbols:
+        try:
+            root = data_dir.as_posix()
+            code_sql = ",".join("'" + str(code).replace("'", "''") + "'" for code in sorted(tracked_symbols))
+            date_filter = f"BETWEEN DATE '{start_date.isoformat()}' AND DATE '{end_date.isoformat()}'"
+            daily_sql = f"""
+                SELECT CAST(regexp_extract(filename, 'date=([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})', 1) AS DATE) AS trade_day,
+                       regexp_replace(CAST(symbol AS VARCHAR), '\\\\..*$', '') AS code
+                FROM read_parquet('{root}/{'kline_etf_daily' if asset_type == 'etf' else 'kline_daily'}/date=*/part.parquet',
+                                  union_by_name=true, filename=true)
+                WHERE CAST(regexp_extract(filename, 'date=([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})', 1) AS DATE) {date_filter}
+                  AND regexp_replace(CAST(symbol AS VARCHAR), '\\\\..*$', '') IN ({code_sql})
+            """
+            minute_sql = f"""
+                SELECT CAST(regexp_extract(filename, 'date=([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})', 1) AS DATE) AS trade_day,
+                       regexp_replace(CAST(symbol AS VARCHAR), '\\\\..*$', '') AS code,
+                       COUNT(*) AS rows
+                FROM read_parquet('{root}/{'kline_etf_minute' if asset_type == 'etf' else 'kline_minute'}/date=*/part.parquet',
+                                  union_by_name=true, filename=true)
+                WHERE CAST(regexp_extract(filename, 'date=([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})', 1) AS DATE) {date_filter}
+                  AND regexp_replace(CAST(symbol AS VARCHAR), '\\\\..*$', '') IN ({code_sql})
+                GROUP BY 1, 2
+            """
+            daily_rows = repo.db.execute(daily_sql).fetchall()
+            minute_rows = repo.db.execute(minute_sql).fetchall()
+            required_by_day: dict[date, set[str]] = {}
+            for trade_day, code in daily_rows:
+                if trade_day is not None and code:
+                    required_by_day.setdefault(trade_day, set()).add(str(code))
+            counts_by_day: dict[date, dict[str, int]] = {}
+            for trade_day, code, count in minute_rows:
+                if trade_day is not None and code:
+                    counts_by_day.setdefault(trade_day, {})[str(code)] = int(count or 0)
+            gaps = []
+            for trade_day in scan_days:
+                required = required_by_day.get(trade_day, set())
+                counts = counts_by_day.get(trade_day, {})
+                if any(counts.get(code, 0) < min_symbol_rows for code in required):
+                    gaps.append(trade_day)
+                    if limit_value > 0 and len(gaps) >= limit_value:
+                        break
+            return gaps
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("bulk minute gap scan failed, falling back to partition scan: %s", exc)
+
+    gaps: list[date] = []
+    for trade_day in scan_days:
+        part = minute_root / f"date={trade_day.isoformat()}" / "part.parquet"
+        if not part.exists():
+            gaps.append(trade_day)
+            if limit_value > 0 and len(gaps) >= limit_value:
+                break
+            continue
+        if tracked_symbols:
+            if _missing_minute_symbols(
+                repo,
+                trade_day,
+                list(tracked_symbols),
+                asset_type=asset_type,
+                min_symbol_rows=min_symbol_rows,
+            ):
+                gaps.append(trade_day)
+                if limit_value > 0 and len(gaps) >= limit_value:
+                    break
+                continue
+        if min_rows > 0:
+            rows = _parquet_row_count(part)
+            if rows is None or rows < min_rows:
+                gaps.append(trade_day)
+                if limit_value > 0 and len(gaps) >= limit_value:
+                    break
+    return gaps
+
+
+def _group_trade_day_ranges(days: list[date], calendar: list[date]) -> list[tuple[date, date]]:
+    if not days:
+        return []
+    selected = sorted(set(days))
+    index = {d: i for i, d in enumerate(calendar)}
+    ranges: list[tuple[date, date]] = []
+    start = prev = selected[0]
+    for day in selected[1:]:
+        if day in index and prev in index and index[day] == index[prev] + 1:
+            prev = day
+            continue
+        ranges.append((start, prev))
+        start = prev = day
+    ranges.append((start, prev))
+    return ranges
+
+
+def sync_missing_minute_days(
+    symbols: list[str],
+    repo: KlineRepository,
+    capset: CapabilitySet,
+    *,
+    start_date: date,
+    end_date: date,
+    max_missing_days: int = 1,
+    min_rows: int = 0,
+    newest_first: bool = True,
+    on_range_done: Callable[[int, int, str], None] | None = None,
+    asset_type: AssetType = "stock",
+    provider_name: str | None = None,
+) -> dict:
+    """Backfill missing minute-K trading days only.
+
+    This is different from ``history_increment`` (latest tail) and
+    ``history_backfill`` (extend before earliest local date): it repairs holes
+    inside the existing history window.
+    """
+    if not symbols:
+        return {
+            "written_rows": 0,
+            "missing_days_before": 0,
+            "selected_days": [],
+            "ranges": [],
+            "remaining_missing_days": 0,
+        }
+
+    daily_root = repo.store.data_dir / ("kline_etf_daily" if asset_type == "etf" else "kline_daily")
+    calendar = [d for d in _partition_dates(daily_root) if start_date <= d <= end_date]
+    coverage_symbols = symbols if len(symbols) <= 1000 else None
+    gaps = minute_gap_days(
+        repo,
+        start_date=start_date,
+        end_date=end_date,
+        min_rows=min_rows,
+        symbols=coverage_symbols,
+        newest_first=newest_first,
+        limit=max(1, int(max_missing_days)),
+        asset_type=asset_type,
+    )
+    ordered = sorted(gaps, reverse=newest_first)
+    selected = sorted(ordered[: max(1, int(max_missing_days))])
+    # A local provider such as QMT can return a bounded multi-day history per
+    # symbol.  Merge consecutive missing dates even for a symbol-scoped
+    # repair; the old one-day-per-request path multiplied the same QMT lookup
+    # hundreds of times for the Beijing market.  The range still contains only
+    # dates selected by the gap detector, so complete dates remain untouched.
+    ranges = _group_trade_day_ranges(selected, calendar)
+    minute_dir = _minute_table_dir(repo, asset_type)
+    written_box = [0]
+    requested_symbol_days = 0
+
+    def _persist(seg_df: pl.DataFrame) -> None:
+        with repo._write_lock:
+            from app.config import settings
+            if asset_type == "stock" and settings.minute_fallback_provider == "tdx" and preferences.get_minute_data_provider() == "tushare":
+                pieces = []
+                for key, part in seg_df.with_columns(pl.col("datetime").dt.date().alias("_day")).partition_by("_day", as_dict=True).items():
+                    day = key[0]
+                    part = part.drop("_day")
+                    allow_qmt_partial = (
+                        str(provider_name or "").strip().lower() == "qmt"
+                        and os.getenv("QMT_IMPORT_PARTIAL", "0").strip().lower()
+                        in {"1", "true", "yes"}
+                    )
+                    if (
+                        datetime.combine(day, dt_time(15, 10)) <= cn_now().replace(tzinfo=None)
+                        and not allow_qmt_partial
+                    ):
+                        dp = repo.store.data_dir / "kline_daily" / f"date={day}" / "part.parquet"
+                        mp = minute_dir / f"date={day}" / "part.parquet"
+                        if not dp.exists():
+                            continue
+                        part = _verified_closed_minute_additions(
+                            part, pl.read_parquet(mp) if mp.exists() else part.clear(),
+                            pl.read_parquet(dp), day, data_dir=repo.store.data_dir,
+                            validation_source=(provider_name or preferences.get_minute_data_provider()),
+                        )
+                    if not part.is_empty():
+                        pieces.append(part)
+                if not pieces:
+                    return
+                seg_df = pl.concat(pieces)
+            written_box[0] += _write_minute_partition(
+                seg_df,
+                minute_dir,
+                asset_type=asset_type,
+            )
+
+    limit = resolve_limit(
+        capset,
+        Cap.KLINE_MINUTE_BATCH,
+        default_batch=100,
+        default_rpm=30,
+        default_rpm_when_unset=False,
+    )
+    total_ranges = len(ranges)
+    for idx, (first_day, last_day) in enumerate(ranges, start=1):
+        range_symbols = symbols
+        if coverage_symbols:
+            # Query only symbols that are incomplete on at least one date in
+            # this contiguous range.  This keeps the request bounded while
+            # still allowing QMT to return several historical sessions at
+            # once for each symbol.
+            pending = set()
+            for trade_day in calendar:
+                if first_day <= trade_day <= last_day:
+                    pending.update(_missing_minute_symbols(
+                        repo,
+                        trade_day,
+                        coverage_symbols,
+                        asset_type=asset_type,
+                    ))
+            range_symbols = sorted(pending)
+            if not range_symbols:
+                continue
+            requested_symbol_days += len(range_symbols) * max(
+                1, sum(first_day <= trade_day <= last_day for trade_day in calendar)
+            )
+        else:
+            requested_symbol_days += len(symbols)
+        start_time = datetime.combine(first_day, dt_time(9, 25))
+        end_time = datetime.combine(last_day, dt_time(15, 5))
+        label = f"{first_day.isoformat()}~{last_day.isoformat()}"
+
+        def _range_chunk_done(cur: int, total: int, seg_label: str) -> None:
+            if on_range_done is None:
+                return
+            local = cur / max(total, 1)
+            done = int(((idx - 1) + local) / max(total_ranges, 1) * 100)
+            on_range_done(done, 100, f"{label} · {seg_label}")
+
+        sync_minute_batch(
+            range_symbols,
+            start_time=start_time,
+            end_time=end_time,
+            batch_size=limit.batch,
+            rpm=limit.rpm,
+            on_chunk_done=_range_chunk_done,
+            segment_trading_days=preferences.get_minute_sync_segment_days(),
+            on_segment=_persist,
+            asset_type=asset_type,
+            provider_name=provider_name,
+        )
+
+    remaining = minute_gap_days(
+        repo,
+        start_date=start_date,
+        end_date=end_date,
+        min_rows=min_rows,
+        symbols=coverage_symbols,
+        newest_first=newest_first,
+        limit=max(10, int(max_missing_days)),
+        asset_type=asset_type,
+    )
+    if written_box[0] > 0:
+        try:
+            d = repo.store.data_dir.as_posix()
+            table = "kline_etf_minute" if asset_type == "etf" else "kline_minute"
+            repo.db.execute(
+                f"""CREATE OR REPLACE VIEW {table} AS
+                    SELECT * FROM read_parquet('{d}/{table}/**/*.parquet', union_by_name=true)"""
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("refresh minute gap view failed: %s", e)
+
+    return {
+        "written_rows": written_box[0],
+        "missing_days_before": len(gaps),
+        "selected_days": [d.isoformat() for d in selected],
+        "ranges": [(a.isoformat(), b.isoformat()) for a, b in ranges],
+        "remaining_missing_days": len(remaining),
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "min_rows": int(min_rows),
+        "symbol_coverage": len(coverage_symbols or []),
+        "requested_symbol_days": requested_symbol_days,
+    }
+
+
 def _resolve_minute_provider(
     provider_name: str,
 ) -> tuple[object | None, bool, str | None]:
@@ -895,6 +1618,7 @@ def _try_custom_minute(
     asset_type: AssetType,
     freq: str = "1m",
     on_chunk_done: Callable[[int, int, str], None] | None = None,
+    provider_name: str | None = None,
     on_segment: Callable[[pl.DataFrame], None] | None = None,
 ) -> tuple[pl.DataFrame | None, bool]:
     """尝试从自定义分钟源拉取。返回 (df, should_fallback_to_tickflow)。
@@ -914,7 +1638,7 @@ def _try_custom_minute(
     实现内部以 2 参 (cur, total) 调用。这里包装一层, provider 调 2 参时补
     默认 seg_label="custom" 转发给上层, 保证进度展示不降级。
     """
-    provider_name = _selected_minute_provider_name()
+    provider_name = provider_name or _selected_minute_provider_name()
     if provider_name.startswith("unavailable:"):
         logger.warning("custom minute provider %s is unavailable; not falling back to TickFlow",
                        provider_name.removeprefix("unavailable:"))
@@ -981,10 +1705,17 @@ def _try_custom_minute(
         return (pl.DataFrame(), False)
 
     try:
-        df = provider.get_minute(
-            symbols, start_time=start_time, end_time=end_time,
-            asset_type=asset_type, freq=freq, on_chunk_done=wrapped_cb,
-        )
+        from app.services import minute_failover
+        if minute_failover.enabled(provider_name, provider):
+            df, _ = minute_failover.fetch_minutes(
+                provider, symbols, start_time, end_time, asset_type=asset_type,
+                freq=freq, on_chunk_done=wrapped_cb,
+            )
+        else:
+            df = provider.get_minute(
+                symbols, start_time=start_time, end_time=end_time,
+                asset_type=asset_type, freq=freq, on_chunk_done=wrapped_cb,
+            )
     except ProviderRequestError:
         raise
     except Exception as e:
@@ -1007,6 +1738,134 @@ def _try_custom_minute(
     return (df, False)
 
 
+def _try_custom_minute_batched(
+    symbols: list[str],
+    start_time: datetime | None,
+    end_time: datetime | None,
+    asset_type: AssetType,
+    freq: str = "1m",
+    batch_size: int | None = None,
+    rpm: int | None = None,
+    on_chunk_done: Callable[[int, int, str], None] | None = None,
+    on_segment: Callable[[pl.DataFrame], None] | None = None,
+    provider_name: str | None = None,
+    on_source_issues: Callable[[list[dict]], None] | None = None,
+) -> tuple[pl.DataFrame | None, bool]:
+    """分批调用自定义分钟源。
+
+    Tushare/Promax 的历史分钟接口通常是逐股请求。旧逻辑把全市场股票
+    一次交给 provider，只有全部完成后才落盘；长任务中途失败会白跑。
+    这里按 symbol chunk 分批调用并在每批结束后落盘，保证可取消、可续跑。
+    """
+    provider_name = provider_name or _selected_minute_provider_name()
+    provider, fallback, err = _resolve_minute_provider(provider_name)
+    if fallback:
+        return (None, True)
+    if provider is None or err:
+        raise ProviderRequestError(f"分钟源 {provider_name} 不可用: {err}")
+    if not symbols:
+        return (pl.DataFrame(), False)
+
+    chunks = chunked(symbols, batch_size)
+    total_symbols = len(symbols)
+    processed_symbols = 0
+    hard_errors = 0
+    successful_calls = 0
+    out: list[pl.DataFrame] = []
+    validation_issues: list[dict] = []
+    received_rows = 0
+
+    for chunk_index, chunk in enumerate(chunks):
+        sleep_between_batches(chunk_index, rpm)
+
+        def _wrapped_cb(cur: int, total: int) -> None:
+            if on_chunk_done is None:
+                return
+            done = min(processed_symbols + max(0, int(cur)), total_symbols)
+            on_chunk_done(done, total_symbols, "custom")
+
+        try:
+            from app.services import minute_failover
+            if minute_failover.enabled(provider_name, provider):
+                df, issues = minute_failover.fetch_minutes(
+                    provider, chunk, start_time, end_time, asset_type=asset_type,
+                    freq=freq, on_chunk_done=_wrapped_cb,
+                )
+                if issues and on_source_issues:
+                    on_source_issues(issues)
+                if df.is_empty() and issues:
+                    failure = minute_failover.MinuteSourcesUnavailableError(issues)
+                    if failure.reason == "upstream_unavailable":
+                        raise failure
+                    validation_issues.extend(issues)
+                    logger.warning("%s", failure)
+                    if on_chunk_done:
+                        on_chunk_done(processed_symbols, total_symbols, str(failure))
+            else:
+                df = provider.get_minute(
+                    chunk,
+                    start_time=start_time,
+                    end_time=end_time,
+                    asset_type=asset_type,
+                    freq=freq,
+                    on_chunk_done=_wrapped_cb,
+                )
+            successful_calls += 1
+        except Exception as e:  # noqa: BLE001
+            if getattr(e, "reason", None) in {
+                "source_pending", "rate_limited", "upstream_unavailable", "request_timeout", "transport_error",
+            }:
+                # Retry the unfinished increment later, not every remaining
+                # stock batch (nor an unrelated provider) in this run.
+                raise
+            hard_errors += 1
+            logger.warning(
+                "custom minute provider %s call failed for %d symbols: %s",
+                provider_name,
+                len(chunk),
+                e,
+            )
+            processed_symbols += len(chunk)
+            if on_chunk_done:
+                on_chunk_done(min(processed_symbols, total_symbols), total_symbols, "custom")
+            continue
+
+        try:
+            df = _enforce_minute_beijing_wallclock(df, source=provider_name)
+        except Exception as e:  # noqa: BLE001
+            hard_errors += 1
+            logger.warning(
+                "custom minute provider %s datetime contract failed for %d symbols: %s",
+                provider_name,
+                len(chunk),
+                e,
+            )
+            processed_symbols += len(chunk)
+            if on_chunk_done:
+                on_chunk_done(min(processed_symbols, total_symbols), total_symbols, "custom")
+            continue
+
+        df = df if df is not None else pl.DataFrame()
+        if not df.is_empty():
+            received_rows += df.height
+            if on_segment:
+                on_segment(df)
+            else:
+                out.append(df)
+
+        processed_symbols += len(chunk)
+        if on_chunk_done:
+            on_chunk_done(min(processed_symbols, total_symbols), total_symbols, "custom")
+
+    if not received_rows and validation_issues:
+        raise minute_failover.MinuteSourcesUnavailableError(validation_issues)
+    if hard_errors and successful_calls == 0:
+        raise ProviderRequestError(f"分钟源 {provider_name} 全部请求失败")
+    if not out:
+        return (pl.DataFrame(), False)
+    return (pl.concat(out, how="diagonal_relaxed"), False)
+
+
 def sync_minute_batch(
     symbols: list[str],
     start_time: datetime | None = None,
@@ -1018,6 +1877,8 @@ def sync_minute_batch(
     segment_trading_days: int = 20,
     on_segment: Callable[[pl.DataFrame], None] | None = None,
     asset_type: AssetType = "stock",
+    on_source_issues: Callable[[list[dict]], None] | None = None,
+    provider_name: str | None = None,
     raw_basis: bool = False,
 ) -> pl.DataFrame:
     """向选中的分钟源交付完整标的列表和时间窗;消费源返回的标准帧。
@@ -1032,10 +1893,22 @@ def sync_minute_batch(
     """
     if not symbols:
         return pl.DataFrame()
-    df, fallback = _try_custom_minute(
-        symbols, start_time=start_time, end_time=end_time,
-        asset_type=asset_type, freq="1m", on_chunk_done=on_chunk_done, on_segment=on_segment,
-    )
+    provider_name = provider_name or _selected_minute_provider_name()
+    from app.services import minute_failover
+    provider, _, _ = _resolve_minute_provider(provider_name)
+    if minute_failover.enabled(provider_name, provider):
+        df, fallback = _try_custom_minute_batched(
+            symbols, start_time=start_time, end_time=end_time,
+            asset_type=asset_type, freq="1m", batch_size=batch_size, rpm=rpm,
+            on_chunk_done=on_chunk_done, on_segment=on_segment,
+            on_source_issues=on_source_issues, provider_name=provider_name,
+        )
+    else:
+        df, fallback = _try_custom_minute(
+            symbols, start_time=start_time, end_time=end_time,
+            asset_type=asset_type, freq="1m", on_chunk_done=on_chunk_done, on_segment=on_segment,
+            provider_name=provider_name,
+        )
     if not fallback:
         if on_segment is not None:
             if df is not None and not df.is_empty():
@@ -1269,6 +2142,65 @@ def fetch_intraday_universe_increment(
     return (_normalize_minute(seg), 1)
 
 
+def fetch_custom_intraday_increment(
+    symbols: list[str],
+    repo: KlineRepository,
+    capset: CapabilitySet | None,
+    *,
+    full_day: bool = False,
+    now: datetime | None = None,
+) -> tuple[pl.DataFrame, int]:
+    """Fetch today's minute increment from the configured custom minute source.
+
+    TickFlow Expert has intraday.universe for one-shot full-market increments.
+    Tushare/TDX/custom providers are symbol-scoped, so the realtime refresher
+    uses the configured minute universe and each symbol's local latest bar.
+    """
+    universe = _dedupe_symbols(symbols)
+    if not universe:
+        return (pl.DataFrame(), 0)
+    now_value = now or cn_now()
+    if now_value.tzinfo is not None:
+        end_time = now_value.replace(tzinfo=None)
+    else:
+        end_time = now_value
+    day_start = end_time.replace(hour=9, minute=25, second=0, microsecond=0)
+    if full_day:
+        latest_by_symbol: dict[str, datetime] = {}
+    else:
+        latest_by_symbol = _latest_minute_datetime_by_symbol(
+            repo,
+            universe,
+            start_floor=day_start,
+            end_time=end_time,
+        )
+    groups = _minute_increment_groups(universe, latest_by_symbol, default_start=day_start)
+
+    limits = capset.limits(Cap.KLINE_MINUTE_BATCH) if capset and capset.has(Cap.KLINE_MINUTE_BATCH) else None
+    frames: list[pl.DataFrame] = []
+    requests = 0
+    for group_symbols, start_time, _label in groups:
+        if start_time >= end_time:
+            continue
+        df = sync_minute_batch(
+            group_symbols,
+            start_time=start_time,
+            end_time=end_time,
+            batch_size=limits.batch if limits else None,
+            rpm=limits.rpm if limits else None,
+            asset_type="stock",
+        )
+        requests += max(1, len(group_symbols))
+        if not df.is_empty():
+            frames.append(df)
+    if not frames:
+        return (pl.DataFrame(), requests)
+    return (
+        pl.concat(frames, how="diagonal_relaxed")
+        .unique(subset=["symbol", "datetime"], keep="last")
+        .sort(["symbol", "datetime"]),
+        requests,
+    )
 def _resolve_full_minute_provider(
     provider_name: str,
 ) -> tuple[object | None, bool, str | None]:
@@ -1368,7 +2300,7 @@ def fetch_minute_single(
     trade_date: date,
     asset_type: AssetType = "stock",
     *,
-    capset: CapabilitySet,
+    capset: CapabilitySet | None = None,
     raw_basis: bool = False,
 ) -> pl.DataFrame:
     source = minute_source_stamp()
@@ -1397,16 +2329,54 @@ def _fetch_minute_single(
     start_time = datetime(trade_date.year, trade_date.month, trade_date.day, 9, 25, 0, tzinfo=CN_TZ)
     end_time = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 5, 0, tzinfo=CN_TZ)
 
-    # 按用户当前选择的分钟数据源路由，避免无提示跨源。
-    df, fallback = _try_custom_minute(
-        [symbol], start_time=start_time, end_time=end_time,
-        asset_type=asset_type, freq="1m",
-    )
+    minute_provider = preferences.get_minute_data_provider()
+    realtime_provider = preferences.get_realtime_data_provider()
+    from app.services import minute_failover
+    candidate, candidate_fallback, _ = _resolve_minute_provider(minute_provider)
+    failover_active = not candidate_fallback and minute_failover.enabled(minute_provider, candidate)
+
+    def _try_named_minute(provider_name: str) -> tuple[pl.DataFrame, bool]:
+        df, fallback = _try_custom_minute(
+            [symbol], start_time=start_time, end_time=end_time,
+            asset_type=asset_type, freq="1m", provider_name=provider_name,
+        )
+        return (df if df is not None else pl.DataFrame(), fallback)
+
+    if not failover_active and trade_date == cn_today() and realtime_provider != minute_provider:
+        rt_df, rt_fallback = _try_named_minute(realtime_provider)
+        if not rt_fallback:
+            if not rt_df.is_empty():
+                logger.info(
+                    "fetch_minute_single(%s, %s): realtime provider %s returned %d rows",
+                    symbol, trade_date, realtime_provider, rt_df.height,
+                )
+                return rt_df
+
+    # 自定义数据源分流: 与 sync_minute_batch 一致, 配了自定义分钟源时走 custom provider,
+    # 避免无 TickFlow Pro+ 权限的用户分时图首次打开(本地无数据)时补拉失败返回空。
+    df, fallback = _try_named_minute(minute_provider)
     if not fallback:
         # 见 sync_minute_batch 同分支注释: df 在此必非 None。
-        return df if df is not None else pl.DataFrame()
+        if not df.is_empty():
+            return df
+        # Tushare rt_min_daily 会对部分标的返回旧交易日分钟数据；规范化过滤后为空。
+        # 单股详情页此时应继续尝试本地 TDX，而不是把空数组直接交给前端。
+        if trade_date != cn_today() or failover_active:
+            return df
 
-    if not capset.has(Cap.KLINE_MINUTE_BY_SYMBOL):
+    if trade_date == cn_today() and asset_type == "stock":
+        for fallback_provider in ("tdx",):
+            if fallback_provider in {str(minute_provider).lower(), str(realtime_provider).lower()}:
+                continue
+            alt_df, alt_fallback = _try_named_minute(fallback_provider)
+            if not alt_fallback and not alt_df.is_empty():
+                logger.info(
+                    "fetch_minute_single(%s, %s): provider %s returned empty, fallback %s returned %d rows",
+                    symbol, trade_date, minute_provider, fallback_provider, alt_df.height,
+                )
+                return alt_df
+
+    if not fallback or capset is None or not capset.has(Cap.KLINE_MINUTE_BY_SYMBOL):
         return pl.DataFrame()
 
     tf = get_client()
@@ -1419,7 +2389,7 @@ def _fetch_minute_single(
             adjust="none" if raw_basis else "forward",
             as_dataframe=False, show_progress=False,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning("fetch_minute_single(%s, %s) failed: %s", symbol, trade_date, e)
         return pl.DataFrame()
 
@@ -1457,6 +2427,203 @@ def fetch_adj_factor_single(
     return _normalize_adj_factor(raw)
 
 
+def _minute_table_dir(repo: KlineRepository, asset_type: AssetType = "stock") -> Path:
+    dirname = "kline_minute" if asset_type == "stock" else f"kline_{asset_type}_minute"
+    return repo.store.data_dir / dirname
+
+
+def _minute_symbol_key_expr(column: str = "symbol") -> pl.Expr:
+    return (
+        pl.col(column)
+        .cast(pl.Utf8)
+        .str.to_uppercase()
+        .str.replace(r"^(SH|SZ|BJ)", "")
+        .str.replace(r"\..*$", "")
+        .alias("_symbol_key")
+    )
+
+
+def _minute_partition_files(
+    repo: KlineRepository,
+    *,
+    asset_type: AssetType = "stock",
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> list[Path]:
+    minute_dir = _minute_table_dir(repo, asset_type)
+    if not minute_dir.exists():
+        return []
+    files: list[tuple[date, Path]] = []
+    for entry in minute_dir.iterdir():
+        if not (entry.is_dir() and entry.name.startswith("date=")):
+            continue
+        try:
+            trade_date = date.fromisoformat(entry.name[5:])
+        except ValueError:
+            continue
+        if start_date is not None and trade_date < start_date:
+            continue
+        if end_date is not None and trade_date > end_date:
+            continue
+        part = entry / "part.parquet"
+        if part.exists():
+            files.append((trade_date, part))
+    files.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in files]
+
+
+def _latest_minute_datetime_by_symbol(
+    repo: KlineRepository,
+    symbols: list[str],
+    *,
+    asset_type: AssetType = "stock",
+    start_floor: datetime | None = None,
+    end_time: datetime | None = None,
+) -> dict[str, datetime]:
+    """Return local latest minute timestamp per symbol.
+
+    The historical sync must not use one global max(datetime): a single already
+    fresh symbol would make every lagging symbol start too late. We scan recent
+    date partitions newest-first and stop as soon as all requested symbols are
+    found. Invalid half-written parquet files are quarantined by read_parquet_safe.
+    """
+    keys = _dedupe_symbols(symbols)
+    if not keys:
+        return {}
+    lookup = _minute_identity_lookup(repo.store.data_dir / "kline_minute", asset_type)
+    aliases = {}
+    requested = {}
+    for key in keys:
+        code = key.split(".", 1)[0]
+        native = lookup.get(code)
+        if native and key not in {code, native}:
+            continue
+        canonical = native or key
+        requested.setdefault(canonical, set()).add(key)
+        aliases[key] = canonical
+        if native:
+            aliases[code] = canonical
+            aliases[native] = canonical
+    wanted = set(requested)
+    latest: dict[str, datetime] = {}
+    found = set()
+    files = _minute_partition_files(
+        repo,
+        asset_type=asset_type,
+        start_date=start_floor.date() if start_floor else None,
+        end_date=end_time.date() if end_time else None,
+    )
+    if not files:
+        return {}
+
+    for part in files:
+        if wanted <= found:
+            break
+        df = read_parquet_safe(part, columns=["symbol", "datetime"])
+        if df is None or df.is_empty() or "symbol" not in df.columns or "datetime" not in df.columns:
+            continue
+        try:
+            sub = (
+                df.with_columns(
+                    pl.col("symbol").cast(pl.String).str.to_uppercase()
+                    .str.replace(r"^(SH|SZ|BJ)(\d{6})$", "$2.$1")
+                    .replace_strict(aliases, default=None).alias("_symbol_key")
+                )
+                .filter(pl.col("_symbol_key").is_in(list(wanted - found)))
+                .filter(pl.col("datetime").is_not_null())
+            )
+            if start_floor is not None:
+                sub = sub.filter(pl.col("datetime") >= start_floor)
+            if end_time is not None:
+                sub = sub.filter(pl.col("datetime") <= end_time)
+            if sub.is_empty():
+                continue
+            grouped = sub.group_by("_symbol_key").agg(pl.col("datetime").max().alias("datetime"))
+            for row in grouped.to_dicts():
+                value = row.get("datetime")
+                key = _normalize_sync_symbol(row.get("_symbol_key"))
+                if key and isinstance(value, datetime):
+                    found.add(key)
+                    for requested_key in requested[key]:
+                        latest[requested_key] = value
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("latest minute scan skipped %s: %s", part, exc)
+            continue
+    return latest
+
+
+def _minute_increment_groups(
+    symbols: list[str],
+    latest_by_symbol: dict[str, datetime],
+    *,
+    default_start: datetime,
+) -> list[tuple[list[str], datetime, str]]:
+    buckets: dict[datetime, list[str]] = {}
+    for symbol in _dedupe_symbols(symbols):
+        start = latest_by_symbol.get(symbol) or default_start
+        buckets.setdefault(start.replace(second=0, microsecond=0), []).append(symbol)
+    groups: list[tuple[list[str], datetime, str]] = []
+    for start, group_symbols in sorted(buckets.items(), key=lambda item: item[0]):
+        if start == default_start.replace(second=0, microsecond=0):
+            label = f"缺口回补 {start:%m-%d %H:%M}"
+        else:
+            label = f"增量 {start:%m-%d %H:%M}"
+        groups.append((group_symbols, start, label))
+    return groups
+
+
+def _closed_minute_gap_starts(repo, symbols, start: datetime, end: datetime) -> dict[str, datetime]:
+    """A 15:00 watermark alone does not prove that all 240 minutes exist."""
+    from app.services.minute_repair import daily_reference, keyed, regular
+    from app.services.security_identity import IdentityError, parse_identity
+    lookup = _minute_identity_lookup(repo.store.data_dir / "kline_minute", "stock")
+    requested = {}
+    for symbol in _dedupe_symbols(symbols):
+        try:
+            identity = parse_identity(symbol, asset_type="stock", lookup=lookup)
+        except IdentityError:
+            continue
+        requested.setdefault(identity.code, []).append(symbol)
+    missing = {}
+    for day in _partition_dates(repo.store.data_dir / "kline_daily"):
+        if not start.date() <= day <= end.date() or datetime.combine(day, dt_time(15)) > end:
+            continue
+        daily_path = repo.store.data_dir / "kline_daily" / f"date={day}" / "part.parquet"
+        references = daily_reference(pl.read_parquet(daily_path), data_dir=repo.store.data_dir)
+        active = set(requested) & set(references)
+        minute_path = repo.store.data_dir / "kline_minute" / f"date={day}" / "part.parquet"
+        complete = set()
+        if minute_path.exists():
+            frame = keyed(pl.read_parquet(minute_path, columns=["symbol", "datetime"]))
+            counts = regular(frame, day).group_by("_code").agg(pl.col("datetime").n_unique().alias("n"))
+            complete = set(counts.filter(pl.col("n") == 240)["_code"])
+        for code in active - complete:
+            for symbol in requested[code]:
+                missing[symbol] = min(missing.get(symbol, end), datetime.combine(day, dt_time.min))
+    return missing
+
+
+def _verified_closed_minute_additions(incoming, existing, daily, day, *, data_dir=None, validation_source=None):
+    from collections import Counter
+    from app.services.minute_repair import checked_additions, daily_reference, keyed
+
+    references = daily_reference(daily, data_dir=data_dir)
+    old = {key[0]: part.drop("_code") for key, part in keyed(existing).partition_by("_code", as_dict=True).items()}
+    additions, rejected = [], Counter()
+    for key, part in keyed(incoming).partition_by("_code", as_dict=True).items():
+        code = key[0]
+        source = part.drop("_code")
+        delta, reason = checked_additions(
+            source, old.get(code, source.clear()), references.get(code), day,
+            source=validation_source,
+        )
+        if not delta.is_empty():
+            additions.append(delta)
+        elif reason != "already_complete":
+            rejected[reason] += 1
+    if rejected:
+        logger.warning("closed minute gap %s left unchanged after verification: %s", day, dict(rejected))
+    return pl.concat(additions) if additions else incoming.clear()
 def _as_beijing(d: datetime) -> datetime:
     """落盘的分钟 datetime 是北京墙钟 naive, 带上北京时区再交给取数窗口。
 
@@ -1553,10 +2720,13 @@ def sync_and_persist_minute(
     on_chunk_done: Callable[[int, int, str], None] | None = None,
     extend_backward: bool = False,
     force_full_days: bool = False,
+    as_of: datetime | None = None,
+    on_source_issues: Callable[[list[dict]], None] | None = None,
     *,
     asset_type: AssetType | None = None,
     repair_date: date | None = None,
     expected_source: MinuteSourceStamp | None = None,
+    expected_raw_basis: bool | None = None,
 ) -> int:
     """同步分钟 K 并存到 Parquet。返回写入行数。
 
@@ -1565,77 +2735,191 @@ def sync_and_persist_minute(
     使用 start_time / end_time 区间拉取, 确保所有标的覆盖同一时间段。
     on_chunk_done(current, total) 每个 chunk 完成后回调。
     force_full_days=True 时强制回溯 days 自然日 (不增量补, 用于个股补齐历史)。
-    repair_date 指定北京时间的单日窗口，只补缺失记录，返回实际新增根数。
-    未指定资产类型时按维表拆分股票/ETF，分别取数、落盘与刷新视图。
     """
+    source = minute_source_stamp()
+    if expected_source is not None and source != expected_source:
+        raise WorkBusyError("分钟数据源配置已变化，请重新补齐")
+    raw_basis = minute_adjust.minute_basis_is_raw(repo.store.data_dir)
+    if expected_raw_basis is not None and raw_basis != expected_raw_basis:
+        raise WorkBusyError("分钟价格基准已变化，请重新补齐")
+    if asset_type is None:
+        etfs = getattr(repo, "get_etf_symbol_set", lambda: set())()
+        if etfs and any(symbol in etfs for symbol in symbols):
+            return sum(
+                sync_and_persist_minute(
+                    group, repo, capset, days, on_chunk_done, extend_backward, force_full_days,
+                    as_of, on_source_issues, asset_type=asset, repair_date=repair_date, expected_source=source,
+                    expected_raw_basis=raw_basis,
+                )
+                for asset, group in (
+                    ("stock", [s for s in symbols if s not in etfs]),
+                    ("etf", [s for s in symbols if s in etfs]),
+                )
+                if group
+            )
+        asset_type = "stock"
+    if on_chunk_done:
+        on_chunk_done(0, 100, "检查分钟数据源")
+    minute_provider = _selected_minute_provider_name()
+    if minute_provider.startswith('unavailable:'):
+        raise ProviderRequestError('配置的分钟数据源不可用')
+    # resolver 调用统一走 _resolve_minute_provider, 与 _try_custom_minute 共用异常边界。
+    # resolver 异常时视为非 custom (minute_is_custom=False), 走 capset 检查 →
+    # sync_minute_batch 内 _try_custom_minute 会再次 resolver 异常 → fallback TickFlow。
+    provider, fallback, resolve_err = _resolve_minute_provider(minute_provider)
+    minute_is_custom = not fallback
+    if resolve_err is not None:
+        logger.warning("custom minute provider %s unavailable: %s", minute_provider, resolve_err)
+        return 0
     if not symbols:
         return 0
-    source_stamp = minute_source_stamp()
-    if expected_source is not None and source_stamp != expected_source:
-        raise WorkBusyError("分钟数据源配置已变化，请重新补齐")
-    if asset_type is None:
-        etf_set = repo.get_etf_symbol_set()
-        etf_symbols = [symbol for symbol in symbols if symbol in etf_set]
-        if etf_symbols:
-            stock_symbols = [symbol for symbol in symbols if symbol not in etf_set]
-            written = 0
-            for asset, group in (("stock", stock_symbols), ("etf", etf_symbols)):
-                if group:
-                    written += sync_and_persist_minute(
-                        group, repo, capset, days=days, on_chunk_done=on_chunk_done,
-                        extend_backward=extend_backward, force_full_days=force_full_days,
-                        asset_type=asset, repair_date=repair_date, expected_source=source_stamp,
-                    )
-            return written
-        asset_type = "stock"
-    if asset_type not in {"stock", "etf"}:
-        raise ValueError("分钟落库同步仅支持股票和 ETF")
-
-    minute_table = "kline_etf_minute" if asset_type == "etf" else "kline_minute"
-    minute_provider = source_stamp.provider
-    # 自定义源的能力和请求失败时都 fail-closed；共享能力集可能包含第三方源增补。
-    _, fallback, resolve_err = _resolve_minute_provider(minute_provider)
-    if resolve_err is not None:
-        logger.warning(
-            "custom minute provider %s resolution failed at sync_and_persist_minute: %s",
-            minute_provider, resolve_err,
-        )
+    if not minute_is_custom and not capset.has(Cap.KLINE_MINUTE_BATCH):
         return 0
-    if fallback and not capset.has(Cap.KLINE_MINUTE_BATCH):
-        return 0
+    from app.services import minute_failover
+    wall_now = cn_now().replace(tzinfo=None)
+    if as_of is not None:
+        as_of = _as_beijing(as_of).astimezone(CN_TZ).replace(tzinfo=None)
+    now = min(as_of, wall_now) if as_of else wall_now
+    if minute_failover.enabled(minute_provider, provider):
+        closed_request = (now.time() >= dt_time(15)
+                          and datetime.combine(now.date(), dt_time(15, 10)) <= wall_now)
+        deferred = minute_failover.retry_state(repo.store.data_dir, include_local=closed_request)
+        if deferred["source_retry"]:
+            raise minute_failover.MinuteSourcesUnavailableError(deferred["source_errors"])
 
-    # 迁移:旧版 _normalize_minute 未转换 timestamp→datetime,导致全部 datetime 为 null
-    # 检测到后直接清除(这些数据无法使用)
-    if asset_type == "stock":
-        if repair_date is None:
-            _cleanup_null_datetime_minute(repo)
-        # 迁移:旧版按 symbol= 分区转为 date= 分区
-        _migrate_symbol_to_date_partition(repo)
+    # Legacy full-history audits/migrations are offline maintenance only.
+    # Daily batches must neither scan nor delete unrelated historical partitions.
 
-    # 窗口两端统一为北京时区: 起止点会与本地分钟 K 的北京墙钟混用, 用服务器
-    # 本地时间会让窗口整体错位 (UTC 容器上起点晚于终点, 增量补拉一个请求都发不出)。
-    now = cn_now()
+    minute_dir = _minute_table_dir(repo, asset_type)
+    written_box = [0]  # list 闭包, 绕过 Python 闭包外层赋值
+    repair_dates: set[date] = set()
+    repair_backup_dir = None
 
+    def _persist(seg_df: pl.DataFrame) -> None:
+        nonlocal repair_backup_dir
+        # 单股自动补齐可能与另一个补齐请求同时写同一日期分区。Windows 不允许
+        # 替换仍被另一写入占用的临时文件,因此读-改-写必须复用仓库写锁。
+        with repo._write_lock:
+            if minute_source_stamp() != source:
+                raise WorkBusyError("分钟数据源配置已变化，请重新补齐")
+            if minute_adjust.minute_basis_is_raw(repo.store.data_dir) != raw_basis:
+                raise WorkBusyError("分钟价格基准已变化，请重新补齐")
+            if repair_date is not None:
+                seg_df = seg_df.filter(
+                    pl.col("symbol").is_in(symbols)
+                    & pl.col("datetime").is_between(start_time, end_time)
+                )
+            if seg_df.is_empty():
+                return
+            from app.config import settings
+            if asset_type == "stock" and settings.minute_fallback_provider == "tdx" and minute_provider == "tushare":
+                repair_dates.update(
+                    day for day in seg_df["datetime"].dt.date().drop_nulls().unique()
+                    if datetime.combine(day, dt_time(15, 10)) <= cn_now().replace(tzinfo=None)
+                )
+            if repair_dates:
+                pieces = []
+                dated = seg_df.with_columns(pl.col("datetime").dt.date().alias("_sync_day"))
+                for key, part in dated.partition_by("_sync_day", as_dict=True).items():
+                    day = key[0]
+                    part = part.drop("_sync_day")
+                    if day in repair_dates:
+                        daily_path = repo.store.data_dir / "kline_daily" / f"date={day}" / "part.parquet"
+                        existing_path = minute_dir / f"date={day}" / "part.parquet"
+                        if not daily_path.exists():
+                            logger.warning("closed minute gap %s has no daily reference; not written", day)
+                            continue
+                        part = _verified_closed_minute_additions(
+                            part, pl.read_parquet(existing_path) if existing_path.exists() else part.clear(),
+                            pl.read_parquet(daily_path), day, data_dir=repo.store.data_dir,
+                        )
+                    if not part.is_empty():
+                        pieces.append(part)
+                if not pieces:
+                    return
+                seg_df = pl.concat(pieces)
+            for day in set(seg_df["datetime"].dt.date().drop_nulls()) & repair_dates:
+                import shutil
+                import uuid
+                existing = minute_dir / f"date={day}" / "part.parquet"
+                if existing.exists():
+                    if repair_backup_dir is None:
+                        repair_backup_dir = repo.store.data_dir / "import_backups" / ("minute_incremental_" + uuid.uuid4().hex[:12])
+                    backup = repair_backup_dir / f"date={day}" / "part.parquet"
+                    if not backup.exists():
+                        backup.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(existing, backup)
+            written_box[0] += _write_minute_partition(
+                seg_df,
+                minute_dir,
+                asset_type=asset_type, missing_only=repair_date is not None,
+            )
     if repair_date is not None:
-        start_time = datetime.combine(repair_date, clock_time(9, 25), CN_TZ)
-        end_time = min(datetime.combine(repair_date, clock_time(15, 5), CN_TZ), now)
-        if end_time <= start_time:
-            return 0
-    else:
-        end_time = now
-        calendar_days = days
-        last_dt = None
-        if extend_backward:
-            end_time = _earliest_minute_datetime(repo, asset_type) or now
-            calendar_days = int(days * 7 / 5) + (10 if days > 41 else 0)
-        elif force_full_days:
-            calendar_days = int(days * 7 / 5) + 5
+        start_time = datetime.combine(repair_date, dt_time(9, 25))
+        end_time = min(datetime.combine(repair_date, dt_time(15, 5)), now)
+        groups = [(symbols, start_time, repair_date.isoformat())]
+    elif extend_backward:
+        # 向前扩展模式: 从本地最早数据往前补, 叠加已有数据避免缺口。
+        earliest_dt = _earliest_minute_datetime(repo, asset_type)
+        # 按交易日换算自然日 (7/5 系数)。>41 交易日时 +10 天余量覆盖节假日。
+        # (分段由 sync_minute_batch 的 segment_trading_days 控制, 与此处的区间天数独立。)
+        calendar_days = int(days * 7 / 5) + (10 if days > 41 else 0)
+        if earliest_dt:
+            end_time = _as_beijing(earliest_dt).astimezone(CN_TZ).replace(tzinfo=None)
+            start_time = end_time - timedelta(days=calendar_days)
         else:
-            last_dt = _latest_minute_datetime(repo, asset_type)
-        # 只有追尾增量沿用精确分钟。历史首日从开盘前取，避免继承点击时刻。
-        start_time = last_dt or datetime.combine(
-            end_time.date() - timedelta(days=calendar_days), clock_time(9, 25), CN_TZ,
-        )
+            # 本地无数据 → 从今天往前拉
+            start_time = now - timedelta(days=calendar_days)
+            end_time = now
+        start_time = datetime.combine(start_time.date(), dt_time(9, 25))
+        groups = [(symbols, start_time, f"向前扩展 {start_time:%m-%d}~{end_time:%m-%d}")]
+    else:
+        # 默认增量模式: 首次拉取回溯 N 天, 已有数据则按「每只股票自己的最新时间」
+        # 分组增量补到今天。不能用全局 max(datetime), 否则一只新鲜票会让所有
+        # 滞后票跳过历史缺口。
+        # force_full_days=True: 强制回溯 days 自然日 (个股补齐历史, 不增量)
+        if force_full_days:
+            # 按交易日换算自然日 (7/5 系数), 确保覆盖足够交易日
+            calendar_days = int(days * 7 / 5) + 5
+            start_time = datetime.combine((now - timedelta(days=calendar_days)).date(), dt_time(9, 25))
+            end_time = now
+            groups = [(symbols, start_time, f"强制补齐 {start_time:%m-%d}~{end_time:%m-%d}")]
+        else:
+            start_time = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+            end_time = min(now, now.replace(hour=15, minute=0, second=0, microsecond=0))
+            if dt_time(11, 30) <= now.time() < dt_time(13):
+                end_time = now.replace(hour=11, minute=30, second=0, microsecond=0)
+            if now.time() < dt_time(9, 30) or now.weekday() >= 5:
+                prior = [d for d in _partition_dates(repo.store.data_dir / "kline_daily") if d < now.date()]
+                if prior:
+                    end_time = datetime.combine(max(prior), dt_time(15))
+                    start_time = min(start_time, datetime.combine(end_time.date(), dt_time.min))
+            if on_chunk_done:
+                on_chunk_done(0, 100, f"检查最近分区 {start_time:%Y-%m-%d}~{end_time:%Y-%m-%d}")
+            latest_by_symbol = _latest_minute_datetime_by_symbol(
+                repo,
+                symbols,
+                start_floor=start_time,
+                end_time=end_time,
+                asset_type=asset_type,
+            )
+            if on_chunk_done:
+                on_chunk_done(0, 100, f"校验本批 {len(symbols)} 只股票的分钟缺口")
+            gap_starts = _closed_minute_gap_starts(repo, symbols, start_time, end_time) if asset_type == "stock" else {}
+            if gap_starts:
+                first_gap = min(v.date() for v in gap_starts.values())
+                repair_dates.update(
+                    first_gap + timedelta(days=i)
+                    for i in range((end_time.date() - first_gap).days + 1)
+                    if datetime.combine(first_gap + timedelta(days=i), dt_time(15)) <= now
+                )
+            for symbol, gap_start in gap_starts.items():
+                latest_by_symbol[symbol] = min(latest_by_symbol.get(symbol, gap_start), gap_start)
+            groups = _minute_increment_groups(
+                symbols,
+                latest_by_symbol,
+                default_start=start_time,
+            )
 
     limit = resolve_limit(
         capset,
@@ -1645,50 +2929,63 @@ def sync_and_persist_minute(
         default_rpm_when_unset=False,
     )
 
-    # 原生流式源每帧立即写盘, 核心不再积累全量;旧源仍保留 get_minute 返回契约。
-    # 全量攒内存曾导致 1 年全市场分钟 K OOM 卡死 (3 亿行 / 数十 GB)。
-    minute_dir = repo.store.data_dir / minute_table
-    raw_basis = minute_adjust.minute_basis_is_raw(repo.store.data_dir)
-    written_box = [0]  # list 闭包, 绕过 Python 闭包外层赋值
-
-    def _persist(seg_df: pl.DataFrame) -> None:
-        if repair_date is not None:
-            seg_df = seg_df.filter(
-                pl.col("symbol").is_in(symbols)
-                & pl.col("datetime").is_between(start_time.replace(tzinfo=None), end_time.replace(tzinfo=None))
-            )
-        # 单股自动补齐可能与另一个补齐请求同时写同一日期分区。Windows 不允许
-        # 替换仍被另一写入占用的临时文件,因此读-改-写必须复用仓库写锁。
-        with repo._write_lock:
-            if raw_basis != minute_adjust.minute_basis_is_raw(repo.store.data_dir):
-                raise WorkBusyError("分钟价格基准已变化，请重新补齐")
-            if source_stamp != minute_source_stamp():
-                raise WorkBusyError("分钟数据源配置已变化，请重新补齐")
-            if repair_date is not None:
-                written_box[0] += _write_minute_partition(seg_df, minute_dir, missing_only=True)
-            else:
-                written_box[0] += _write_minute_partition(seg_df, minute_dir)
-
     segment_days = preferences.get_minute_sync_segment_days()
-    try:
-        sync_minute_batch(
-            symbols, start_time=start_time, end_time=end_time,
-            batch_size=limit.batch, rpm=limit.rpm,
-            on_chunk_done=on_chunk_done,
-            segment_trading_days=segment_days,
-            on_segment=_persist,
-            asset_type=asset_type,
-            raw_basis=raw_basis,
-        )
-    finally:
-        # 后续批次失败时，先前已落盘的股票/ETF 分区仍需可查询。
-        if written_box[0]:
-            d = repo.store.data_dir.as_posix()
-            repo.refresh_view(minute_table, f"{d}/{minute_table}/**/*.parquet")
+    progress_units_per_group = 100
+    total_units = max(1, len(groups) * progress_units_per_group)
+
+    # 流式落盘: 每段拉完立即写盘, 内存峰值 = 单段 (而非全量)。
+    # 全量攒内存曾导致 1 年全市场分钟 K OOM 卡死 (3 亿行 / 数十 GB)。
+    for group_index, (group_symbols, start_time, label) in enumerate(groups):
+        if start_time >= end_time:
+            continue
+
+        def _group_chunk_done(cur: int, total: int, seg_label: str) -> None:
+            if on_chunk_done is None:
+                return
+            local = int(progress_units_per_group * cur / max(total, 1))
+            done = min(group_index * progress_units_per_group + local, total_units)
+            on_chunk_done(done, total_units, f"{label} · {seg_label}".strip(" ·"))
+
+        try:
+            _group_chunk_done(0, 100, f"请求分钟源, 本组 {len(group_symbols)} 只")
+            sync_minute_batch(
+                group_symbols, start_time=_as_beijing(start_time), end_time=_as_beijing(end_time),
+                batch_size=limit.batch, rpm=limit.rpm,
+                on_chunk_done=_group_chunk_done,
+                segment_trading_days=segment_days,
+                on_segment=_persist,
+                asset_type=asset_type,
+                on_source_issues=on_source_issues,
+                raw_basis=raw_basis,
+            )
+        except Exception as exc:
+            if getattr(exc, "reason", None) != "minute_validation_failed":
+                exc.written_rows = written_box[0]
+                if written_box[0]:
+                    _refresh_minute_view(repo, asset_type)
+                raise
+            # The maintenance post-check retains these stocks in the retry queue.
+            # Data conflicts in an earlier start-date group must not starve later groups.
+            logger.warning("%s", exc)
+            _group_chunk_done(1, 1, str(exc))
 
     if written_box[0] == 0:
         return 0
     written = written_box[0]
 
+    _refresh_minute_view(repo, asset_type)
+
     logger.info("minute K synced: %d rows (%d symbols)", written, len(symbols))
     return written
+
+
+
+def _refresh_minute_view(repo, asset_type="stock"):
+    # Publish successful streamed segments even when a later source request fails.
+    from app.jobs.daily_pipeline import _refresh_single_view
+
+    table = _minute_table_dir(repo, asset_type).name
+    try:
+        _refresh_single_view(repo, table)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("refresh %s view failed: %s", table, e)

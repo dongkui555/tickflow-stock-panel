@@ -71,6 +71,8 @@ def _ensure_history(repo, capset, symbol: str, asset_type: str, start: date, end
     enriched = compute_enriched(raw, factors=factors, instruments=instruments)
     if enriched.is_empty():
         return enriched
+    # 指标计算可压缩股票代码；单标的结果用已过滤的请求标识发布和缓存。
+    enriched = enriched.with_columns(pl.lit(symbol).alias("symbol"))
     if source != kline_sync.preferences.data_source_stamp():
         raise WorkBusyError("数据源配置已变化，请重新补齐")
     repo.append_daily_asset(asset_type, raw)

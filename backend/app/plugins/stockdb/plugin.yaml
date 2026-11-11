@@ -1,0 +1,8 @@
+name: stockdb
+display_name: "本地 StockDB（历史分钟补缺）"
+runtime: python
+entry: app.plugins.stockdb.provider:StockDBProvider
+check: app.plugins.stockdb.provider:availability
+datasets: [minute]
+description: "仅从本地 StockDB 读取已收盘 A 股原始 1 分钟数据，作为盘后批量分钟主源；不提供盘中实时、ETF或指数行情；写入前仍需完整性及日K量价校验。"
+install_hint: "Compose 默认启动本地 StockDB sidecar；配置 STOCKDB_ENABLED、STOCKDB_BASE_URL，并开启 STOCKDB_MINUTE_FALLBACK_ENABLED、STOCKDB_AFTER_CLOSE_PRIMARY_ENABLED。禁止填写公网体验地址。"

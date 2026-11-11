@@ -27,7 +27,7 @@ ENTRY_SIGNALS = ["entry"]
 EXIT_SIGNALS = ["exit"]
 def filter(df, params):
     return pl.col("close") > params["threshold"]
-""")
+""", encoding="utf-8")
     engine = StrategyEngine([directory])
     frame = pl.DataFrame(
         {
@@ -118,7 +118,7 @@ def test_wait_for_confirmed_current_bar_and_do_not_replay_past_signal(env):
 
 def test_changed_strategy_pauses_instead_of_using_new_code(env):
     bind(env)
-    env.path.write_text(env.path.read_text() + "\n# changed\n")
+    env.path.write_text(env.path.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
     env.service.tick(NOW)
     assert paper.load_orders(env.root) == []
     assert env.service.get("default")["status"] == "blocked"
@@ -168,7 +168,7 @@ def test_existing_rules_require_explicit_takeover_and_new_conflict_blocks(env):
 def test_preview_revision_prevents_stale_binding(env):
     source = {"strategy_id": "demo"}
     preview = env.service.preview(source)
-    env.path.write_text(env.path.read_text() + "\n# edit\n")
+    env.path.write_text(env.path.read_text(encoding="utf-8") + "\n# edit\n", encoding="utf-8")
     with pytest.raises(ValueError, match="预览"):
         env.service.bind("default", source, preview["revision"], now=NOW)
 
@@ -178,6 +178,9 @@ def fill_buys(env, monkeypatch, day=27):
 
     repo = KlineRepository(DataStore(env.root))
     symbols = env.screener.frame["symbol"].to_list()
+    pl.DataFrame({"symbol": symbols, "code": [symbol.split(".")[0] for symbol in symbols]}).write_parquet(
+        env.root / "instruments/instruments.parquet",
+    )
     for d in (26, 27, 28):
         repo.append_daily(
             pl.DataFrame(
@@ -486,7 +489,9 @@ def test_definition_change_during_evaluation_prevents_orders(env, monkeypatch):
 
     def changed(*args, **kwargs):
         result = original_run(*args, **kwargs)
-        env.path.write_text(env.path.read_text() + "\n# changed while evaluating\n")
+        env.path.write_text(
+            env.path.read_text(encoding="utf-8") + "\n# changed while evaluating\n", encoding="utf-8",
+        )
         return result
 
     monkeypatch.setattr(env.engine, "run", changed)
@@ -510,9 +515,10 @@ def test_dependency_fingerprint_uses_original_files_not_export_serialization(env
     path = signal_dir / "qa_entry.json"
     path.write_text(json.dumps(definition, separators=(",", ":")))
     env.path.write_text(
-        env.path.read_text().replace(
+        env.path.read_text(encoding="utf-8").replace(
             'ENTRY_SIGNALS = ["entry"]', 'ENTRY_SIGNALS = ["csg_qa_entry"]'
-        )
+        ),
+        encoding="utf-8",
     )
     env.engine.reload()
     env.screener.frame = env.screener.frame.with_columns(pl.lit(True).alias("csg_qa_entry"))
@@ -567,7 +573,7 @@ class Native:
     def compute_signals(self, market, params):
         return make_signal_matrix(market.shape, entry=(market.close > params["threshold"]).astype(np.uint8), exit=np.zeros(market.shape, dtype=np.uint8))
 MATRIX_STRATEGY = Native()
-""")
+""", encoding="utf-8")
     env.engine.reload()
     env.screener.frame = env.screener.frame.with_columns(
         pl.lit(10.0).alias("open"),

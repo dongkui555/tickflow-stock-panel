@@ -47,6 +47,7 @@ def enriched_history_days(data_dir, asset_type: str = "stock", as_of: date | Non
 # ── 进程级历史数据缓存 (避免 run_all 每次重新扫描 parquet + 计算指标) ──
 _history_cache: dict[tuple[str, date, int], tuple[float, pl.DataFrame]] = {}
 _HISTORY_CACHE_TTL = 120.0  # 秒
+_PRIOR_PARTITION_SCAN = 10
 
 # load_prior_consecutive 最多回看多少个已存在的日分区 (缺列时继续往前找的上限)
 _PRIOR_PARTITION_SCAN = 10

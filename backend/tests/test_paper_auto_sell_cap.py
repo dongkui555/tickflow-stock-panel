@@ -20,6 +20,9 @@ DAY = date(2026, 10, 8)
 
 def _write_prev_close(tmp_path) -> None:
     repo = KlineRepository(DataStore(tmp_path))
+    pl.DataFrame({"symbol": [SYM], "code": [SYM.split(".")[0]]}).write_parquet(
+        tmp_path / "instruments/instruments.parquet",
+    )
     repo.append_daily(pl.DataFrame({
         "symbol": [SYM], "date": [DAY - timedelta(days=1)],
         "open": [10.0], "high": [10.0], "low": [10.0], "close": [10.0],

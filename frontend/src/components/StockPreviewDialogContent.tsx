@@ -12,6 +12,7 @@ import { StockPanel, getDefaultRange } from '@/components/StockPanel'
 import { NavPager, NavWrapToast } from '@/components/NavPager'
 import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
 import { StockMultiDayIntradayChart } from '@/components/StockMultiDayIntradayChart'
+import { StockDailyKChart } from '@/components/StockDailyKChart'
 import { DatePicker } from '@/components/DatePicker'
 import { RuleEditor } from '@/components/monitor/RuleEditor'
 import { PriceAlertDialog } from '@/components/stock-analysis/PriceAlertDialog'
@@ -56,6 +57,7 @@ const PRESETS: { label: string; months: number }[] = [
 const CHART_TABS = [
   { key: 'daily', label: '日 K', icon: LineChart },
   { key: 'intraday', label: '分时', icon: Clock },
+  { key: 'minutes', label: '分钟 K', icon: Activity },
 ] as const
 type PreviewView = typeof CHART_TABS[number]['key'] | `extension:${string}`
 interface PriceAlertDraft {
@@ -97,13 +99,14 @@ function fmtAbnormalCalcTime(asofSec: number): string {
 
 export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, navList: navListSource, onNavigate }: Props) {
   const [view, setView] = useState<PreviewView>('daily')
+  const [minutePeriod, setMinutePeriod] = useState<5 | 15 | 30 | 60>(5)
   const panelId = useId()
   const extensionTabs = getFrontendSlotRegistrations('stock-preview.tabs')
   const tabs = [
     ...CHART_TABS,
     ...extensionTabs.map(tab => ({ key: `extension:${tab.id}` as const, label: tab.label, icon: null })),
   ]
-  const isChartView = view === 'daily' || view === 'intraday'
+  const isChartView = view === 'daily' || view === 'intraday' || view === 'minutes'
   const selectedTab = isChartView ? undefined : extensionTabs.find(tab => view === `extension:${tab.id}`)
   const TabContent = selectedTab?.component
   const [intradayDays, setIntradayDays] = useState<number | null>(loadIntradayDays)
@@ -333,6 +336,16 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                 </div>
                 {isChartView && <span className="h-4 w-px shrink-0 bg-border/70" />}
                 {/* 区间选择 — 随视图切换 */}
+                {view === 'minutes' && (
+                  <select
+                    aria-label="分钟 K 周期"
+                    value={minutePeriod}
+                    onChange={e => setMinutePeriod(Number(e.target.value) as 5 | 15 | 30 | 60)}
+                    className="h-6 rounded border border-border bg-base px-2 text-[11px]"
+                  >
+                    {[5, 15, 30, 60].map(period => <option key={period} value={period}>{period} 分钟</option>)}
+                  </select>
+                )}
                 {view === 'daily' ? (
                   <div className="flex max-w-full flex-wrap items-center gap-2">
                     <div className="inline-flex shrink-0 items-center rounded border border-border/60 bg-base/60 p-0.5">
@@ -559,6 +572,16 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                   intradayDays={effectiveIntradayDays}
                   addedDate={addedDate}
                 />
+              ) : view === 'minutes' ? (
+                <StockDailyKChart
+                  symbol={symbol}
+                  minutePeriod={minutePeriod}
+                  minuteDays={20}
+                  height={480}
+                  priceLines={monitorPriceLines}
+                  onPriceDoubleClick={openPriceAlert}
+                  refetchIntervalMs={intradayRefetchMs}
+                />
               ) : view === 'intraday' ? (
                 <div className="flex min-w-0 flex-col gap-4">
                 <StockPanel
@@ -596,7 +619,7 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
               <div className="shrink-0">
                 <ExtensionSlot
                   name="stock-preview.footer"
-                  context={{ symbol, name: name ?? null, view }}
+                  context={{ symbol, name: name ?? null, view: view === 'minutes' ? 'intraday' : view }}
                 />
               </div>
             )}

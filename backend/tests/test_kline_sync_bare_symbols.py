@@ -19,7 +19,7 @@ from app.tickflow.repository import DataStore, KlineRepository
 def _write_instruments(data_dir, symbols: list[str]) -> None:
     out = data_dir / "instruments" / "instruments.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
-    pl.DataFrame({"symbol": symbols}).write_parquet(out)
+    pl.DataFrame({"symbol": symbols, "code": [s.split(".")[0] for s in symbols]}).write_parquet(out)
 
 
 def _daily(symbol: str, day: date) -> pl.DataFrame:
@@ -86,6 +86,8 @@ def test_sync_reports_zero_rows_in_caller_spelling(monkeypatch, tmp_path, caplog
     caplog.set_level(logging.WARNING, logger="app.services.kline_sync")
     repo = KlineRepository(DataStore(tmp_path))
     provider = _Provider([_daily("000001.SZ", date(2026, 9, 10))])
+    _write_instruments(tmp_path, ["000001.SZ"])
+    repo._refresh_instruments()
     _route_provider(monkeypatch, provider)
     zero: list[str] = []
 

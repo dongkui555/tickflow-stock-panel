@@ -649,7 +649,7 @@ export function Regime() {
     setRecomputing(true)
     try {
       const r = await api.regimeRecompute()
-      toast(r.computed > 0 ? `重算完成 · 新增 ${r.computed} 天` : '重算完成 · 数据已是最新', 'success')
+      toast(r.queued ? `历史重算已排队 · ${r.queued_days} 天 · 进度见数据页` : '暂无可重算数据', 'success')
       await Promise.all([
         qc.invalidateQueries({ queryKey: ['regime-history'] }),
         qc.invalidateQueries({ queryKey: ['regime-states'] }),
@@ -1214,7 +1214,7 @@ function MainlineFilterPanel({ filter, onDone }: {
       if (stChanged) {
         // 口径切换影响情绪周期驱动指标, 需全量重算 regime+主线(较重, 需等待)
         await api.regimeRecompute()
-        toast('过滤已保存, 主线与情绪周期已全量重算', 'success')
+        toast('过滤已保存, 主线与情绪周期重算已排队', 'success')
       } else {
         await api.regimeMainlineRecompute()
         toast('过滤已保存, 主线已重算', 'success')

@@ -10,8 +10,17 @@ from __future__ import annotations
 from datetime import datetime
 
 import polars as pl
+import pytest
 
 from app.services.kline_sync import _write_minute_partition
+
+
+@pytest.fixture(autouse=True)
+def instruments(tmp_path):
+    root = tmp_path / "instruments"
+    root.mkdir()
+    pl.DataFrame({"symbol": ["000001.SZ", "600000.SH", "300750.SZ"],
+                  "code": ["000001", "600000", "300750"]}).write_parquet(root / "instruments.parquet")
 
 
 def _bars(spec: dict[str, list[tuple[str, float]]]) -> pl.DataFrame:

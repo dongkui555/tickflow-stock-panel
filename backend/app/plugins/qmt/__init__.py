@@ -1,0 +1,1 @@
+"""QMT local bridge provider."""

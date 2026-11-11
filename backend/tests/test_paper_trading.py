@@ -23,6 +23,11 @@ def _cap_account(tmp_path, cash: float = 1_000_000.0) -> dict:
 
 def _write_daily(tmp_path, rows: list[tuple[date, float, float]]) -> None:
     """写 kline_daily 分区: [(day, open, close)] (不复权 raw 价)。"""
+    instruments = tmp_path / "instruments"
+    instruments.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"symbol": [SYM], "code": ["600519"], "name": ["贵州茅台"]}).write_parquet(
+        instruments / "instruments.parquet"
+    )
     repo = KlineRepository(DataStore(tmp_path))
     df = pl.DataFrame(
         {

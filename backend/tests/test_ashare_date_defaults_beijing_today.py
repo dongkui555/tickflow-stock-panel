@@ -109,22 +109,20 @@ def test_factors_trial_uses_beijing_today(monkeypatch) -> None:
 def test_regime_recompute_defaults_to_beijing_today(monkeypatch) -> None:
     captured_args = []
 
-    def fake_run_batch(repo, start, end):
-        captured_args.append((start, end))
-        return pl.DataFrame()
+    def fake_enqueue(data_dir, kind, dates, **kwargs):
+        assert kind == "regime"
+        captured_args.extend(dates)
+        return "queued"
 
     monkeypatch.setattr(regime_api, "cn_today", lambda: BJ)
     monkeypatch.setattr(regime_api, "_data_dir", lambda r: MagicMock())
-    monkeypatch.setattr(regime_builder, "earliest_enriched_date", lambda repo: date(2026, 1, 1))
-    monkeypatch.setattr(regime_builder, "run_regime_batch", fake_run_batch)
-    monkeypatch.setattr(regime_builder, "refresh_phase_labels", lambda d: 0)
+    monkeypatch.setattr(regime_builder, "enriched_date_set", lambda repo: {BJ, BJ + timedelta(days=1)})
+    monkeypatch.setattr("app.services.maintenance_queue.enqueue", fake_enqueue)
 
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(repo=MagicMock())))
     regime_api.regime_recompute(request, start=None, end=None)
 
-    assert captured_args
-    _start, end = captured_args[0]
-    assert end == BJ
+    assert captured_args == [BJ]
 
 
 def test_repair_daily_validates_against_beijing_today(monkeypatch) -> None:

@@ -19,6 +19,38 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/financials", tags=["financials"])
 
 
+def _financial_table_stats(data_dir, table: str) -> dict:
+    """Return lightweight local coverage stats for one financial table."""
+    path = data_dir / "financials" / table / "part.parquet"
+    empty = {"rows": 0, "symbols": 0, "earliest_date": None, "latest_date": None}
+    if not path.exists():
+        return empty
+    try:
+        lf = pl.scan_parquet(path)
+        names = set(lf.collect_schema().names())
+        exprs = [pl.len().alias("rows")]
+        if "symbol" in names:
+            exprs.append(pl.col("symbol").n_unique().alias("symbols"))
+        if "period_end" in names:
+            period = pl.col("period_end").cast(pl.Date, strict=False)
+            exprs.extend([
+                period.min().alias("earliest_date"),
+                period.max().alias("latest_date"),
+            ])
+        row = lf.select(exprs).collect().row(0, named=True)
+        earliest = row.get("earliest_date")
+        latest = row.get("latest_date")
+        return {
+            "rows": int(row.get("rows") or 0),
+            "symbols": int(row.get("symbols") or 0),
+            "earliest_date": str(earliest) if earliest else None,
+            "latest_date": str(latest) if latest else None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取 financials/%s 状态失败: %s", table, exc)
+        return empty
+
+
 def _financial_allowed(capset) -> bool:
     """是否有财务数据访问权限 (TickFlow FINANCIAL 套餐 或 custom 财务源)。"""
     if capset.has(Cap.FINANCIAL):
@@ -45,18 +77,7 @@ def financial_status(request: Request):
     tables = {}
 
     for table in FINANCIAL_TABLES:
-        path = data_dir / "financials" / table / "part.parquet"
-        if path.exists():
-            try:
-                df = pl.read_parquet(path, columns=["symbol"])
-                tables[table] = {
-                    "rows": len(df),
-                    "symbols": df["symbol"].n_unique() if not df.is_empty() else 0,
-                }
-            except Exception:
-                tables[table] = {"rows": 0, "symbols": 0}
-        else:
-            tables[table] = {"rows": 0, "symbols": 0}
+        tables[table] = _financial_table_stats(data_dir, table)
 
     fs = getattr(request.app.state, "financial_scheduler", None)
     last_sync = fs.last_sync if fs else {}

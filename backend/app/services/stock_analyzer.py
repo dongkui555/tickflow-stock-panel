@@ -14,11 +14,16 @@
 """
 from __future__ import annotations
 
+import datetime
 import json
 import logging
+import math
+import numbers
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
 from collections.abc import AsyncIterator
 from datetime import timedelta
-from pathlib import Path
 
 import polars as pl
 
@@ -32,6 +37,33 @@ logger = logging.getLogger(__name__)
 _KLINE_WINDOW = 90
 # 注入财务表的最近期数
 _MAX_PERIODS = 4
+
+
+def _json_safe(value: Any) -> Any:
+    """递归转换为 JSON 安全值。"""
+    if value is None:
+        return None
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        value = float(value)
+    if isinstance(value, numbers.Real) and not isinstance(value, bool):
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        if isinstance(value, numbers.Integral):
+            return int(value)
+        return round(number, 4)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except Exception:  # noqa: BLE001
+            return str(value)
+    return value
 
 
 # ================================================================
@@ -58,22 +90,9 @@ def _clean_rows(df: pl.DataFrame, keep_cols: list[str]) -> list[dict]:
     polars 的 date 列会变成 Python datetime.date,json.dumps 无法直接序列化,
     必须转成 ISO 字符串,否则 json.dumps 抛 TypeError 让整个流静默失败。
     """
-    import datetime
-    import math
     cols = [c for c in keep_cols if c in df.columns]
     sub = df.select(cols)
-    rows = []
-    for rec in sub.to_dicts():
-        clean = {}
-        for k, v in rec.items():
-            if isinstance(v, float):
-                clean[k] = None if not math.isfinite(v) else round(v, 4)
-            elif isinstance(v, (datetime.date, datetime.datetime)):
-                clean[k] = v.isoformat()
-            else:
-                clean[k] = v
-        rows.append(clean)
-    return rows
+    return _json_safe(sub.to_dicts())
 
 
 def _load_financials(data_dir: Path, symbol: str) -> dict[str, list[dict]]:
@@ -94,17 +113,13 @@ def _load_financials(data_dir: Path, symbol: str) -> dict[str, list[dict]]:
             continue
         if "period_end" in df.columns:
             df = df.sort("period_end", descending=True).head(2)  # 只取最近 2 期
-        import math
         rows = []
         for rec in df.to_dicts():
             clean = {}
             for k, v in rec.items():
                 if k == "symbol":
                     continue
-                if isinstance(v, float):
-                    clean[k] = None if not math.isfinite(v) else v
-                else:
-                    clean[k] = v
+                clean[k] = _json_safe(v)
             rows.append(clean)
         out[table] = rows
     return out
@@ -246,7 +261,7 @@ def _build_user_prompt(
         "以下是该标的最近日 K 数据(JSON,含 OHLCV 与已计算的技术指标。"
         f"最近 {_KLINE_WINDOW} 个交易日,升序):",
         "```json",
-        json.dumps(kline_tail, ensure_ascii=False),
+        json.dumps(_json_safe(kline_tail), ensure_ascii=False, allow_nan=False),
         "```",
     ]
 
@@ -256,7 +271,7 @@ def _build_user_prompt(
             "",
             "以下是该标的最新财务数据(JSON,核心指标 + 利润表,金额单位为元):",
             "```json",
-            json.dumps(fins, ensure_ascii=False),
+            json.dumps(_json_safe(fins), ensure_ascii=False, allow_nan=False),
             "```",
         ])
     elif asset_type == "index":
@@ -311,6 +326,223 @@ _KLINE_KEEP_COLS = [
 ]
 
 
+_AGENT_SPECS = [
+    {
+        "key": "technical",
+        "name": "技术分析师",
+        "mission": "只看趋势、均线、形态、MACD/KDJ/RSI/BOLL、量价配合与支撑阻力，判断当前技术位置和信号有效性。",
+    },
+    {
+        "key": "fund_flow",
+        "name": "资金分析师",
+        "mission": "重点分析主力/大单资金、近5/20/60日资金趋势、放量来源、换手变化与资金持续性，不能把单日流入当作充分理由。",
+    },
+    {
+        "key": "fundamental",
+        "name": "基本面分析师",
+        "mission": "分析公司基本信息、行业位置、估值、财务质量、业绩变化和基本面风险；数据缺失时明确降级，不编造指标。",
+    },
+    {
+        "key": "sentiment",
+        "name": "新闻情绪分析师",
+        "mission": "分析国内新闻、海外市场、美股/汇率/大宗商品等外部扰动、题材热度和情绪催化；新闻缺失时只能依据已知行情异动做推断。",
+    },
+    {
+        "key": "risk",
+        "name": "风险管理师",
+        "mission": "识别涨跌停、炸板、连续异动、流动性、波动率、回撤空间、数据覆盖缺口和事件风险，给出风险等级与失效条件。",
+    },
+    {
+        "key": "trader",
+        "name": "短线交易分析师",
+        "mission": "把前面维度转成1-5个交易日的条件化交易参考，包括触发买点、卖点/止盈、止损、仓位上限和不交易条件。",
+    },
+]
+
+
+_AGENT_SYSTEM_PROMPT = """你是 A 股短线研究系统中的{agent_name}。
+
+你的职责: {mission}
+
+要求:
+- 只基于用户提供的数据和可验证推断，不编造财务、资金或新闻数据。
+- 所有判断必须引用关键数据或说明数据缺失。
+- 输出必须紧凑，面向后续总评审使用。
+- 只输出 JSON，不要 Markdown，不要代码块。
+
+JSON 结构:
+{{
+  "stance": "偏多/中性/偏空/数据不足",
+  "score": 0-100,
+  "confidence": 0-100,
+  "summary": "一句话结论",
+  "evidence": ["证据1", "证据2"],
+  "risks": ["风险1", "风险2"],
+  "watch": ["后续观察点1", "后续观察点2"]
+}}
+"""
+
+
+_CHIEF_REVIEWER_SYSTEM_PROMPT = """你是 A 股短线多 Agent 研究系统的总评审。
+
+你会收到同一只股票的行情、关键价位、财务、资金、新闻/海外上下文，以及 6 位分析师的独立结论。你的任务是做交叉验证，不是简单平均分。
+
+输出要求:
+- 用 Markdown 输出，直接给正文，不要 JSON，不要代码块。
+- 必须把“数据可靠性”和“数据缺失”写清楚。
+- 可以给短线交易参考，但必须是条件化表达，例如“若放量站上某价位，则...；若跌破某价位，则...”，不能写成确定性承诺。
+- 不得承诺收益，不得暗示一定上涨。
+- 总字数控制在 1200-2200 字。
+
+固定结构:
+### 1. 总评结论
+给出综合评级、短线状态、确定性等级和核心矛盾。
+
+### 2. 六位分析师交叉验证
+用表格列出技术、资金、基本面、新闻情绪、风险、短线交易六个维度的结论、证据、风险。
+
+### 3. 关键价位与触发条件
+列出上方压力、下方支撑、触发买点、卖点/止盈参考、止损/失效参考。价位必须来自提供的关键价位或最近 K 线。
+
+### 4. 1-5个交易日短线计划参考
+分“强势确认”“震荡等待”“走弱处理”三种情景写，不输出无条件买卖指令。
+
+### 5. 数据质量与风险提示
+说明资金流、新闻、财务、海外数据是否可用，以及这些缺失如何影响置信度。
+
+末尾附一行:
+> ⚠️ 本内容由 AI 基于本地行情、资金、财务和新闻上下文生成，仅供研究参考，不构成投资建议或买卖指令。交易有风险，入市需谨慎。
+"""
+
+
+def _event_json(payload: dict) -> str:
+    return json.dumps(_json_safe(payload), ensure_ascii=False, allow_nan=False)
+
+
+def _brief_text(text: str, limit: int = 90) -> str:
+    compact = " ".join(str(text or "").replace("\n", " ").split())
+    return compact[:limit] + ("…" if len(compact) > limit else "")
+
+
+def _safe_asset_type(repo, symbol: str) -> str:
+    try:
+        return repo.resolve_asset_type(symbol)
+    except Exception:  # noqa: BLE001
+        return "stock"
+
+
+def _compact_aiagents_context(context: dict | None) -> dict:
+    if not isinstance(context, dict):
+        return {}
+    fund = context.get("fund_flow") or {}
+    news = context.get("news") or {}
+    news_data = news.get("news_data") or {}
+    overseas = context.get("overseas") or {}
+    overseas_market = overseas.get("market") or {}
+    overseas_news = overseas.get("global_news") or {}
+    return _json_safe({
+        "generated_at": context.get("generated_at"),
+        "quote": context.get("quote") or {},
+        "technical": context.get("technical") or {},
+        "basic": context.get("basic") or {},
+        "fund_flow": {
+            "data_success": fund.get("data_success"),
+            "source": fund.get("source"),
+            "days": fund.get("days"),
+            "date_start": fund.get("date_start"),
+            "date_end": fund.get("date_end"),
+            "latest_trade_date": fund.get("latest_trade_date"),
+            "freshness_status": fund.get("freshness_status"),
+            "lag_days": fund.get("lag_days"),
+            "freshness_note": fund.get("freshness_note"),
+            "latest": fund.get("latest"),
+            "main_net_total": fund.get("main_net_total"),
+            "main_net_5d": fund.get("main_net_5d"),
+            "main_net_20d": fund.get("main_net_20d"),
+            "main_net_60d": fund.get("main_net_60d"),
+            "positive_days_20": fund.get("positive_days_20"),
+            "positive_days_60": fund.get("positive_days_60"),
+            "rows": (fund.get("rows") or [])[-12:],
+            "error": fund.get("error"),
+        },
+        "news": {
+            "data_success": news.get("data_success"),
+            "source": news.get("source"),
+            "count": news_data.get("count"),
+            "items": (news_data.get("items") or [])[:12],
+            "error": news.get("error"),
+        },
+        "overseas": {
+            "data_success": overseas.get("data_success"),
+            "impact": overseas.get("impact") or {},
+            "market": {
+                "data_success": overseas_market.get("data_success"),
+                "source": overseas_market.get("source"),
+                "quotes": (overseas_market.get("quotes") or [])[:12],
+                "error": overseas_market.get("error"),
+            },
+            "global_news": {
+                "items": (overseas_news.get("items") or [])[:12],
+                "count": overseas_news.get("count"),
+                "error": overseas_news.get("error"),
+            },
+        },
+    })
+
+
+def _build_multi_agent_payload(
+    *,
+    kline_tail: list[dict],
+    fins: dict[str, list[dict]],
+    levels: dict[str, list[dict]],
+    close: float | None,
+    symbol: str,
+    focus: str,
+    asset_type: str,
+    aiagents_context: dict | None,
+) -> dict:
+    from app.services.ai_provider import sanitize_focus
+
+    return _json_safe({
+        "symbol": symbol,
+        "asset_type": asset_type,
+        "close": close,
+        "level_summary": summarize_levels(levels, close),
+        "levels": levels,
+        "recent_kline": kline_tail[-60:],
+        "financials": fins,
+        "enhanced_context": _compact_aiagents_context(aiagents_context),
+        "user_focus": sanitize_focus(focus),
+    })
+
+
+def _agent_messages(agent: dict, payload: dict) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": _AGENT_SYSTEM_PROMPT.format(
+                agent_name=agent["name"],
+                mission=agent["mission"],
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False, allow_nan=False),
+        },
+    ]
+
+
+def _reviewer_messages(payload: dict, agent_outputs: dict[str, dict]) -> list[dict[str, str]]:
+    review_payload = _json_safe({
+        **payload,
+        "agent_outputs": agent_outputs,
+    })
+    return [
+        {"role": "system", "content": _CHIEF_REVIEWER_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(review_payload, ensure_ascii=False, allow_nan=False)},
+    ]
+
+
 # ================================================================
 # 流式分析入口
 # ================================================================
@@ -320,6 +552,7 @@ async def analyze_stock_stream(
     data_dir: Path,
     symbol: str,
     focus: str = "",
+    mode: str = "multi_agent",
 ) -> AsyncIterator[str]:
     """流式个股分析:yield 出每个 NDJSON 事件。
 
@@ -346,18 +579,31 @@ async def analyze_stock_stream(
     asset_type = repo.resolve_asset_type(symbol)
     fins = {} if asset_type in {"etf", "index"} else _load_financials(data_dir, symbol)
 
+    analysis_mode = (mode or "multi_agent").strip().lower()
+    if analysis_mode not in {"quick", "multi_agent"}:
+        analysis_mode = "multi_agent"
+
     # 4. meta
-    yield json.dumps({
+    yield _event_json({
         "type": "meta",
         "symbol": symbol,
         "summary": summarize_levels(levels, close),
         "levels": levels,
         "close": close,
-    }, ensure_ascii=False)
+        "analysis_mode": analysis_mode,
+        "agents": (
+            [{"key": "data_context", "name": "数据上下文", "status": "pending", "message": ""}]
+            + [
+                {"key": a["key"], "name": a["name"], "status": "pending", "message": ""}
+                for a in _AGENT_SPECS
+            ]
+            + [{"key": "chief_reviewer", "name": "总评审", "status": "pending", "message": ""}]
+        ) if analysis_mode == "multi_agent" else [],
+    })
 
     # 5+6. 构建提示词 + 流式调用 LLM(整体 try-except,任何异常都 yield error,避免前端卡死)
     try:
-        from app.services.ai_provider import stream_ai_text
+        from app.services.ai_provider import generate_ai_text, stream_ai_text
 
         # 虚拟持仓上下文 (V3): 逐账户 (V2 多账户) 收集持有该标的的持仓注入
         # (任何异常静默跳过, 不影响分析)。
@@ -374,32 +620,165 @@ async def analyze_stock_stream(
         raw_close = float(df.tail(1)["raw_close"][0]) if "raw_close" in df.columns else None
 
         kline_tail = _clean_rows(df, _KLINE_KEEP_COLS)
-        user_prompt = _build_user_prompt(kline_tail, fins, levels, close, symbol, focus,
-                                         asset_type=asset_type, paper_positions=paper_positions,
-                                         raw_close=raw_close)
+        asset_type = _safe_asset_type(repo, symbol)
+
+        if analysis_mode == "quick":
+            user_prompt = _build_user_prompt(kline_tail, fins, levels, close, symbol, focus,
+                                             asset_type=asset_type, paper_positions=paper_positions,
+                                             raw_close=raw_close)
+            got_content = False
+            async for delta in stream_ai_text(
+                [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.5,
+                # 不限制输出: 推理模型(deepseek reasoner 系)思考 token 计入 max_tokens
+                # 预算, 固定上限会把正文挤光(实测 4500 全被推理吃掉 → 正文 0 字)。
+                max_tokens=None,
+            ):
+                got_content = True
+                yield _event_json({"type": "delta", "content": delta})
+
+            if not got_content:
+                logger.warning("AI stock quick analysis ended with empty content for %s", symbol)
+                yield _event_json({"type": "error", "message": "AI 未返回正文(输出被截断), 请重试"})
+                return
+            yield _event_json({"type": "done"})
+            return
+
+        aiagents_context: dict | None = None
+        yield _event_json({
+            "type": "agent",
+            "agent_key": "data_context",
+            "agent_name": "数据上下文",
+            "status": "running",
+            "message": "正在读取资金、新闻、海外和旧 6Agent 上下文",
+        })
+        try:
+            from app.services.aiagents_bridge import market_context
+
+            aiagents_context = market_context(
+                symbol,
+                include_fund_flow=True,
+                include_news=True,
+                include_overseas=True,
+                fund_flow_days=60,
+            )
+            compact = _compact_aiagents_context(aiagents_context)
+            fund = compact.get("fund_flow") or {}
+            fund_status = "可用" if fund.get("data_success") else "降级"
+            if fund.get("freshness_status") == "lagging_1d":
+                fund_status += "(滞后1日)"
+            elif fund.get("freshness_status") == "stale":
+                fund_status += f"(滞后{fund.get('lag_days') or '?'}日)"
+            data_bits = [
+                f"资金{fund_status}",
+                f"新闻{(compact.get('news') or {}).get('count') or 0}条",
+                f"海外{'可用' if (compact.get('overseas') or {}).get('data_success') else '降级'}",
+            ]
+            yield _event_json({
+                "type": "agent",
+                "agent_key": "data_context",
+                "agent_name": "数据上下文",
+                "status": "done",
+                "message": " / ".join(data_bits),
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("AI agents context failed for %s: %s", symbol, exc)
+            yield _event_json({
+                "type": "agent",
+                "agent_key": "data_context",
+                "agent_name": "数据上下文",
+                "status": "error",
+                "message": f"增强上下文读取失败: {exc}",
+            })
+
+        payload = _build_multi_agent_payload(
+            kline_tail=kline_tail,
+            fins=fins,
+            levels=levels,
+            close=close,
+            symbol=symbol,
+            focus=focus,
+            asset_type=asset_type,
+            aiagents_context=aiagents_context,
+        )
+        payload["paper_positions"] = paper_positions
+        payload["raw_close"] = raw_close
+        agent_outputs: dict[str, dict] = {}
+        for agent in _AGENT_SPECS:
+            yield _event_json({
+                "type": "agent",
+                "agent_key": agent["key"],
+                "agent_name": agent["name"],
+                "status": "running",
+                "message": "分析中",
+            })
+            try:
+                text = await generate_ai_text(
+                    _agent_messages(agent, payload),
+                    temperature=0.25,
+                    max_tokens=None,
+                    timeout=160,
+                )
+                agent_outputs[agent["key"]] = {
+                    "name": agent["name"],
+                    "raw": text,
+                }
+                yield _event_json({
+                    "type": "agent",
+                    "agent_key": agent["key"],
+                    "agent_name": agent["name"],
+                    "status": "done",
+                    "message": _brief_text(text),
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("AI stock agent %s failed for %s: %s", agent["key"], symbol, exc)
+                agent_outputs[agent["key"]] = {
+                    "name": agent["name"],
+                    "error": str(exc),
+                }
+                yield _event_json({
+                    "type": "agent",
+                    "agent_key": agent["key"],
+                    "agent_name": agent["name"],
+                    "status": "error",
+                    "message": str(exc),
+                })
+
+        yield _event_json({
+            "type": "agent",
+            "agent_key": "chief_reviewer",
+            "agent_name": "总评审",
+            "status": "running",
+            "message": "正在综合六位分析师结论",
+        })
         got_content = False
         async for delta in stream_ai_text(
-            [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
+            _reviewer_messages(payload, agent_outputs),
             temperature=0.5,
-            # 不限制输出: 推理模型(deepseek reasoner 系)思考 token 计入 max_tokens
-            # 预算, 固定上限会把正文挤光(实测 4500 全被推理吃掉 → 正文 0 字)。
             max_tokens=None,
             prefer_final_answer=True,
         ):
             got_content = True
-            yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)
+            yield _event_json({"type": "delta", "content": delta})
 
     except Exception as e:
         logger.exception("AI stock analysis failed for %s: %s", symbol, e)
-        yield json.dumps({"type": "error", "message": f"AI 分析失败: {e}"}, ensure_ascii=False)
+        yield _event_json({"type": "error", "message": f"AI 分析失败: {e}"})
         return
 
     if not got_content:
         # 流正常结束但一个正文块都没有(典型: 输出上限被思考吃光后静默截断)
         logger.warning("AI stock analysis ended with empty content for %s", symbol)
-        yield json.dumps({"type": "error", "message": "AI 未返回正文(输出被截断), 请重试"}, ensure_ascii=False)
+        yield _event_json({"type": "error", "message": "AI 未返回正文(输出被截断), 请重试"})
         return
-    yield json.dumps({"type": "done"}, ensure_ascii=False)
+    yield _event_json({
+        "type": "agent",
+        "agent_key": "chief_reviewer",
+        "agent_name": "总评审",
+        "status": "done",
+        "message": "综合报告已生成",
+    })
+    yield _event_json({"type": "done"})

@@ -1212,6 +1212,7 @@ export function EChartsCandlestick({
       {/* 主图信息栏 — 内容由 JS 直接操作 innerHTML */}
       {showInfoBar && (
         <div ref={infoBarRef} style={{ backgroundColor: CT().infoBarBg }}
+          className="[&>div]:!flex-nowrap [&>div]:overflow-x-auto [&>div]:whitespace-nowrap [&>div]:[scrollbar-width:none] [&>div>span]:shrink-0"
           dangerouslySetInnerHTML={{ __html: initialHTML }} />
       )}
 

@@ -1,10 +1,38 @@
-import { useState, useEffect, useId, useRef } from 'react'
+import { useState, useEffect, useId, useMemo, useRef } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2, Trash2, Download, Calendar, SlidersHorizontal, Activity } from 'lucide-react'
+import { Loader2, Trash2, Download, Calendar, SlidersHorizontal, Activity, RefreshCw } from 'lucide-react'
 import { api } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { MissingCapChip } from '@/lib/capability-labels'
 import { MinuteGapPanel } from '@/components/data/MinuteGapPanel'
+
+type MinuteSyncScope = 'combined' | 'watchlist' | 'realtime_watchlist' | 'holdings' | 'stockformer_top' | 'manual' | 'all'
+
+const SCOPE_OPTIONS: { value: MinuteSyncScope; label: string; hint: string }[] = [
+  { value: 'combined', label: '持仓+自选+推荐', hint: '默认：覆盖短线盯盘重点池' },
+  { value: 'watchlist', label: '自选股', hint: '只同步自选列表' },
+  { value: 'holdings', label: '持仓股', hint: '只同步模拟/持仓股票' },
+  { value: 'stockformer_top', label: '推荐TopN', hint: '按 StockFormer 多因子推荐池' },
+  { value: 'manual', label: '手动输入', hint: '只同步输入的股票代码' },
+  { value: 'realtime_watchlist', label: '实时盯盘列表', hint: '当前实时行情列表' },
+  { value: 'all', label: '全市场A股', hint: '极慢，仅少量天数调试' },
+]
+
+function normalizeSymbols(raw: string): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  raw.replace(/，/g, ',').split(/[\s,;；]+/).forEach(item => {
+    let symbol = item.trim().toUpperCase()
+    if (!symbol) return
+    if (symbol.includes('.')) symbol = symbol.split('.')[0]
+    if (/^\d+$/.test(symbol)) symbol = symbol.padStart(6, '0')
+    if (!seen.has(symbol)) {
+      seen.add(symbol)
+      out.push(symbol)
+    }
+  })
+  return out
+}
 
 // hasCap: 分钟K能力当前是否可用 (路由矩阵判定, 生效源含插件/自定义源)
 export function MinuteSyncConfig({ hasCap, onJobStart, onClose }: { hasCap: boolean; onJobStart?: (jobId: string) => void; onClose?: () => void }) {
@@ -17,9 +45,20 @@ export function MinuteSyncConfig({ hasCap, onJobStart, onClose }: { hasCap: bool
     queryKey: QK.preferences,
     queryFn: api.preferences,
   })
+  const refreshStatus = useQuery({
+    queryKey: ['minute-refresh-status'],
+    queryFn: api.minuteRefreshStatus,
+    refetchInterval: 5000,
+  })
   const update = useMutation({
-    mutationFn: ({ enabled, days, segmentDays }: { enabled: boolean; days: number; segmentDays?: number }) =>
-      api.updateMinuteSync(enabled, days, segmentDays),
+    mutationFn: ({ enabled, days, segmentDays, scope, topN, symbols }: {
+      enabled: boolean
+      days: number
+      segmentDays?: number
+      scope?: MinuteSyncScope
+      topN?: number
+      symbols?: string[]
+    }) => api.updateMinuteSync(enabled, days, { segmentDays, scope, topN, symbols }),
     onSuccess: () => qc.invalidateQueries({ queryKey: QK.preferences }),
   })
 
@@ -27,31 +66,71 @@ export function MinuteSyncConfig({ hasCap, onJobStart, onClose }: { hasCap: bool
   const enabled = prefs.data?.minute_sync_enabled ?? false
   const days = prefs.data?.minute_sync_days ?? 5
   const segmentDays = prefs.data?.minute_sync_segment_days ?? 20
+  const scope = (prefs.data?.minute_sync_scope ?? 'combined') as MinuteSyncScope
+  const topN = prefs.data?.minute_sync_top_n ?? 100
+  const manualSymbols = prefs.data?.minute_sync_symbols ?? []
   const [localDays, setLocalDays] = useState(days)
   const [localSegment, setLocalSegment] = useState(segmentDays)
+  const [localScope, setLocalScope] = useState<MinuteSyncScope>(scope)
+  const [localTopN, setLocalTopN] = useState(topN)
+  const [manualText, setManualText] = useState(manualSymbols.join('\n'))
+  const parsedSymbols = useMemo(() => normalizeSymbols(manualText), [manualText])
 
   useEffect(() => { setLocalDays(days) }, [days])
   useEffect(() => { setLocalSegment(segmentDays) }, [segmentDays])
+  useEffect(() => { setLocalScope(scope) }, [scope])
+  useEffect(() => { setLocalTopN(topN) }, [topN])
+  useEffect(() => { setManualText(manualSymbols.join('\n')) }, [manualSymbols.join('|')])
 
-  useEffect(() => { setLocalDays(days) }, [days])
-  useEffect(() => { setLocalSegment(segmentDays) }, [segmentDays])
+  const savePrefs = (overrides: {
+    enabled?: boolean
+    days?: number
+    segmentDays?: number
+    scope?: MinuteSyncScope
+    topN?: number
+    symbols?: string[]
+  } = {}) => {
+    update.mutate({
+      enabled: overrides.enabled ?? enabled,
+      days: overrides.days ?? localDays,
+      segmentDays: overrides.segmentDays,
+      scope: overrides.scope ?? localScope,
+      topN: overrides.topN ?? localTopN,
+      symbols: overrides.symbols ?? parsedSymbols,
+    })
+  }
 
   const handleToggle = () => {
     if (!hasMinuteCap) return
-    update.mutate({ enabled: !enabled, days: localDays })
+    savePrefs({ enabled: !enabled })
   }
 
   const setDays = (v: number) => {
     const clamped = Math.max(1, Math.min(30, v))
     setLocalDays(clamped)
-    update.mutate({ enabled, days: clamped })
+    savePrefs({ days: clamped })
   }
 
   // 段大小: 交易日/段, 步进 ±5, 范围 [5, 30]。越小越省内存但越慢。
   const setSegment = (v: number) => {
     const clamped = Math.max(5, Math.min(30, v))
     setLocalSegment(clamped)
-    update.mutate({ enabled, days: localDays, segmentDays: clamped })
+    savePrefs({ segmentDays: clamped })
+  }
+
+  const setScope = (v: MinuteSyncScope) => {
+    setLocalScope(v)
+    savePrefs({ scope: v })
+  }
+
+  const setTopN = (v: number) => {
+    const clamped = Math.max(1, Math.min(1000, v))
+    setLocalTopN(clamped)
+    savePrefs({ topN: clamped })
+  }
+
+  const saveManual = () => {
+    savePrefs({ symbols: parsedSymbols })
   }
 
   // 清空分钟K数据 (二次确认)
@@ -64,14 +143,29 @@ export function MinuteSyncConfig({ hasCap, onJobStart, onClose }: { hasCap: bool
     },
   })
 
-  // 手动获取 (两个独立按钮, 各自指定天数, 不影响自动同步偏好)
-  const [fetchingMode, setFetchingMode] = useState<'' | '40d' | '1y'>('')
-  const handleFetch = (mode: '40d' | '1y') => {
+  const intradayMutation = useMutation({
+    mutationFn: () => api.minuteRefreshRun(),
+    onSuccess: () => {
+      refreshStatus.refetch()
+      qc.invalidateQueries({ queryKey: QK.dataStatus })
+    },
+  })
+
+  // 历史分钟补齐 (补最新尾巴 / 向前补历史互相独立, 不影响盘中增量刷新)
+  const [fetchingMode, setFetchingMode] = useState<'' | 'latest' | 'backfill' | '1y' | '2y'>('')
+  const handleFetch = (mode: 'latest' | 'backfill' | '1y' | '2y') => {
     if (!hasMinuteCap) return
-    // 单次获取 = 按「分段大小」拉一段 (向前扩展); 1年 = 拉365天按分段切多段
-    const fetchDays = mode === '40d' ? localSegment : 365
+    const fetchDays = mode === '2y' ? 730 : mode === '1y' ? 365 : mode === 'backfill' ? localSegment : localDays
+    const extend = mode !== 'latest'
     setFetchingMode(mode)
-    api.syncMinute(fetchDays, true).then((res) => {
+    api.syncMinute({
+      days: fetchDays,
+      extend,
+      mode: extend ? 'history_backfill' : 'history_increment',
+      scope: localScope,
+      topN: localTopN,
+      symbols: parsedSymbols,
+    }).then((res) => {
       qc.invalidateQueries({ queryKey: QK.pipelineJobs })
       qc.invalidateQueries({ queryKey: QK.dataStatus })
       // 通知主页面跟踪 job 进度 (ActiveJobCard 会显示实时进度+日志)
@@ -200,25 +294,110 @@ export function MinuteSyncConfig({ hasCap, onJobStart, onClose }: { hasCap: bool
       <div className="text-[11px] text-muted leading-relaxed">
         每段拉完即写盘，避免内存堆积。分段越小越省内存，获取耗时越长；默认 20 个交易日。设置自动保存。
       </div>
+
+      <div className="pt-2 border-t border-border space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <div className="text-xs text-foreground font-medium">同步范围</div>
+            <div className="text-[10px] text-muted">
+              {SCOPE_OPTIONS.find(item => item.value === localScope)?.hint}
+            </div>
+          </div>
+          <select
+            value={localScope}
+            onChange={event => setScope(event.target.value as MinuteSyncScope)}
+            disabled={!hasMinuteCap}
+            className="h-7 w-36 rounded-input border border-border bg-base px-2 text-[11px] text-foreground outline-none focus:border-accent disabled:opacity-40"
+          >
+            {SCOPE_OPTIONS.map(item => (
+              <option key={item.value} value={item.value}>{item.label}</option>
+            ))}
+          </select>
+        </div>
+
+        {(localScope === 'combined' || localScope === 'stockformer_top') && (
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] text-secondary">推荐池 TopN</span>
+            <div className="flex items-center">
+              <button
+                onClick={() => setTopN(localTopN - 50)}
+                disabled={!hasMinuteCap || localTopN <= 1}
+                className="h-6 w-6 flex items-center justify-center rounded-l-btn bg-elevated border border-border text-secondary hover:bg-border/50 disabled:opacity-30 transition-colors text-xs"
+              >−</button>
+              <div className="h-6 w-12 flex items-center justify-center border-y border-border text-[11px] font-mono tabular-nums bg-base text-foreground">
+                {localTopN}
+              </div>
+              <button
+                onClick={() => setTopN(localTopN + 50)}
+                disabled={!hasMinuteCap || localTopN >= 1000}
+                className="h-6 w-6 flex items-center justify-center rounded-r-btn bg-elevated border border-border text-secondary hover:bg-border/50 disabled:opacity-30 transition-colors text-xs"
+              >+</button>
+            </div>
+          </div>
+        )}
+
+        {(localScope === 'manual' || localScope === 'combined') && (
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-secondary">手动代码</span>
+              <button
+                onClick={saveManual}
+                disabled={!hasMinuteCap || update.isPending}
+                className="px-2 py-0.5 rounded-btn bg-elevated text-[10px] text-secondary hover:text-foreground hover:bg-border/50 disabled:opacity-40 transition-colors"
+              >
+                保存
+              </button>
+            </div>
+            <textarea
+              value={manualText}
+              onChange={event => setManualText(event.target.value)}
+              disabled={!hasMinuteCap}
+              placeholder="000001, 600519"
+              rows={2}
+              className="w-full resize-none rounded-input border border-border bg-base px-2 py-1.5 text-[11px] text-foreground outline-none focus:border-accent disabled:opacity-40"
+            />
+            <div className="text-[10px] text-muted">
+              已识别 {parsedSymbols.length} 只；可用逗号、空格或换行分隔
+            </div>
+          </div>
+        )}
+
+        {localScope === 'all' && (
+          <div className="rounded-md border border-warning/25 bg-warning/8 px-2 py-1.5 text-[10px] text-warning/90 leading-relaxed">
+            全市场分钟K数据量极大，建议只拉 1-3 天做排障；短线实盘优先使用重点股票池。
+          </div>
+        )}
+      </div>
       </div>
 
       {/* 区块 B: 手动获取 (一次性操作, 独立于上方自动同步开关) */}
       <div className="space-y-3">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <Download className="h-3 w-3 text-secondary" />
-          <span className="text-[11px] text-secondary font-medium">手动获取</span>
-          <span className="text-[10px] text-muted">不受自动同步开关影响</span>
+          <span className="text-[11px] text-secondary font-medium">历史分钟补齐</span>
+          <span className="text-[10px] text-muted">补本地历史库</span>
         </div>
         <div className="grid grid-cols-2 gap-2">
         <button
-          onClick={() => handleFetch('40d')}
+          onClick={() => handleFetch('latest')}
           disabled={!hasMinuteCap || fetchingMode !== ''}
           className="inline-flex min-h-20 flex-col items-center justify-center gap-1 px-2 py-3 rounded-btn bg-accent/90 text-white text-xs font-medium hover:bg-accent disabled:opacity-40 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
         >
-          {fetchingMode === '40d' ? (
-            <><Loader2 className="h-3.5 w-3.5 animate-spin" /><span>获取中…</span></>
+          {fetchingMode === 'latest' ? (
+            <><Loader2 className="h-3.5 w-3.5 animate-spin" /><span>补齐中…</span></>
           ) : (
-            <><Download className="h-3.5 w-3.5" /><span>单次获取 {localSegment} 天</span></>
+            <><Download className="h-3.5 w-3.5" /><span>增量补最新</span><span className="text-[9px] opacity-70">{localDays}天窗口</span></>
+          )}
+        </button>
+        <button
+          onClick={() => handleFetch('backfill')}
+          disabled={!hasMinuteCap || fetchingMode !== ''}
+          className="inline-flex flex-col items-center justify-center gap-0.5 px-2 py-2 rounded-btn bg-elevated text-secondary text-xs font-medium hover:bg-border/50 disabled:opacity-40 transition-colors duration-150"
+        >
+          {fetchingMode === 'backfill' ? (
+            <><Loader2 className="h-3.5 w-3.5 animate-spin" /><span>回补中…</span></>
+          ) : (
+            <><Download className="h-3.5 w-3.5" /><span>向前补 {localSegment} 天</span></>
           )}
         </button>
         <button
@@ -232,11 +411,63 @@ export function MinuteSyncConfig({ hasCap, onJobStart, onClose }: { hasCap: bool
             <><Calendar className="h-3.5 w-3.5" /><span>获取最近 1 年</span><span className="text-[9px] opacity-70">分段拉取</span></>
           )}
         </button>
+        <button
+          onClick={() => handleFetch('2y')}
+          disabled={!hasMinuteCap || fetchingMode !== ''}
+          className="inline-flex flex-col items-center justify-center gap-0.5 px-2 py-2 rounded-btn border border-danger/35 bg-danger/10 text-danger/90 text-xs font-medium hover:bg-danger/15 disabled:opacity-40 transition-colors duration-150"
+        >
+          {fetchingMode === '2y' ? (
+            <><Loader2 className="h-3.5 w-3.5 animate-spin" /><span>分段获取中…</span></>
+          ) : (
+            <><Calendar className="h-3.5 w-3.5" /><span>获取最近 2 年</span><span className="text-[9px] opacity-70">长任务</span></>
+          )}
+        </button>
         </div>
-        <div className="text-[11px] text-muted leading-relaxed">
-          A股标的 · 前复权价格 · 从本地最早数据向前叠加 ·{' '}
-          均按上方「分段大小」分段拉取、每段即落盘
+        <div className="text-[10px] text-muted leading-relaxed">
+          A股标的 · 前复权价格 · 增量补最新按单股最后分钟线补尾巴；向前补历史从本地最早数据继续回补。
         </div>
+      </div>
+
+      {/* 区块 C: 盘中增量刷新 */}
+      <div className="pt-3 border-t border-border space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5">
+            <RefreshCw className="h-3 w-3 text-secondary" />
+            <span className="text-[11px] text-secondary font-medium">盘中增量刷新</span>
+            <span className={`text-[10px] px-1.5 py-px rounded ${
+              refreshStatus.data?.gate_reason ? 'bg-warning/10 text-warning' : 'bg-accent/10 text-accent'
+            }`}>
+              {refreshStatus.data?.running ? '服务运行中' : '服务未运行'}
+            </span>
+          </div>
+          <button
+            onClick={() => intradayMutation.mutate()}
+            disabled={!hasMinuteCap || intradayMutation.isPending}
+            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-btn bg-elevated text-[10px] text-secondary hover:text-foreground hover:bg-border/50 disabled:opacity-40 transition-colors"
+          >
+            {intradayMutation.isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+            立即跑一轮
+          </button>
+        </div>
+        <div className="grid grid-cols-3 gap-2 text-[10px]">
+          <div className="rounded-md border border-border bg-base px-2 py-1.5">
+            <div className="text-muted">间隔</div>
+            <div className="text-foreground font-mono">{refreshStatus.data?.interval_seconds ?? '-'}s</div>
+          </div>
+          <div className="rounded-md border border-border bg-base px-2 py-1.5">
+            <div className="text-muted">上轮写入</div>
+            <div className="text-foreground font-mono">{refreshStatus.data?.last_rows ?? 0}</div>
+          </div>
+          <div className="rounded-md border border-border bg-base px-2 py-1.5">
+            <div className="text-muted">覆盖标的</div>
+            <div className="text-foreground font-mono">{refreshStatus.data?.last_symbols ?? 0}</div>
+          </div>
+        </div>
+        {(refreshStatus.data?.gate_reason || intradayMutation.data?.reason) && (
+          <div className="rounded-md border border-warning/25 bg-warning/8 px-2 py-1.5 text-[10px] text-warning/90 leading-relaxed">
+            {intradayMutation.data?.reason || refreshStatus.data?.gate_reason}
+          </div>
+        )}
       </div>
       </div>
       <div

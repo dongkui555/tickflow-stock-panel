@@ -26,9 +26,10 @@ _GEM_PREFIXES = ("300", "301", "302")
 
 
 def board_limit_pct(symbol: str) -> float:
-    if symbol.endswith(".BJ"):
+    code = str(symbol or "").split(".", 1)[0]
+    if symbol.endswith(".BJ") or code.startswith(("8", "4", "920")):
         return BEIJING_BOARD_LIMIT
-    if symbol.startswith((*_GEM_PREFIXES, "688", "689")):
+    if code.startswith((*_GEM_PREFIXES, "688", "689")):
         return GROWTH_BOARD_LIMIT
     return MAIN_BOARD_LIMIT
 
@@ -143,13 +144,14 @@ def polars_price_limit_pct(
     is_risk_warning: pl.Expr,
 ) -> pl.Expr:
     """Return a vectorized Polars expression for the effective daily limit."""
+    code = symbol.str.split(".").list.first()
     is_growth = (
-        symbol.str.starts_with("300")
-        | symbol.str.starts_with("301")
-        | symbol.str.starts_with("302")
+        code.str.starts_with("300")
+        | code.str.starts_with("301")
+        | code.str.starts_with("302")
     )
-    is_star = symbol.str.starts_with("688") | symbol.str.starts_with("689")
-    is_beijing = symbol.str.ends_with(".BJ")
+    is_star = code.str.starts_with("688") | code.str.starts_with("689")
+    is_beijing = symbol.str.ends_with(".BJ") | code.str.contains(r"^(?:8|4|920)")
     gem_pre_registration = (
         is_growth & ~is_beijing & (trade_date < pl.lit(GEM_20PCT_LIMIT_START_DATE))
     )

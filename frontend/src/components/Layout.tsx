@@ -35,6 +35,7 @@ import {
   Tags,
   BarChart3,
   Sparkles,
+  BrainCircuit,
   CheckCircle2,
   ChevronRight,
   ChevronDown,
@@ -46,6 +47,7 @@ import {
   PanelLeft,
   PanelLeftClose,
   PanelLeftOpen,
+  Target,
   Download,
   HardDriveDownload,
 } from 'lucide-react'
@@ -96,6 +98,10 @@ const nav = [
   { to: '/regime',           label: '市场环境', icon: IconRegime },
   { to: '/indices',          label: '指数',     icon: IconIndices },
   { to: '/data',             label: '数据',     icon: IconData },
+  { to: '/short-term-ai', label: '短线AI荐股', icon: Target },
+  { to: '/stockformer', label: 'StockFormer', icon: BrainCircuit },
+  { to: '/aiagents', label: 'AI增强', icon: Sparkles },
+  { to: '/fund-monitor', label: '资金监控', icon: DatabaseZap },
 ] as const
 
 /** 亮/暗主题切换 — 状态存 localStorage, 生效见 lib/theme.ts */
@@ -1061,7 +1067,7 @@ export function Layout() {
               <div className="mt-1.5 text-[10px] leading-snug space-y-0.5">
                 {isWatchlistMode && !dismissFreeHint && !realtimeProviderName && (
                   <div className="flex items-start gap-1 text-amber-400/80">
-                    <span className="flex-1">自选实时模式监控前 5 只，全市场实时依赖数据源支持</span>
+                    <span className="flex-1">按标的实时模式会刷新自选、持仓、监控规则和核心指数；全市场实时依赖数据源支持</span>
                     <button
                       onClick={() => setDismissFreeHint(true)}
                       className="text-amber-400/50 hover:text-amber-400 shrink-0 transition-colors"

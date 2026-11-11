@@ -19,7 +19,7 @@ DAY = date(2026, 11, 4)
 @pytest.fixture
 def market(tmp_path, monkeypatch):
     repo = KlineRepository(DataStore(tmp_path))
-    repo.save_etf_instruments(pl.DataFrame({"symbol": [ETF], "name": ["test ETF"]}))
+    repo.save_etf_instruments(pl.DataFrame({"symbol": [ETF], "code": ["159558"], "name": ["test ETF"]}))
     monkeypatch.setattr(repo, "get_enriched_latest", lambda **kw: (pl.DataFrame(), None))
     monkeypatch.setattr(repo, "get_enriched_latest_asset", lambda *a, **kw: (pl.DataFrame(), None))
     monkeypatch.setattr(watchlist.watchlist, "list_symbols", lambda: [{"symbol": ETF}])
@@ -101,6 +101,9 @@ def test_prepared_snapshot_expires_on_daily_repair_and_does_not_pollute_market_s
 
 def test_current_stock_partition_survives_etf_preparation(market):
     root = market.repo.store.data_dir
+    pl.DataFrame({"symbol": ["600519.SH"], "code": ["600519"]}).write_parquet(
+        root / "instruments/instruments.parquet",
+    )
     stock = pl.DataFrame({
         "symbol": ["600519.SH"], "date": [DAY], "open": [10.0], "high": [10.0],
         "low": [10.0], "close": [10.0], "volume": [100.0], "amount": [1000.0],

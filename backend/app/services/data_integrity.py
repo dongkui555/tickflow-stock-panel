@@ -32,6 +32,7 @@ from pathlib import Path
 import polars as pl
 
 from app.market_time import CN_TZ, cn_today
+from app.services.market_status import market_day_status
 
 logger = logging.getLogger(__name__)
 
@@ -175,24 +176,27 @@ def _partition_problem(
         if not path.resolve().is_relative_to(root.resolve()):
             return "corrupt", "文件链接指向数据目录以外, 请手动检查目录", (), ()
         try:
-            parquet = pq.ParquetFile(path)
-            rows += parquet.metadata.num_rows
-            if not deep:
-                continue
-            if not set(DAILY_REQUIRED).issubset(parquet.schema.names):
-                bad.append(path.name)
-                reasons.append("日K字段不完整")
-                unknown_symbols = True
-                continue
-            columns = [*DAILY_REQUIRED, *(["amount"] if "amount" in parquet.schema.names else [])]
-            for batch in parquet.iter_batches(batch_size=65536, columns=columns):
-                invalid = invalid_daily_rows(pl.from_arrow(batch), day)
-                if not invalid.is_empty():
+            # Own the handle even when opening corrupt parquet fails. On Windows
+            # the repair must be able to replace the file after this scan.
+            with path.open("rb") as source:
+                parquet = pq.ParquetFile(source)
+                rows += parquet.metadata.num_rows
+                if not deep:
+                    continue
+                if not set(DAILY_REQUIRED).issubset(parquet.schema.names):
                     bad.append(path.name)
-                    reasons.append(_invalid_daily_reason(invalid, day))
-                    values = invalid["symbol"].unique().to_list()
-                    unknown_symbols |= any(s is None or not s.strip() for s in values)
-                    symbols.update(s for s in values if s and s.strip())
+                    reasons.append("日K字段不完整")
+                    unknown_symbols = True
+                    continue
+                columns = [*DAILY_REQUIRED, *(["amount"] if "amount" in parquet.schema.names else [])]
+                for batch in parquet.iter_batches(batch_size=65536, columns=columns):
+                    invalid = invalid_daily_rows(pl.from_arrow(batch), day)
+                    if not invalid.is_empty():
+                        bad.append(path.name)
+                        reasons.append(_invalid_daily_reason(invalid, day))
+                        values = invalid["symbol"].unique().to_list()
+                        unknown_symbols |= any(s is None or not s.strip() for s in values)
+                        symbols.update(s for s in values if s and s.strip())
         except Exception as exc:  # noqa: BLE001 — 单文件失败记录为检查问题, 继续检查其他文件
             logger.warning("日K文件检查失败 %s: %s", path, exc)
             bad.append(path.name)
@@ -221,7 +225,8 @@ def _quote_ts_max_ms(part_dir: Path) -> int | None:
         return None
     for path in files:
         try:
-            meta = pq.read_metadata(path)
+            with path.open("rb") as source:
+                meta = pq.read_metadata(source)
             names = [meta.schema.column(i).name for i in range(meta.num_columns)]
             if "quote_ts" not in names:
                 continue
@@ -589,6 +594,45 @@ def prune_enriched_partitions(
     return removed
 
 
+def prune_table_partition_dates(
+    data_dir: Path,
+    table: str,
+    days: Iterable[date],
+) -> int:
+    """删除指定表的日期分区，用于权威历史数据覆盖旧实时快照。
+
+    只允许日 K 族表和 enriched 日线表，且删除目标必须落在 data_dir 内。
+    """
+    allowed = {*_DAILY_TABLES, "kline_daily_enriched", "kline_etf_enriched", "kline_index_enriched"}
+    if table not in allowed:
+        raise ValueError(f"不允许删除数据表分区: {table}")
+
+    import shutil
+
+    root = Path(data_dir).resolve()
+    base = (root / table).resolve()
+    try:
+        base.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"删除目标不在数据目录内: {base}") from exc
+
+    removed = 0
+    seen: set[date] = set()
+    for day in days:
+        if not isinstance(day, date) or day in seen:
+            continue
+        seen.add(day)
+        part = base / f"date={day.isoformat()}"
+        try:
+            part.resolve().relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"删除目标不在数据目录内: {part}") from exc
+        if part.exists():
+            shutil.rmtree(part, ignore_errors=True)
+            removed += 1
+    return removed
+
+
 def describe_issues(issues: list[IntegrityIssue]) -> str:
     """面向用户的一句话描述 (409 详情 / 日志用)。"""
     if not issues:
@@ -745,8 +789,35 @@ def boot_integrity_check(app_state) -> None:
     if not issues:
         logger.info("boot integrity check: 近 %d 个交易日数据完整", SCAN_WINDOW_DAYS)
         return
-    earliest = earliest_issue_day(issues)
     logger.warning("boot integrity check: %s (共 %d 个坏分区)", describe_issues(issues), len(issues))
+
+    # A weekday is not proof that the exchanges were open.  The local
+    # calendar can lag the current date (especially around long holidays), so
+    # do not turn an unknown tail date into a full repair on every restart.
+    # Snapshot partitions remain repairable because they are direct evidence
+    # of a bad write; missing partitions require an explicit open-session
+    # record first.
+    repairable: list[IntegrityIssue] = []
+    for issue in issues:
+        if issue.kind == "snapshot":
+            repairable.append(issue)
+            continue
+        status = market_day_status(repo.store.data_dir, issue.day)
+        if status.get("status") == "open":
+            repairable.append(issue)
+        else:
+            logger.info(
+                "integrity: %s %s 未确认开市(%s), 启动时不自动修复",
+                issue.table,
+                issue.day,
+                status.get("reason", "unknown"),
+            )
+
+    if not repairable:
+        logger.warning("integrity: 仅发现未确认开市的尾部缺口, 不自动占用数据执行槽")
+        return
+
+    earliest = earliest_issue_day(repairable)
     if not within_auto_repair_window(earliest):
         logger.warning(
             "integrity: 最早坏日 %s 超出自动修复窗口(%d 天), 请在数据页手动执行数据修正",

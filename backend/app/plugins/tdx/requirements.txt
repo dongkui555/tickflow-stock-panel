@@ -1,0 +1,2 @@
+# requests 与 polars 已随 TickFlow 后端安装；保留该文件以支持插件安装流程。
+requests>=2.31.0

@@ -350,6 +350,12 @@ TickFlow 全市场快照未覆盖的自选/详情标的按码补拉（包括未�
 这是 services 层路由的关键: 用户在设置页选了插件, 但某数据集未声明时, 该数据集
 自动回退 TickFlow。
 
+插件注册时，`plugin.yaml` 的声明是能力上限；加载器将它与
+`provider.config.datasets` 的运行时可用子集取交集，设置页能力矩阵和服务路由
+使用同一子集。插件可以根据自身可用性探测收窄能力，但不能越过清单新增能力。
+例如 QMT 历史分钟可读而实时路由未就绪时，仅声明 `minute`，不同时声明
+`realtime`、`depth5`；探测失败时不沿用上一轮成功能力。
+
 ```python
 class MyConfig:
     datasets = {"daily": ..., "realtime": ...}  # key 是数据集名, value 任意

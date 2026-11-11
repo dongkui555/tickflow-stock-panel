@@ -5,7 +5,6 @@ null); 历史交易日的 quote_ts 时刻 < 15:00 即盘中快照 → 坏。
 """
 from __future__ import annotations
 
-import time
 from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
 
@@ -600,14 +599,15 @@ def _write_full_partition(root, table: str, day: date, quote_ts: int | None) -> 
 
 def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
     """用户 bug 场景复刻: 昨天盘中快照 + 今天实时分区 → 管道应放弃"只刷今天",
-    降级为从坏日起的范围拉取, 并把坏 enriched 分区删后重算。"""
+    降级为从坏日起的范围拉取, 并在修正日K后更新最近 enriched 分区。"""
     from app.config import settings as app_settings
     from app.jobs import daily_pipeline
     from app.services import instrument_sync, kline_sync
     from app.tickflow.repository import DataStore, KlineRepository
 
-    today = datetime.now(CN_TZ).date()
+    today = TODAY
     yesterday = _recent_trading_day_before(today)
+    monkeypatch.setattr(daily_pipeline, "cn_today", lambda: today)
 
     _write_full_partition(tmp_path, "kline_daily", yesterday, _ts_ms(yesterday, time(11, 58)))
     _write_full_partition(tmp_path, "kline_daily", today, _ts_ms(today, time(10, 0)))
@@ -618,12 +618,20 @@ def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
     monkeypatch.setattr(instrument_sync, "sync_instruments", lambda data_dir: 0)
     batch_calls: list[dict] = []
 
-    def _fake_batch(universe, repo, capset, start_date=None, end_date=None, on_chunk_done=None):
+    def _fake_batch(universe, repo, capset, start_date=None, end_date=None, on_chunk_done=None,
+                    replace_existing=False):
         batch_calls.append({
             "start": start_date.date() if hasattr(start_date, "date") else start_date,
             "end": end_date.date() if hasattr(end_date, "date") else end_date,
+            "replace_existing": replace_existing,
         })
-        return 0
+        for day in (yesterday, today):
+            _write_full_partition(tmp_path, "kline_daily", day, None)
+            path = tmp_path / "kline_daily" / f"date={day}" / "part.parquet"
+            pl.read_parquet(path).with_columns(
+                (pl.col("close") + 0.05).alias("close"),
+            ).write_parquet(path)
+        return 4
 
     monkeypatch.setattr(kline_sync, "sync_and_persist_daily_batch", _fake_batch)
     # run_pipeline() 不传 data_dir 时读 settings.data_dir — 同步指到 tmp
@@ -636,14 +644,20 @@ def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
 
     # 分支3(实时覆写只刷今天)被降级 → 范围拉取起点=坏日
     assert batch_calls and batch_calls[0]["start"] == yesterday
+    assert batch_calls[0]["replace_existing"] is True
     assert result["integrity_repair_from"] == yesterday.isoformat()
     assert result["integrity_issues"] >= 1
-    # 坏 enriched 分区被删后当"新日期"重算写回 (无 prune 时 Step 2 走 skip 不写)
+    # 最近坏日同步发布修正结果, 不能继续沿用盘中快照的收盘价。
     enriched_left = sorted(
         p.name for p in (tmp_path / "kline_daily_enriched").glob("date=*")
     )
     assert enriched_left == [f"date={yesterday.isoformat()}", f"date={today.isoformat()}"]
     assert result["enriched_days"] > 0
+    for day in (yesterday, today):
+        enriched = pl.read_parquet(
+            tmp_path / "kline_daily_enriched" / f"date={day}" / "part.parquet",
+        ).sort("symbol")
+        assert enriched["raw_close"].to_list() == pytest.approx([10.05, 20.05])
 
 
 def test_quotes_flush_partition_keeps_quote_ts_for_integrity_scan(tmp_path, monkeypatch):

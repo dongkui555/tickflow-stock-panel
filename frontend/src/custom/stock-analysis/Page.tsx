@@ -1,6 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Sparkles, LineChart, History as HistoryIcon, Loader2, ExternalLink, Bell, AlertTriangle } from 'lucide-react'
+import {
+  Sparkles, LineChart, History as HistoryIcon, Loader2, ExternalLink, Bell, AlertTriangle,
+  RadioTower, Newspaper, Globe2, Database, Activity, Users, Zap,
+} from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { StockFinancialSearch } from '@/components/financials/StockFinancialSearch'
@@ -8,7 +11,7 @@ import { StockPreviewDialog } from '@/components/StockPreviewDialog'
 import { LastStockChip } from '@/components/LastStockChip'
 import { AnalysisKChart, type PriceLevel, type LevelType } from '@/components/stock-analysis/AnalysisKChart'
 import { PriceAlertDialog } from '@/components/stock-analysis/PriceAlertDialog'
-import { api } from '@/lib/api'
+import { api, type AIAgentsContext, type StockAnalysisMode } from '@/lib/api'
 import { useLastStock } from '@/lib/useLastStock'
 import { QK } from '@/lib/queryKeys'
 import { toast } from '@/components/Toast'
@@ -18,7 +21,7 @@ import {
 } from '@/lib/stockAnalysisStore'
 
 /**
- * 个股分析页 —— 日 K + 关键价位(压力/支撑/密集区/枢轴/前高前低)+ AI 四维分析。
+ * 个股分析页 —— 日 K + 关键价位 + 多 Agent 数据覆盖 + AI 综合分析。
  *
  * 与财务分析页的区别:
  *  - 以【行情 + 关键价位】为视觉主体(专用日 K 图表,不复用个股对话框图表)
@@ -32,6 +35,7 @@ export function StockAnalysis() {
   const [confirmReport, setConfirmReport] = useState<{ id: string; created_at: string; focus: string } | null>(null)
   const [previewSymbol, setPreviewSymbol] = useState<string | null>(null)
   const [showPriceAlerts, setShowPriceAlerts] = useState(false)
+  const [analysisMode, setAnalysisMode] = useState<StockAnalysisMode>('multi_agent')
   const { last: lastStock, remember: rememberStock } = useLastStock('stock-analysis')
 
   // 进入页面立即加载历史报告(供右侧常驻列表)。store 内部有 historyLoaded 去重, 重复调用安全。
@@ -73,7 +77,7 @@ export function StockAnalysis() {
   }
 
   const doAnalysis = async () => {
-    const r = await startAnalysis(symbol, name)
+    const r = await startAnalysis(symbol, name, '', analysisMode)
     if (r.error) toast(r.error, 'error')
   }
 
@@ -81,7 +85,7 @@ export function StockAnalysis() {
     <>
       <PageHeader
         title="个股分析"
-        subtitle="日 K · 关键价位 · AI 四维分析(技术 / 基本面 / 财务 / 消息面)"
+        subtitle="日 K · 关键价位 · 多 Agent 数据覆盖 · AI 综合分析"
         right={
           <div className="flex items-center gap-2">
             <LastStockChip stock={lastStock} onSelect={onSelect} />
@@ -106,13 +110,14 @@ export function StockAnalysis() {
                 <span className="text-[10px] font-mono text-muted">{symbol}</span>
                 <ExternalLink className="h-3 w-3 text-muted opacity-0 group-hover:opacity-100 transition-opacity" />
               </button>
+              <AnalysisModeToggle value={analysisMode} onChange={setAnalysisMode} />
               <button
                 onClick={handleAnalyze}
                 disabled={checking}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-gradient-to-r from-sky-500/25 to-blue-500/15 border border-sky-400/30 text-sky-300 text-xs font-medium hover:from-sky-500/35 hover:to-blue-500/25 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {checking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-                AI 个股分析
+                {analysisMode === 'multi_agent' ? '6 Agent 分析' : '快速分析'}
               </button>
               <button
                 onClick={() => setShowPriceAlerts(true)}
@@ -133,10 +138,10 @@ export function StockAnalysis() {
               <EmptyState
                 icon={LineChart}
                 title="选择一只股票开始分析"
-                hint="搜索代码或名称,查看日 K 与关键价位,并可让 AI 进行技术面 / 基本面 / 财务面 / 消息面四维综合分析。"
+                hint="搜索代码或名称,查看日 K、关键价位与多源数据覆盖,并可让多 Agent 进行技术 / 基本面 / 资金 / 新闻 / 海外综合分析。"
               />
             ) : (
-              <StockAnalysisBoard symbol={symbol} />
+          <StockAnalysisBoard symbol={symbol} />
             )}
           </div>
           <HistorySidebar />
@@ -173,6 +178,43 @@ export function StockAnalysis() {
   )
 }
 
+function AnalysisModeToggle({
+  value,
+  onChange,
+}: {
+  value: StockAnalysisMode
+  onChange: (value: StockAnalysisMode) => void
+}) {
+  const items: Array<{ value: StockAnalysisMode; label: string; icon: any; title: string }> = [
+    { value: 'multi_agent', label: '6Agent', icon: Users, title: '六位分析师交叉验证' },
+    { value: 'quick', label: '快速', icon: Zap, title: '单模型快速分析' },
+  ]
+  return (
+    <div className="inline-flex h-8 items-center rounded-lg border border-border/60 bg-elevated/30 p-0.5">
+      {items.map(item => {
+        const active = value === item.value
+        const Icon = item.icon
+        return (
+          <button
+            key={item.value}
+            type="button"
+            title={item.title}
+            onClick={() => onChange(item.value)}
+            className={`inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] transition-colors ${
+              active
+                ? 'bg-sky-500/18 text-sky-300'
+                : 'text-muted hover:bg-elevated hover:text-secondary'
+            }`}
+          >
+            <Icon className="h-3.5 w-3.5" />
+            {item.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 // ===== 分析看板:日 K + 关键价位 =====
 function StockAnalysisBoard({ symbol }: { symbol: string }) {
   const kline = useQuery({
@@ -186,6 +228,19 @@ function StockAnalysisBoard({ symbol }: { symbol: string }) {
     staleTime: 60_000,
     placeholderData: (prev: any, prevQuery: any) =>
       (prevQuery?.queryKey as readonly unknown[] | undefined)?.[1] === symbol ? prev : undefined,
+  })
+
+  const agents = useQuery({
+    queryKey: ['aiagents-context', symbol],
+    queryFn: () => api.aiagentsContext({
+      symbol,
+      include_fund_flow: true,
+      include_news: true,
+      include_overseas: true,
+      fund_flow_days: 60,
+    }),
+    enabled: !!symbol,
+    staleTime: 60_000,
   })
 
   const levelsQ = useQuery({
@@ -215,6 +270,7 @@ function StockAnalysisBoard({ symbol }: { symbol: string }) {
   }
 
   const levels = (levelsQ.data?.levels ?? {}) as Record<LevelType, PriceLevel[]>
+  const agentContext = agents.data as AIAgentsContext | undefined
 
   // 涨跌色:最后一根 K 线收 vs 前一根收(无前日则按开收判断)
   const last = rows[rows.length - 1]
@@ -223,33 +279,87 @@ function StockAnalysisBoard({ symbol }: { symbol: string }) {
   const isUp = prev ? (last.close >= prev.close) : (last.close >= last.open)
 
   return (
-    <div className="rounded-card border border-border/60 bg-surface/40 overflow-hidden">
-      <div className="px-4 py-3 border-b border-border/40">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <LineChart className="h-4 w-4 text-sky-400 shrink-0" />
-            <span className="text-sm font-medium text-foreground">关键价位分析</span>
-          </div>
-          <div className="flex items-baseline gap-2 shrink-0">
-            <span className="text-[10px] text-muted">{rows.length} 个交易日</span>
-            <span className="text-[10px] text-muted/60">·</span>
-            <span className="text-[10px] text-muted">当前价</span>
-            <span className={`text-[16px] leading-6 font-mono font-bold ${isUp ? 'text-bull' : 'text-bear'}`}>
-              {curClose?.toFixed(2) ?? '—'}
-            </span>
+    <div className="space-y-4">
+      <AgentCoverageBar context={agentContext} loading={agents.isLoading} />
+      <div className="rounded-card border border-border/60 bg-surface/40 overflow-hidden">
+        <div className="px-4 py-3 border-b border-border/40">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <LineChart className="h-4 w-4 text-sky-400 shrink-0" />
+              <span className="text-sm font-medium text-foreground">关键价位分析</span>
+            </div>
+            <div className="flex items-baseline gap-2 shrink-0">
+              <span className="text-[10px] text-muted">{rows.length} 个交易日</span>
+              <span className="text-[10px] text-muted/60">·</span>
+              <span className="text-[10px] text-muted">当前价</span>
+              <span className={`text-base font-mono font-bold ${isUp ? 'text-bull' : 'text-bear'}`}>
+                {curClose?.toFixed(2) ?? '—'}
+              </span>
+            </div>
           </div>
         </div>
+        <div className="p-3">
+          <AnalysisKChart
+            rows={rows}
+            levels={levels}
+            series={levelsQ.data?.series}
+            seriesDates={levelsQ.data?.dates}
+            defaultLevelTypes={['sr', 'pivot', 'keltner_s']}
+            scopeKey={symbol}
+            height={480}
+          />
+        </div>
       </div>
-      <div className="p-3">
-        <AnalysisKChart
-          rows={rows}
-          levels={levels}
-          series={levelsQ.data?.series}
-          seriesDates={levelsQ.data?.dates}
-          defaultLevelTypes={['sr', 'pivot', 'keltner_s']}
-          scopeKey={symbol}
-          height={480}
-        />
+    </div>
+  )
+}
+
+function AgentCoverageBar({ context, loading }: { context?: AIAgentsContext; loading?: boolean }) {
+  const quote = context?.quote ?? {}
+  const tech = context?.technical ?? {}
+  const fund = context?.fund_flow ?? {}
+  const news = context?.news?.news_data ?? {}
+  const overseas = context?.overseas?.market ?? {}
+  const basic = context?.basic ?? {}
+  return (
+    <div className="rounded-card border border-border/60 bg-surface/40 p-3">
+      <div className="flex items-center gap-2 mb-2">
+        <Activity className="h-4 w-4 text-sky-400" />
+        <span className="text-sm font-medium text-foreground">多 Agent 数据覆盖</span>
+        <span className="ml-auto text-[10px] text-muted">{loading ? '加载中' : context?.generated_at || '--'}</span>
+      </div>
+      <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-6">
+        <CoverageMetric icon={LineChart} label="行情" value={quote.price ?? tech.latest_close} status={tech.data_success ? 'ok' : 'degraded'} />
+        <CoverageMetric icon={RadioTower} label="资金" value={fund.data_success ? `${fund.days ?? 0} 天` : '降级'} status={fund.data_success ? 'ok' : 'degraded'} />
+        <CoverageMetric icon={Newspaper} label="新闻" value={news.count ?? 0} status={context?.news?.data_success ? 'ok' : 'degraded'} />
+        <CoverageMetric icon={Globe2} label="海外" value={overseas.data_success ? '可用' : '降级'} status={overseas.data_success ? 'ok' : 'degraded'} />
+        <CoverageMetric icon={Database} label="基本面" value={basic.name || basic.industry || '--'} status={basic && Object.keys(basic).length > 0 ? 'ok' : 'degraded'} />
+        <CoverageMetric icon={Sparkles} label="多Agent" value={context?.disclaimer ? '已接入' : '--'} status={context ? 'ok' : 'degraded'} />
+      </div>
+    </div>
+  )
+}
+
+function CoverageMetric({
+  icon: Icon,
+  label,
+  value,
+  status,
+}: {
+  icon: any
+  label: string
+  value: any
+  status: 'ok' | 'degraded'
+}) {
+  return (
+    <div className="rounded-card border border-border/60 bg-base/40 px-3 py-2">
+      <div className="flex items-center gap-2 text-[10px] text-muted">
+        <Icon className="h-3.5 w-3.5" />
+        <span>{label}</span>
+        <span className={`ml-auto ${status === 'ok' ? 'text-bull' : 'text-warning'}`}>{status === 'ok' ? '正常' : '降级'}</span>
+      </div>
+      <div className="mt-1 text-sm font-semibold text-foreground truncate">
+        {typeof value === 'number' ? value.toFixed(2) : (value ?? '--')}
       </div>
     </div>
   )

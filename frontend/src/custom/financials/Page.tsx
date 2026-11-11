@@ -11,7 +11,7 @@ import { StockFinancialDetail } from '@/components/financials/StockFinancialDeta
 import { ReportHistoryPanel } from '@/components/financials/ReportHistoryPanel'
 import { LastStockChip } from '@/components/LastStockChip'
 import { useLastStock } from '@/lib/useLastStock'
-import { fmtBigNum } from '@/lib/format'
+import { fmtBigNum, fmtDate } from '@/lib/format'
 import { toast } from '@/components/Toast'
 
 const TABLE_LABELS: Record<string, string> = {
@@ -265,11 +265,21 @@ export function Financials() {
                     <div className="text-[11px] text-muted mt-0.5">
                       {fmtBigNum(info?.symbols ?? 0)} 只标的
                     </div>
-                    <div className="mt-auto pt-2 border-t border-border/40 text-[10px] text-muted flex items-center gap-1">
-                      <Clock className="h-2.5 w-2.5 shrink-0" />
-                      {lsTime
-                        ? new Date(lsTime).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-                        : '尚未同步'}
+                    <div className="mt-auto pt-2 border-t border-border/40 text-[10px] text-muted space-y-0.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>报告期</span>
+                        <span className="font-mono text-secondary">
+                          {info?.earliest_date || info?.latest_date
+                            ? `${fmtDate(info?.earliest_date)} ~ ${fmtDate(info?.latest_date)}`
+                            : '—'}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <Clock className="h-2.5 w-2.5 shrink-0" />
+                        {hasData && lsTime
+                          ? new Date(lsTime).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+                          : '尚未同步'}
+                      </div>
                     </div>
                   </div>
                 )

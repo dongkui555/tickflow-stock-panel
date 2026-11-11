@@ -26,8 +26,6 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from app.services.fs_utils import atomic_write_text
-
 logger = logging.getLogger(__name__)
 
 BACKUP_FORMAT = "tick-config-backup"
@@ -226,7 +224,7 @@ def _safe_rel(entry_name: str) -> PurePosixPath:
     """校验条目名可安全转换为相对路径, 否则整体拒绝。"""
     if not entry_name or entry_name.endswith("/"):
         raise ConfigBackupError(f"非法条目: {entry_name!r}")
-    if "\\" in entry_name or entry_name.startswith("/") or ":" in entry_name:
+    if "\\" in entry_name or "\x00" in entry_name or entry_name.startswith("/") or ":" in entry_name:
         raise ConfigBackupError(f"非法条目路径: {entry_name!r}")
     rel = PurePosixPath(entry_name)
     if rel.is_absolute() or any(p in ("", ".", "..") for p in rel.parts):
@@ -465,7 +463,7 @@ def _parse_archive(data: bytes) -> _ParsedArchive:
                 raise ConfigBackupError(f"备份解压总量超过 {MAX_TOTAL_BYTES // 1024 // 1024}MB 上限")
             if info.file_size > MAX_FILE_BYTES:
                 raise ConfigBackupError(f"条目 {info.filename} 超过单文件 {MAX_FILE_BYTES // 1024 // 1024}MB 上限")
-            rel = _safe_rel(info.filename)
+            rel = _safe_rel(info.orig_filename)
             cls = _classify(rel, data_dir)
             if cls is None:
                 out_of_scope.append(info.filename)
@@ -598,16 +596,15 @@ def _write_bytes_atomic(target: Path, payload: bytes) -> None:
     replace_with_retry(tmp, target)
 
 
-# 文本类后缀走 atomic_write_text; 其余 (parquet/音频等二进制) 走字节原子写。
 _TEXT_SUFFIXES = frozenset({".py", ".json", ".jsonl", ".yaml", ".yml", ".js"})
 
 
 def _write_payload(target: Path, payload: bytes) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
     if target.suffix.lower() in _TEXT_SUFFIXES:
-        atomic_write_text(target, payload.decode("utf-8"))
-    else:
-        _write_bytes_atomic(target, payload)
+        payload.decode("utf-8")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # 备份保留原始字节，避免 Windows 文本写入再次转换包内的 CRLF。
+    _write_bytes_atomic(target, payload)
 
 
 def apply_archive(data: bytes, *, allow_overwrite: bool = False, categories: Iterable[str] | None = None) -> dict[str, Any]:

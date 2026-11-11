@@ -27,6 +27,9 @@ def frame(day=DAY, close=10.0):
 
 @pytest.fixture
 def repo(tmp_path):
+    path = tmp_path / "instruments" / "instruments.parquet"
+    path.parent.mkdir()
+    pl.DataFrame({"symbol": ["600000.SH"], "code": ["600000"]}).write_parquet(path)
     result = KlineRepository(DataStore(tmp_path))
     yield result
     result.db.close()

@@ -335,7 +335,7 @@ def parse_bundle(data: bytes, *, allow_resources: bool = False) -> ParsedBundle:
         for info in infos:
             if info.filename == "manifest.json":
                 continue
-            rel = config_backup._safe_rel(info.filename)
+            rel = config_backup._safe_rel(info.orig_filename)
             cls = config_backup._classify(rel, data_dir) if rel is not None else None
             if cls is None or cls[0] not in BUNDLE_CATEGORIES:
                 offenders.append(info.filename)
@@ -510,7 +510,7 @@ def _zip_entries(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
     total = 0
     for info in entries:
         try:
-            rel = config_backup._safe_rel(info.filename)
+            rel = config_backup._safe_rel(info.orig_filename)
         except config_backup.ConfigBackupError as exc:
             raise StrategyBundleError(str(exc)) from exc
         if rel.as_posix() != info.filename:

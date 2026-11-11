@@ -25,6 +25,11 @@ DAY = date(2026, 9, 24)  # 周四, 次日仍是交易日
 
 def _write_daily(tmp_path: Path, rows: list[tuple[date, float, float]]) -> None:
     """写 kline_daily 分区: [(day, open, close)] (不复权 raw 价)。"""
+    instruments = tmp_path / "instruments"
+    instruments.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"symbol": [SYM], "code": ["600519"], "name": ["贵州茅台"]}).write_parquet(
+        instruments / "instruments.parquet"
+    )
     repo = KlineRepository(DataStore(tmp_path))
     df = pl.DataFrame(
         {

@@ -70,6 +70,7 @@ def _enriched_close(data_dir, day: date) -> float:
 def test_etf_incremental_daily_reapplies_adj_to_history(tmp_path, monkeypatch):
     """本地已有拆分前未复权 enriched, 增量只拉新一日时, 历史收盘必须改写成前复权价。"""
     repo = KlineRepository(DataStore(tmp_path))
+    repo.save_etf_instruments(pl.DataFrame({"symbol": [ETF], "code": [ETF.split(".")[0]], "name": ["测试ETF"]}))
     repo.append_etf_daily(pl.concat([_bar(PRE, PRE_RAW), _bar(EX, EX_RAW)]))
     repo.append_etf_enriched(pl.concat([_bar(PRE, PRE_RAW), _bar(EX, EX_RAW)]))
     _write_factor(tmp_path, EX, EX_FACTOR)
